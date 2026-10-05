@@ -1818,10 +1818,8 @@ panvk_compile_shader(struct panvk_device *dev,
       panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
                       info->robustness, state, &shader->desc_info, false);
 
-      inputs.trust_varying_flat_highp_types = true;
       struct pan_varying_layout varying_layout;
-      pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id,
-                                  inputs.trust_varying_flat_highp_types, true);
+      pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
       pan_build_varying_layout_compact(&varying_layout, nir, inputs.gpu_id);
       inputs.varying_layout = &varying_layout;
 

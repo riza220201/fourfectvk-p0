@@ -411,3 +411,6 @@ Upstream e0907dc5 removed trust_highp_types and b2c14af8 lowers mediump varyings
 
 ### src/panfrost/vulkan/panvk_vX_shader.c — fork tessellation call site
 The merged (non-conflicting) fork code still called the removed pass with no_idvs=false; switched to panvk_lower_vs_input_for_poly (see hunk 1). UNTESTED (CSF-only path).
+
+### src/panfrost/vulkan/panvk_vX_shader.c — fork TES path (compile error, not a textual conflict)
+The fork's tessellation-evaluation path set inputs.trust_varying_flat_highp_types and used the 5-argument pan_varying_collect_formats(). Upstream e0907dc5 removed trust_highp_types and b2c14af8 lowers mediump varyings early; ported to the 3-argument call, same as hunk 4. CSF-only path, UNTESTED.
