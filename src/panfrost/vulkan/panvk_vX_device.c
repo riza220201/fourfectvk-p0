@@ -511,6 +511,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (physical_device->kbase_node_path[0]) {
+      /* Phase 8.5: kbase has no DRM syncobjs (its sync type is the kbase CPU
+       * sync), so the DRM-syncobj payload copier asserts the first time
+       * vk_common_QueueSignalReleaseImageANDROID() calls it on present.
+       * Without a copier the runtime takes its generic path: an empty
+       * QueueSubmit2 plus a SYNC_FD export, which kbase supports (0055).
+       * PANVK_KBASE_SYNCOBJ_COPY=1 restores the old hook (negative control). */
+      if (!os_get_option("PANVK_KBASE_SYNCOBJ_COPY"))
+         device->vk.copy_sync_payloads = NULL;
+
       /* dup()ing a kbase fd would share the physical device's kbase
        * context, whose version handshake can only be done once; open a
        * fresh context instead.  A separate context also means a separate

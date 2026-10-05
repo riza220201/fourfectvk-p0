@@ -306,6 +306,20 @@ vk_android_import_anb(struct vk_device *device,
    return device->dispatch_table.BindImageMemory2((VkDevice)device, 1, &bind_info);
 }
 
+static bool vk_android_ahb_linear_fix_disabled(void);
+static bool vk_android_gralloc_is_fallback(void);
+
+/* Phase 8.5 (ANB counterpart of panvk-g99-jm 0054). PANVK_ANB_NO_LINEAR_FIX=1
+ * restores the old behaviour (negative control).
+ */
+static bool
+vk_android_anb_linear_fix_active(void)
+{
+   return !vk_android_ahb_linear_fix_disabled() &&
+          os_get_option("PANVK_ANB_NO_LINEAR_FIX") == NULL &&
+          vk_android_gralloc_is_fallback();
+}
+
 VkResult
 vk_android_get_anb_layout(
    const VkImageCreateInfo *pCreateInfo,
@@ -321,8 +335,32 @@ vk_android_get_anb_layout(
       .pixel_stride = native_buffer->stride,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+                                                       out_layouts, max_planes);
+   if (result != VK_SUCCESS || out->drmFormatModifier != DRM_FORMAT_MOD_INVALID)
+      return result;
+
+   /* Swapchain (ANB) images: the fallback gralloc cannot read the vendor
+    * layout and reports DRM_FORMAT_MOD_INVALID, which the driver then cannot
+    * use (panvk asserted in panvk_image_get_explicit_mod). Same rule as
+    * vk_android_get_ahb_layout(): a buffer allocated with CPU usage must be
+    * CPU-mappable, i.e. LINEAR with the described stride; without CPU usage
+    * the layout is unknown (MediaTek gralloc picks AFBC), so refuse it.
+    *
+    * The usage is read from the legacy .usage field, which every loader
+    * fills. .usage3 only exists from VK_ANDROID_native_buffer spec 9; on an
+    * older (spec 8, Android 13) loader it lies past the end of the struct.
+    */
+   if (!vk_android_anb_linear_fix_active())
+      return result;
+   if (!(native_buffer->usage &
+         (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK))) {
+      mesa_loge("ANB: fallback gralloc and no CPU usage (0x%x): layout unknown",
+                native_buffer->usage);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+   return VK_SUCCESS;
 }
 
 VkResult
@@ -467,7 +505,16 @@ vk_common_GetSwapchainGrallocUsageANDROID(VkDevice device, VkFormat format,
                                           VkImageUsageFlags imageUsage,
                                           int *grallocUsage)
 {
-   return setup_gralloc0_usage(format, imageUsage, grallocUsage);
+   VkResult result = setup_gralloc0_usage(format, imageUsage, grallocUsage);
+   /* With the fallback gralloc, ask for CPU access so gralloc allocates
+    * linear swapchain buffers whose layout vk_android_get_anb_layout() can
+    * describe, even when the consumer (e.g. the composer) is GPU-only. */
+   if (result == VK_SUCCESS && vk_android_anb_linear_fix_active())
+      *grallocUsage |= GRALLOC_USAGE_SW_READ_RARELY |
+                       GRALLOC_USAGE_SW_WRITE_RARELY;
+   if (getenv("PANVK_ANB_TRACE"))
+      mesa_logi("ANB: GetSwapchainGrallocUsageANDROID -> 0x%x", *grallocUsage);
+   return result;
 }
 
 
@@ -666,6 +713,17 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
    /* for front buffer rendering */
    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
       *grallocProducerUsage |= vk_android_get_front_buffer_usage();
+
+   /* See vk_common_GetSwapchainGrallocUsageANDROID(): linear buffers on the
+    * fallback gralloc. */
+   if (vk_android_anb_linear_fix_active()) {
+      *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ;
+      *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_WRITE;
+   }
+   if (getenv("PANVK_ANB_TRACE"))
+      mesa_logi("ANB: GetSwapchainGrallocUsage2ANDROID -> consumer 0x%llx producer 0x%llx",
+                (unsigned long long)*grallocConsumerUsage,
+                (unsigned long long)*grallocProducerUsage);
 
    return VK_SUCCESS;
 }
@@ -1354,7 +1412,18 @@ vk_android_get_ahb_image_properties(
                        "format (%u) unsupported for AHB", info->format);
    }
 
-   const uint64_t ahb_usage = vk_image_format_info_to_ahb_usage(info);
+   uint64_t ahb_usage = vk_image_format_info_to_ahb_usage(info);
+   /* Phase 8.5: an Android 14+ platform loader derives the swapchain's
+    * producer gralloc usage from THIS query (VkAndroidHardwareBufferUsageANDROID
+    * chained into GetPhysicalDeviceImageFormatProperties2), and only falls back
+    * to vkGetSwapchainGrallocUsage*ANDROID when it fails -- measured by
+    * disassembling getProducerUsage() in the device's libvulkan. So the
+    * fallback-gralloc CPU usage (linear buffers, see
+    * vk_android_get_anb_layout()) has to be requested here too. Probe with the
+    * bits included so gralloc is asked about the combination we report. */
+   if (vk_android_anb_linear_fix_active())
+      ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
+                   AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
    if (!vk_ahb_probe_format(ahb_format, ahb_usage)) {
       return vk_errorf(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
                        "ahb_format (%u) ahb_usage (0x%" PRIx64 ") unsupported",
