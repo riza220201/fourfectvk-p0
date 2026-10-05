@@ -298,12 +298,121 @@ panvk_kbase_submit_and_wait(int fd, uint64_t jc, uint32_t core_req)
    return 0;
 }
 
+/* Kernel-side chaining. panvk_kbase_submit_and_wait() costs two CPU round trips
+ * per render pass (vertex/tiler chain, then fragment chain), and the GPU idles
+ * during each one: measured on the RS4 as ~0.26 ms per pass even for a pass
+ * that covers a single 16x16 tile. Instead, the atoms of a whole vkQueueSubmit
+ * are queued with a DATA dependency on the previous atom -- the same execution
+ * order as before, enforced by kbase instead of by the CPU -- submitted with
+ * one ioctl, and waited for once. Only the last atom reports success; a failed
+ * atom reports itself and cancels its dependents.
+ * PANVK_KBASE_SYNC_SUBMIT=1 restores the per-chain synchronous path. */
+#define PANVK_KBASE_MAX_CHAIN 120
+#define PANVK_KBASE_ATOM_STRIDE 64 /* base_jd_atom_v2 + MTK BM_2 frame_nr */
+/* From the kbase JM UAPI, mali_base_jm_kernel.h (r54p1). */
+#define BASE_JD_DEP_TYPE_DATA (1U << 0)
+#define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE (1U << 12)
+
+struct panvk_kbase_chain {
+   uint8_t atoms[PANVK_KBASE_MAX_CHAIN][PANVK_KBASE_ATOM_STRIDE];
+   const struct panvk_batch *batches[PANVK_KBASE_MAX_CHAIN];
+   unsigned nr_atoms, nr_batches;
+};
+
+static simple_mtx_t panvk_kbase_chain_mtx = SIMPLE_MTX_INITIALIZER;
+static struct panvk_kbase_chain panvk_kbase_chain;
+
+static bool
+panvk_kbase_chain_enabled(void)
+{
+   /* The trace/dump paths decode each chain right after it ran. */
+   return !getenv("PANVK_KBASE_SYNC_SUBMIT") && !pan_v9_trace_enabled() &&
+          !getenv("PANVK_HEAP_LOG") && !PANVK_DEBUG(TRACE) && !PANVK_DEBUG(DUMP);
+}
+
+static void
+panvk_kbase_chain_append(struct panvk_kbase_chain *c, uint64_t jc,
+                         uint32_t core_req)
+{
+   uint8_t *a = c->atoms[c->nr_atoms];
+   const uint8_t num = c->nr_atoms + 1;
+
+   memset(a, 0, PANVK_KBASE_ATOM_STRIDE);
+   memcpy(a + 0, &jc, 8);
+   if (num > 1) {
+      a[36] = num - 1;                 /* pre_dep[0].atom_id */
+      a[37] = BASE_JD_DEP_TYPE_DATA;   /* pre_dep[0].dependency_type */
+   }
+   a[40] = num;                        /* atom_number */
+   core_req |= BASE_JD_REQ_EVENT_ONLY_ON_FAILURE;
+   memcpy(a + 44, &core_req, 4);
+   c->nr_atoms++;
+}
+
+static int
+panvk_kbase_chain_flush(int fd, struct panvk_kbase_chain *c)
+{
+   const unsigned n = c->nr_atoms;
+   int err = 0;
+
+   c->nr_atoms = 0;
+   c->nr_batches = 0;
+   if (!n)
+      return 0;
+
+   /* The last atom reports success too: it is the one we wait for. */
+   uint32_t core_req;
+   memcpy(&core_req, c->atoms[n - 1] + 44, 4);
+   core_req &= ~BASE_JD_REQ_EVENT_ONLY_ON_FAILURE;
+   memcpy(c->atoms[n - 1] + 44, &core_req, 4);
+
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uint64_t)(uintptr_t)c->atoms,
+      .nr_atoms = n,
+      .stride = PANVK_KBASE_ATOM_STRIDE,
+   };
+   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
+      return -errno;
+
+   for (;;) {
+      struct pollfd pfd = { .fd = fd, .events = POLLIN };
+      int pret = poll(&pfd, 1, 20000);
+      if (pret <= 0 || !(pfd.revents & POLLIN))
+         return -110;
+
+      struct panvk_kbase_event_v2 event;
+      if (read(fd, &event, sizeof(event)) != sizeof(event))
+         return -5;
+
+      if (event.event_code != 0x1) {
+         mesa_loge("panvk: kbase atom %u of %u failed: event 0x%x",
+                   event.atom_number, n, event.event_code);
+         if (!err)
+            err = -(int)event.event_code;
+      }
+      if (event.atom_number == n)
+         return err;
+   }
+}
+
+static bool
+panvk_kbase_chain_has_batch(const struct panvk_kbase_chain *c,
+                            const struct panvk_batch *batch)
+{
+   for (unsigned i = 0; i < c->nr_batches; i++) {
+      if (c->batches[i] == batch)
+         return true;
+   }
+   return false;
+}
+
 static void
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
                          struct panvk_batch *batch, uint32_t *bos,
                          unsigned nr_bos, uint32_t *in_fences,
-                         unsigned nr_in_fences)
+                         unsigned nr_in_fences,
+                         struct panvk_kbase_chain *chain)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
@@ -312,6 +421,13 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
+      /* Never rewrite a batch that is still queued in the current chain. */
+      if (chain && panvk_kbase_chain_has_batch(chain, batch)) {
+         ret = panvk_kbase_chain_flush(dev->drm_fd, chain);
+         if (ret)
+            mesa_loge("panvk: v9 chained submit failed: %d", ret);
+      }
+
       util_dynarray_foreach(&batch->jobs, void *, job)
          memset((*job), 0, 4 * 4);
 
@@ -334,6 +450,22 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    /* Flush pending synchronization requests before submitting the job, to
     * make sure things are GPU-visible. */
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+   if (chain) {
+      if (chain->nr_atoms + 2 > PANVK_KBASE_MAX_CHAIN ||
+          chain->nr_batches + 1 > PANVK_KBASE_MAX_CHAIN) {
+         ret = panvk_kbase_chain_flush(dev->drm_fd, chain);
+         if (ret)
+            mesa_loge("panvk: v9 chained submit failed: %d", ret);
+      }
+      if (batch->vtc_jc.first_job)
+         panvk_kbase_chain_append(chain, batch->vtc_jc.first_job, 0x16);
+      if (batch->frag_jc.first_job)
+         panvk_kbase_chain_append(chain, batch->frag_jc.first_job, 0x01);
+      chain->batches[chain->nr_batches++] = batch;
+      batch->issued = true;
+      return;
+   }
 
    /* SKIP: dump sebelum submit dipastikan SIGSEGV karena ALLOC_ON_FAULT (commit_pages=0), nggak informatif */
    if (batch->vtc_jc.first_job) {
@@ -510,6 +642,13 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       semaphores[i + 1] = 0;
    }
 
+   /* One chain per submit, shared state: serialise submits on all queues
+    * (atom numbers restart at 1 every flush). */
+   simple_mtx_lock(&panvk_kbase_chain_mtx);
+   struct panvk_kbase_chain *chain =
+      panvk_kbase_chain_enabled() ? &panvk_kbase_chain : NULL;
+   int cret;
+
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
       struct panvk_cmd_buffer *cmdbuf =
          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
@@ -568,12 +707,29 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 
          panvk_add_wait_event_syncobjs(batch, in_fences, &nr_in_fences);
 
+         /* Event ops are applied on the CPU around a batch that has finished:
+          * keep such a batch out of a chain (everything before it completes
+          * first, and it completes before its sets/resets are applied). */
+         const bool has_event_ops = max_wait_event_syncobjs > 0;
+         if (chain && has_event_ops &&
+             (cret = panvk_kbase_chain_flush(dev->drm_fd, chain)))
+            mesa_loge("panvk: v9 chained submit failed: %d", cret);
+
          panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
-                                  nr_in_fences);
+                                  nr_in_fences, chain);
+
+         if (chain && has_event_ops &&
+             (cret = panvk_kbase_chain_flush(dev->drm_fd, chain)))
+            mesa_loge("panvk: v9 chained submit failed: %d", cret);
 
          panvk_signal_event_syncobjs(queue, batch);
       }
    }
+
+   /* Everything queued has to finish before the fences below are signalled. */
+   if (chain && (cret = panvk_kbase_chain_flush(dev->drm_fd, chain)))
+      mesa_loge("panvk: v9 chained submit failed: %d", cret);
+   simple_mtx_unlock(&panvk_kbase_chain_mtx);
 
    /* Signal fences and semaphores. The old code transferred a DRM syncobj
     * with DRM_IOCTL_SYNCOBJ_* ioctls, which fail on a kbase fd; the asserts
