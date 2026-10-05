@@ -337,6 +337,22 @@ vk_android_get_anb_layout(
 
    VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
                                                        out_layouts, max_planes);
+   /* Negative control for AFBC swapchains: PANVK_ANB_MOD_XOR=<hex> flips bits of
+    * an imported AFBC modifier, so the driver encodes with parameters other than
+    * the ones gralloc reports to every other reader of the buffer. */
+   const char *mod_xor = getenv("PANVK_ANB_MOD_XOR");
+   if (mod_xor && result == VK_SUCCESS &&
+       (out->drmFormatModifier >> 52) ==
+          (DRM_FORMAT_MOD_ARM_TYPE_AFBC | (DRM_FORMAT_MOD_VENDOR_ARM << 4)))
+      out->drmFormatModifier ^= strtoull(mod_xor, NULL, 16);
+   if (getenv("PANVK_ANB_TRACE"))
+      mesa_logi("ANB: import %ux%u usage 0x%x via gralloc type %d -> result %d mod 0x%" PRIx64
+                " planes %u offset %" PRIu64 " pitch %" PRIu64 " size %" PRIu64,
+                pCreateInfo->extent.width, pCreateInfo->extent.height,
+                native_buffer->usage, u_gralloc_get_type(vk_android_get_ugralloc()), result,
+                out->drmFormatModifier, out->drmFormatModifierPlaneCount,
+                (uint64_t)out_layouts[0].offset, (uint64_t)out_layouts[0].rowPitch,
+                (uint64_t)out_layouts[0].size);
    if (result != VK_SUCCESS || out->drmFormatModifier != DRM_FORMAT_MOD_INVALID)
       return result;
 

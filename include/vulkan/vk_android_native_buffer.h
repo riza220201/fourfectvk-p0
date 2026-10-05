@@ -17,7 +17,10 @@
  * system rather the build target.
  */
 
-#if (defined(__ANDROID__) || defined(ANDROID)) && 0 /* PATCH: Termux toolchain lacks AOSP cutils/native_handle.h; use portable buffer_handle_t */
+/* panvk-g99-jm: a Termux/NDK toolchain has no AOSP <cutils/native_handle.h>; fall back to the
+ * portable typedef there, but keep upstream's definition wherever the header exists (the
+ * android-stub headers, or real AOSP headers for the IMapper4 gralloc backend). */
+#if (defined(__ANDROID__) || defined(ANDROID)) && __has_include(<cutils/native_handle.h>)
 
 #include <cutils/native_handle.h>
 #if ANDROID_API_LEVEL < 28
