@@ -41,6 +41,7 @@
 #include "util/libsync.h"
 #include "util/log.h"
 #include "util/os_file.h"
+#include "util/os_misc.h"
 #include "util/u_gralloc/u_gralloc.h"
 
 #include <hardware/gralloc.h>
@@ -214,9 +215,12 @@ vk_android_import_anb_memory(struct vk_device *device,
                              const VkNativeBufferANDROID *anb,
                              const VkAllocationCallbacks *alloc)
 {
-   assert(anb && anb->handle && anb->handle->numFds > 0);
+   assert(anb && anb->handle && ((const native_handle_t *)anb->handle)->numFds > 0);
 
-   int dma_buf_fd = anb->handle->data[0];
+   int dma_buf_fd =
+      u_gralloc_native_handle_dmabuf_fd((const native_handle_t *)anb->handle);
+   if (dma_buf_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
@@ -666,6 +670,21 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
    return VK_SUCCESS;
 }
 
+static bool
+vk_android_ahb_linear_fix_disabled(void)
+{
+   return os_get_option("PANVK_AHB_NO_LINEAR_FIX") != NULL;
+}
+
+/* True when gralloc can only be read through the fallback path, which does
+ * not know vendor layouts (compression, tiling). */
+static bool
+vk_android_gralloc_is_fallback(void)
+{
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+   return gralloc && u_gralloc_get_type(gralloc) == U_GRALLOC_TYPE_FALLBACK;
+}
+
 VkResult
 vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
@@ -684,8 +703,25 @@ vk_android_get_ahb_layout(
       .hal_format = description.format,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   VkResult result = vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
+                                                       out_layouts, max_planes);
+   if (result != VK_SUCCESS || out->drmFormatModifier != DRM_FORMAT_MOD_INVALID)
+      return result;
+
+   /* The fallback gralloc cannot read the vendor layout and reports
+    * DRM_FORMAT_MOD_INVALID. Gralloc must give CPU-mappable (linear) memory
+    * when CPU usage is requested, so such buffers are LINEAR with the
+    * described stride. Without CPU usage the layout is unknown (the MediaTek
+    * gralloc picks AFBC for GPU-only usage), so refuse it instead of
+    * guessing. PANVK_AHB_NO_LINEAR_FIX=1 restores the old behaviour.
+    */
+   if (vk_android_ahb_linear_fix_disabled())
+      return result;
+   if (!(description.usage & (AHARDWAREBUFFER_USAGE_CPU_READ_MASK |
+                              AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK)))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   out->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+   return VK_SUCCESS;
 }
 
 /* From the Android hardware_buffer.h header:
@@ -989,6 +1025,17 @@ vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
              !vk_format_is_depth_or_stencil(image->format))
             usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
       }
+
+      /* panvk-g99-jm 0054: with the fallback gralloc the real layout of a
+       * GPU-only AHB cannot be queried (MediaTek gralloc allocates AFBC for
+       * it). Ask for CPU access, which makes gralloc allocate a plain linear
+       * buffer whose layout the fallback path describes correctly -- the same
+       * mechanism as the COMPRESSION_DISABLED case above.
+       */
+      if (vk_android_gralloc_is_fallback() &&
+          !vk_android_ahb_linear_fix_disabled())
+         usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
+                  AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
    } else {
       /* AHB export allocation for VkBuffer requires a valid allocationSize */
       assert(pAllocateInfo->allocationSize);
@@ -1241,13 +1288,16 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
 
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
    assert(handle && handle->numFds > 0);
-   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);
+   const int dma_buf_fd = u_gralloc_native_handle_dmabuf_fd(handle);
+   if (dma_buf_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   pProperties->allocationSize = lseek(dma_buf_fd, 0, SEEK_END);
 
    VkMemoryFdPropertiesKHR fd_props = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
    };
    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
-      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],
+      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,
       &fd_props);
    if (result != VK_SUCCESS)
       return result;

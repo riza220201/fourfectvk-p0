@@ -25,9 +25,278 @@
 #include "panvk_queue.h"
 
 #include "vk_drm_syncobj.h"
+#include "vk_sync.h"
 #include "vk_framebuffer.h"
 
 #include "drm-uapi/panfrost_drm.h"
+#include "drm-uapi/mali_kbase_ioctl.h"
+#include <fcntl.h>
+#include <inttypes.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include "pan_v9_trace.h"
+
+struct panvk_kbase_event_v2 {
+   uint32_t event_code;
+   uint8_t atom_number;
+   uint8_t padding[3];
+   uint64_t udata[2];
+};
+
+
+/*
+ * Dumps the first bytes of the tiler heap so a caller can diff the contents
+ * before/after a submit and tell whether the tiler wrote anything at all.
+ *
+ * The heap is allocated with PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT, which makes
+ * kbase pass commit_pages=0 (see kbase_kmod.c), so the mapping exists but has
+ * no pages behind it until the GPU faults them in. Dereferencing addr.host
+ * directly therefore SIGSEGVs whenever the tiler did *not* write - which is
+ * exactly the case we are trying to observe. Reading through /proc/self/mem
+ * instead turns that into an EIO/EFAULT return value we can report.
+ *
+ * mincore() is only used as a hint: on some kernels it does not report
+ * residency for device mappings, so a "not resident" answer there is not
+ * treated as conclusive - the pread is what decides.
+ */
+/*
+ * Where the heap dump and submit results go.
+ *
+ * stderr is not usable under a Winlator/Ludashi-style container: nothing
+ * collects it, so the output is simply lost. Set PANVK_HEAP_LOG to a writable
+ * path to capture it instead, e.g.
+ *
+ *    PANVK_HEAP_LOG=/sdcard/Download/panvk-heap.log
+ *
+ * Unset (or unopenable) means fall back to stderr, which keeps the behaviour
+ * of the original patch. The file is opened once, appended to, and line
+ * buffered so a crash mid-run still leaves the lines already written.
+ */
+static FILE *
+panvk_debug_log_file(void)
+{
+   static FILE *log_file = NULL;
+   static bool tried = false;
+
+   if (!tried) {
+      tried = true;
+      const char *path = getenv("PANVK_HEAP_LOG");
+
+      if (path && path[0]) {
+         log_file = fopen(path, "ae");
+         if (log_file) {
+            setvbuf(log_file, NULL, _IOLBF, 0);
+            fprintf(log_file, "[PANVK_DEBUG_HEAP] --- log dibuka, pid=%d ---\n",
+                    (int)getpid());
+         } else {
+            fprintf(stderr,
+                    "[PANVK_DEBUG_HEAP] gagal membuka PANVK_HEAP_LOG=%s: %s,"
+                    " jatuh ke stderr\n",
+                    path, strerror(errno));
+         }
+      }
+   }
+
+   return log_file ? log_file : stderr;
+}
+
+static void
+panvk_debug_dump_tiler_heap(struct panvk_device *dev, const char *label)
+{
+   FILE *out = panvk_debug_log_file();
+
+   if (!dev->tiler_heap || !dev->tiler_heap->addr.host) {
+      fprintf(out, "[PANVK_DEBUG_HEAP] %s: tiler_heap belum ada/belum ke-mmap\n",
+              label);
+      return;
+   }
+
+   void *host = dev->tiler_heap->addr.host;
+   const size_t dump_len = 64;
+
+   fprintf(out,
+           "[PANVK_DEBUG_HEAP] %s bo->flags=0x%x dev=0x%" PRIx64
+           " size=%zu host=%p",
+           label, dev->tiler_heap->bo->flags, dev->tiler_heap->addr.dev,
+           (size_t)pan_kmod_bo_size(dev->tiler_heap->bo), host);
+
+   unsigned char resident = 0;
+   long page_size = sysconf(_SC_PAGESIZE);
+   if (page_size > 0 &&
+       mincore((void *)((uintptr_t)host & ~(uintptr_t)(page_size - 1)),
+               page_size, &resident) == 0) {
+      fprintf(out, " mincore=%s", (resident & 1) ? "resident" : "absent");
+   } else {
+      fprintf(out, " mincore=unavailable");
+   }
+
+   /* Safe read: never dereference host directly, see comment above. */
+   uint8_t buf[64];
+   int mem_fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+   if (mem_fd < 0) {
+      fprintf(out, " -- open(/proc/self/mem) gagal: %s\n", strerror(errno));
+      return;
+   }
+
+   ssize_t n = pread(mem_fd, buf, dump_len, (off_t)(uintptr_t)host);
+   int saved_errno = errno;
+   close(mem_fd);
+
+   if (n < 0) {
+      /* EIO here means the page is mapped but not backed: the GPU never
+       * faulted it in, i.e. nothing wrote to the heap. */
+      fprintf(out, " -- UNREADABLE (%s) => halaman belum ter-commit,"
+                      " tiler tidak menulis apa pun\n",
+              strerror(saved_errno));
+      return;
+   }
+
+   bool all_zero = true;
+   for (ssize_t i = 0; i < n; i++) {
+      if (buf[i] != 0) {
+         all_zero = false;
+         break;
+      }
+   }
+
+   fprintf(out, " first%zd%s:", n, all_zero ? " (ALL ZERO)" : "");
+   for (ssize_t i = 0; i < n; i++)
+      fprintf(out, " %02x", buf[i]);
+   fprintf(out, "\n");
+}
+
+/*
+ * Reads back every job header in the batch AFTER the GPU ran it.
+ *
+ * Job Header (v9.xml) starts with the fields the GPU itself writes:
+ *
+ *   Exception Status       word 0
+ *   First Incomplete Task  word 1
+ *   Fault Pointer          word 2..3
+ *
+ * The pre-submit dump always shows these as zero because nothing has run yet,
+ * so a job that is silently rejected by the GPU looks identical to one that
+ * succeeded. Reading them back after the wait is the only way to tell apart
+ * "the GPU ran this and wrote nothing" from "the GPU refused this".
+ *
+ * Exception Status is a BASE_JD_EVENT_* code. Verified against the r54p1 UAPI
+ * header (jm/mali_base_jm_kernel.h):
+ *
+ *   BASE_JD_EVENT_NOT_STARTED = 0x00
+ *   BASE_JD_EVENT_DONE        = 0x01   <- success
+ *   BASE_JD_EVENT_STOPPED     = 0x03
+ *   BASE_JD_EVENT_TERMINATED  = 0x04
+ *   BASE_JD_EVENT_ACTIVE      = 0x08
+ *   ...RANGE_HW_FAULT_OR_SW_ERROR_START = 0x40
+ *
+ * So 0x01 is *success*, and anything below 0x40 is non-fatal. Only >= 0x40 is
+ * an actual fault. Do not treat "non-zero" as an error here - an earlier
+ * version of this print did and sent the investigation down a dead end.
+ *
+ * batch->jobs holds the CPU pointers of every job descriptor in the batch,
+ * which is exactly what we need - these are pool allocations, still mapped.
+ */
+#define PANVK_JD_EVENT_NOT_STARTED 0x00
+#define PANVK_JD_EVENT_DONE        0x01
+#define PANVK_JD_EVENT_FAULT_START 0x40
+
+static const char *
+panvk_jd_event_str(uint32_t code)
+{
+   switch (code) {
+   case PANVK_JD_EVENT_NOT_STARTED:
+      return "NOT_STARTED";
+   case PANVK_JD_EVENT_DONE:
+      return "DONE";
+   case 0x03:
+      return "STOPPED";
+   case 0x04:
+      return "TERMINATED";
+   case 0x08:
+      return "ACTIVE";
+   default:
+      return code >= PANVK_JD_EVENT_FAULT_START ? "FAULT" : "non-fatal";
+   }
+}
+
+static void
+panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
+                            struct panvk_batch *batch, const char *label)
+{
+   FILE *out = panvk_debug_log_file();
+   unsigned idx = 0;
+
+   /* The descriptor pool is CPU-cached, so invalidate before reading back
+    * anything the GPU may have written. */
+   panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+
+   util_dynarray_foreach(&batch->jobs, void *, job) {
+      const uint8_t *bytes = *job;
+      uint32_t exception_status, first_incomplete_task, word4, word5;
+      uint64_t fault_pointer, next_job;
+
+      memcpy(&exception_status, bytes + 0, sizeof(exception_status));
+      memcpy(&first_incomplete_task, bytes + 4, sizeof(first_incomplete_task));
+      memcpy(&fault_pointer, bytes + 8, sizeof(fault_pointer));
+      memcpy(&word4, bytes + 16, sizeof(word4));
+      /* Job Header, v9.xml: Index is word 4 bits 16..31, Dependency 1 and 2 are
+       * word 5 low and high halves, Next is the 64-bit word 6. Reading these
+       * back tells us the dependency graph the hardware was actually given,
+       * which the job type alone does not. */
+      memcpy(&word5, bytes + 20, sizeof(word5));
+      memcpy(&next_job, bytes + 24, sizeof(next_job));
+
+      fprintf(out,
+              "[PANVK_DEBUG_JOBSTATUS] %s job[%u] type=%u"
+              " index=%u dep1=%u dep2=%u next=0x%" PRIx64
+              " exception_status=0x%02x (%s) first_incomplete_task=%u"
+              " fault_pointer=0x%" PRIx64 "%s\n",
+              label, idx, (word4 >> 1) & BITFIELD_MASK(7),
+              (word4 >> 16) & 0xffff, word5 & 0xffff, (word5 >> 16) & 0xffff,
+              next_job, exception_status,
+              panvk_jd_event_str(exception_status), first_incomplete_task,
+              fault_pointer,
+              exception_status >= PANVK_JD_EVENT_FAULT_START
+                 ? "  <== GPU FAULT"
+                 : "");
+      idx++;
+   }
+}
+
+static int
+panvk_kbase_submit_and_wait(int fd, uint64_t jc, uint32_t core_req)
+{
+   uint8_t atom_bytes[64];
+   memset(atom_bytes, 0, sizeof(atom_bytes));
+   memcpy(atom_bytes + 0, &jc, 8);
+   atom_bytes[40] = 1;
+   memcpy(atom_bytes + 44, &core_req, 4);
+
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uint64_t)(uintptr_t)atom_bytes,
+      .nr_atoms = 1,
+      .stride = 64,
+   };
+
+   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
+      return -errno;
+
+   struct pollfd pfd = { .fd = fd, .events = POLLIN };
+   int pret = poll(&pfd, 1, 5000);
+   if (pret <= 0 || !(pfd.revents & POLLIN))
+      return -110;
+
+   struct panvk_kbase_event_v2 event;
+   ssize_t n = read(fd, &event, sizeof(event));
+   if (n != sizeof(event))
+      return -5;
+
+   if (event.event_code != 0x1)
+      return -(int)event.event_code;
+
+   return 0;
+}
 
 static void
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
@@ -66,28 +335,21 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
     * make sure things are GPU-visible. */
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
+   /* SKIP: dump sebelum submit dipastikan SIGSEGV karena ALLOC_ON_FAULT (commit_pages=0), nggak informatif */
    if (batch->vtc_jc.first_job) {
-      struct drm_panfrost_submit submit = {
-         .bo_handles = (uintptr_t)bos,
-         .bo_handle_count = nr_bos,
-         .in_syncs = (uintptr_t)in_fences,
-         .in_sync_count = nr_in_fences,
-         .out_sync = queue->sync,
-         .jc = batch->vtc_jc.first_job,
-      };
+      ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->vtc_jc.first_job, 0x16); /* PATCH eksperimen: dulu 0x16 (CS|T|V) */
+      if (ret)
+         mesa_loge("panvk: v9 vtc_jc job chain failed: kbase event 0x%x "
+                   "(PANVK_V9_TRACE=1 dumps the job status)", -ret);
+      if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
+         fprintf(panvk_debug_log_file(),
+                 "[PANVK_DEBUG_SUBMIT] vtc_jc ret=%d\n", ret);
+         panvk_debug_dump_job_status(cmdbuf, batch, "vtc_jc");
+         panvk_debug_dump_tiler_heap(dev, "SESUDAH vtc_jc (vertex+tiler)");
+      }
 
-      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
-      assert(!ret);
-
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
-         ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
-                              NULL);
-         assert(!ret);
-
-         /* If we want to read the descriptors back, we need to invalidate the
-          * whole desc pool, otherwise we might end up with stale data. */
+      if (PANVK_DEBUG(TRACE)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
       if (PANVK_DEBUG(TRACE)) {
@@ -98,35 +360,20 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if (PANVK_DEBUG(SYNC))
-         pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
-                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (batch->frag_jc.first_job) {
-      struct drm_panfrost_submit submit = {
-         .bo_handles = (uintptr_t)bos,
-         .bo_handle_count = nr_bos,
-         .out_sync = queue->sync,
-         .jc = batch->frag_jc.first_job,
-         .requirements = PANFROST_JD_REQ_FS,
-      };
-
-      if (batch->vtc_jc.first_job) {
-         submit.in_syncs = (uintptr_t)(&queue->sync);
-         submit.in_sync_count = 1;
-      } else {
-         submit.in_syncs = (uintptr_t)in_fences;
-         submit.in_sync_count = nr_in_fences;
+      ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->frag_jc.first_job, 0x01);
+      if (ret)
+         mesa_loge("panvk: v9 frag_jc job chain failed: kbase event 0x%x "
+                   "(PANVK_V9_TRACE=1 dumps the job status)", -ret);
+      if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
+         fprintf(panvk_debug_log_file(),
+                 "[PANVK_DEBUG_SUBMIT] frag_jc ret=%d\n", ret);
+         panvk_debug_dump_job_status(cmdbuf, batch, "frag_jc");
+         panvk_debug_dump_tiler_heap(dev, "SESUDAH frag_jc (fragment)");
       }
-
-      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
-      assert(!ret);
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
-         ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
-                              NULL);
-         assert(!ret);
-
+      if (PANVK_DEBUG(TRACE)) {
          /* If we want to read the descriptors back, we need to invalidate the
           * whole desc pool, otherwise we might end up with stale data. */
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
@@ -140,9 +387,6 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if (PANVK_DEBUG(SYNC))
-         pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
-                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (PANVK_DEBUG(TRACE))
@@ -187,7 +431,10 @@ panvk_add_wait_event_syncobjs(struct panvk_batch *batch, uint32_t *in_fences,
          /* Nothing to do yet */
          break;
       case PANVK_EVENT_OP_WAIT:
-         in_fences[(*nr_in_fences)++] = op->event->syncobj;
+         /* kbase: the set happened in an earlier, already finished batch
+          * or on the host before submission (required by the spec). */
+         if (!op->event->kbase)
+            in_fences[(*nr_in_fences)++] = op->event->syncobj;
          break;
       default:
          UNREACHABLE("bad panvk_cmd_event_op type\n");
@@ -204,11 +451,22 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
       switch (op->type) {
       case PANVK_EVENT_OP_SET: {
+         if (op->event->kbase) {
+            /* The batch has completed (synchronous kbase submit).
+             * PANVK_KBASE_EVENT_NO_SET=1: negative control, drop the set. */
+            if (!getenv("PANVK_KBASE_EVENT_NO_SET"))
+               p_atomic_set(&op->event->kbase_set, 1);
+            break;
+         }
          panvk_queue_transfer_sync(queue, op->event->syncobj);
          break;
       }
       case PANVK_EVENT_OP_RESET: {
          struct panvk_event *event = op->event;
+         if (event->kbase) {
+            p_atomic_set(&event->kbase_set, 0);
+            break;
+         }
 
          struct drm_syncobj_array objs = {
             .handles = (uint64_t)(uintptr_t)&event->syncobj,
@@ -237,13 +495,19 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
 
-   semaphores[0] = queue->sync;
+   /* On kbase the device's sync type is the CPU sync from
+    * get_device_sync_types_kbase(), not a DRM syncobj, so the waits cannot be
+    * turned into syncobj handles. Every v9 submission below is synchronous
+    * (panvk_kbase_submit_and_wait), so honouring a wait just means waiting for
+    * it on the CPU before submitting. */
+   semaphores[0] = 0;
    for (unsigned i = 0; i < submit->wait_count; i++) {
-      assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
-      struct vk_drm_syncobj *syncobj =
-         vk_sync_as_drm_syncobj(submit->waits[i].sync);
-
-      semaphores[i + 1] = syncobj->syncobj;
+      VkResult wr = vk_sync_wait(&dev->vk, submit->waits[i].sync,
+                                 submit->waits[i].wait_value,
+                                 VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      if (wr != VK_SUCCESS)
+         return wr;
+      semaphores[i + 1] = 0;
    }
 
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
@@ -311,13 +575,21 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       }
    }
 
-   /* Transfer the out fence to signal semaphores */
-   for (unsigned i = 0; i < submit->signal_count; i++) {
-      assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
-      struct vk_drm_syncobj *syncobj =
-         vk_sync_as_drm_syncobj(submit->signals[i].sync);
-
-      panvk_queue_transfer_sync(queue, syncobj->syncobj);
+   /* Signal fences and semaphores. The old code transferred a DRM syncobj
+    * with DRM_IOCTL_SYNCOBJ_* ioctls, which fail on a kbase fd; the asserts
+    * are compiled out in release builds, so the failure was silent and no
+    * fence was ever signalled: vkWaitForFences always timed out even though
+    * the jobs had completed. All work above has already finished, because
+    * each batch is submitted and waited for synchronously, so the signal can
+    * be raised on the CPU. PANVK_KBASE_NO_SIGNAL=1 reproduces the old
+    * behaviour as a negative control. */
+   if (!getenv("PANVK_KBASE_NO_SIGNAL")) {
+      for (unsigned i = 0; i < submit->signal_count; i++) {
+         VkResult sr = vk_sync_signal(&dev->vk, submit->signals[i].sync,
+                                      submit->signals[i].signal_value);
+         if (sr != VK_SUCCESS)
+            return sr;
+      }
    }
 
    return VK_SUCCESS;
@@ -349,12 +621,7 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   int ret = drmSyncobjCreate(device->drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
-                              &queue->sync);
-   if (ret) {
-      result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-      goto err_finish_queue;
-   }
+   queue->sync = 0;
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
@@ -374,7 +641,7 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
    vk_queue_finish(&queue->vk);
-   drmSyncobjDestroy(dev->drm_fd, queue->sync);
+   /* PATCH: no drm_syncobj to destroy */
    vk_free(&dev->vk.alloc, queue);
 }
 
@@ -398,11 +665,6 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
       u_printf_with_ctx(stdout, &dev->printf.ctx);
       return VK_ERROR_DEVICE_LOST;
    }
-
-   ASSERTED int ret = drmSyncobjWait(dev->drm_fd, &queue->sync, 1,
-                                     INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
-                                     NULL);
-   assert(!ret);
 
    return VK_SUCCESS;
 }
