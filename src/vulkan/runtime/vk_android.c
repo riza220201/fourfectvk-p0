@@ -310,14 +310,16 @@ static bool vk_android_ahb_linear_fix_disabled(void);
 static bool vk_android_gralloc_is_fallback(void);
 
 /* Phase 8.5 (ANB counterpart of panvk-g99-jm 0054). PANVK_ANB_NO_LINEAR_FIX=1
- * restores the old behaviour (negative control).
+ * restores the old behaviour (negative control). PANVK_ANB_FORCE_LINEAR=1 keeps
+ * it on with a real mapper too (linear swapchains for A/B measurements).
  */
 static bool
 vk_android_anb_linear_fix_active(void)
 {
    return !vk_android_ahb_linear_fix_disabled() &&
           os_get_option("PANVK_ANB_NO_LINEAR_FIX") == NULL &&
-          vk_android_gralloc_is_fallback();
+          (vk_android_gralloc_is_fallback() ||
+           os_get_option("PANVK_ANB_FORCE_LINEAR") != NULL);
 }
 
 VkResult
