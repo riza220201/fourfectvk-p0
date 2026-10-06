@@ -30,23 +30,6 @@ copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
    if (drm_is_afbc(dst_img->vk.drm_format_mod))
       return true;
 
-#if PAN_ARCH == 9
-   /* v9: compute copies into multisampled images lose every sample but
-    * sample 0. Image stores go through LEA_TEX + a global store, image loads
-    * through LD_TEX, and the two disagree on where sample N lives. dEQP-VK
-    * resolve_image *copy_before_resolving* / whole_array_image* and
-    * depth_stencil_msaa_copy: 288 fail through compute, all 352 runnable
-    * pass through the graphics pipeline (as on the stock driver). Same size
-    * limit as COPY_GFX; wider multisampled formats were not measured.
-    * PANVK_V9_MS_COPY_COMPUTE=1 keeps the compute path (A/B control). */
-   static int ms_copy_compute = -1;
-   if (ms_copy_compute < 0)
-      ms_copy_compute = getenv("PANVK_V9_MS_COPY_COMPUTE") != NULL;
-   if (!ms_copy_compute && dst_img->vk.samples > 1 &&
-       vk_format_get_blocksize(dst_img->vk.format) <= 4)
-      return true;
-#endif
-
    return false;
 }
 

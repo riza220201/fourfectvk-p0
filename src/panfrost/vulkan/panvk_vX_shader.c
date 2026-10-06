@@ -58,6 +58,105 @@
 
 #define FAU_WORD_COUNT 64
 
+#if PAN_ARCH == 9
+/* Multisampled storage images on v9: the descriptor is a 3D texture with one
+ * slice per (layer, sample) and the sample count in its Array size field
+ * (panvk_v9_storage_ms_as_3d() in panvk_vX_image_view.c, which explains why).
+ * Rewrite the accesses to that layout before descriptor lowering:
+ * load/store/atomics use z = layer * samples + sample, a sample index out of
+ * range stays out of bounds, and size/samples queries read the fields where
+ * the values now live. PANVK_V9_MS_STORAGE_2D=1 keeps both as they were.
+ */
+static bool
+panvk_v9_ms_storage_2d(void)
+{
+   static int ms_2d = -1;
+   if (ms_2d < 0)
+      ms_2d = getenv("PANVK_V9_MS_STORAGE_2D") != NULL;
+   return ms_2d;
+}
+
+static bool
+panvk_v9_lower_image_ms_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                              UNUSED void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+      break;
+   default:
+      return false;
+   }
+
+   if (nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_MS)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *deref = intr->src[0].ssa;
+   const bool is_array = nir_intrinsic_image_array(intr);
+
+   /* A size query treated as a 2D array reads the Array size field: the
+    * sample count. 0 for a null descriptor. */
+   nir_def *samples = nir_channel(
+      b,
+      nir_image_deref_size(b, 3, 32, deref, nir_imm_int(b, 0),
+                           .image_dim = GLSL_SAMPLER_DIM_2D,
+                           .image_array = true),
+      2);
+
+   if (intr->intrinsic == nir_intrinsic_image_deref_samples) {
+      nir_def_replace(&intr->def, samples);
+      return true;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+      /* Width, height and Depth = layers * samples. */
+      nir_def *size3 =
+         nir_image_deref_size(b, 3, 32, deref, intr->src[1].ssa,
+                              .image_dim = GLSL_SAMPLER_DIM_3D,
+                              .image_array = false);
+      nir_def *comps[3] = {
+         nir_channel(b, size3, 0),
+         nir_channel(b, size3, 1),
+         nir_udiv(b, nir_channel(b, size3, 2), nir_umax_imm(b, samples, 1)),
+      };
+      nir_def_replace(&intr->def,
+                      nir_vec(b, comps, intr->def.num_components));
+      return true;
+   }
+
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *sample = nir_channel(b, intr->src[2].ssa, 0);
+   nir_def *layer = is_array ? nir_channel(b, coord, 2) : nir_imm_int(b, 0);
+   nir_def *z = nir_iadd(b, nir_imul(b, layer, samples), sample);
+
+   /* Image coordinates are bounds-checked as 16-bit values with the high
+    * bits as an out-of-bounds flag (pack_image_coords()). */
+   z = nir_bcsel(b, nir_uge(b, sample, samples), nir_imm_int(b, 0x10000), z);
+
+   nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, z, 2));
+   nir_src_rewrite(&intr->src[2], nir_imm_int(b, 0));
+   nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_3D);
+   nir_intrinsic_set_image_array(intr, false);
+   return true;
+}
+
+static bool
+panvk_v9_lower_image_ms(nir_shader *nir)
+{
+   if (panvk_v9_ms_storage_2d())
+      return false;
+
+   return nir_shader_intrinsics_pass(nir, panvk_v9_lower_image_ms_instr,
+                                     nir_metadata_control_flow, NULL);
+}
+#endif
+
 struct panvk_lower_sysvals_context {
    struct panvk_shader_variant *shader;
    const struct vk_graphics_pipeline_state *state;
@@ -1001,6 +1100,9 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
     */
    if (PAN_ARCH < 9)
       NIR_PASS(_, nir, pan_nir_lower_image_ms);
+#if PAN_ARCH == 9
+   NIR_PASS(_, nir, panvk_v9_lower_image_ms);
+#endif
 
    panvk_per_arch(nir_lower_descriptors)(nir, dev, rs, set_layout_count,
                                          set_layouts, state, desc_info);
