@@ -211,7 +211,13 @@ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    if (dev->ops->bo_import_fd) {
       size_t size = lseek(fd, 0, SEEK_END);
       if (size == 0 || size == (size_t)-1) {
-         mesa_loge("invalid dmabuf size");
+         int err = errno;
+         char link[64], target[128] = "?";
+         snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+         ssize_t n = readlink(link, target, sizeof(target) - 1);
+         target[n > 0 ? n : 1] = '\0';
+         mesa_loge("invalid dmabuf size (fd %d -> %s, lseek: %zd, %s)", fd,
+                   target, (ssize_t)size, size ? strerror(err) : "0");
          goto err_unlock;
       }
 

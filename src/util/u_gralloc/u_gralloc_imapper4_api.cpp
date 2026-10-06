@@ -169,7 +169,17 @@ mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
 
    out->num_planes = layouts.size();
 
+   /* The first plane's dma-buf is not always data[0]: MediaTek's gralloc
+    * puts an "anon_inode:gralloc_extra" fd there. Start from the fd that
+    * u_gralloc_native_handle_dmabuf_fd() finds (data[0] whenever that is a
+    * real buffer, i.e. the upstream behaviour). */
+   const int first = u_gralloc_native_handle_dmabuf_fd(hnd->handle);
    int fd_index = 0;
+   while (fd_index < hnd->handle->numFds &&
+          hnd->handle->data[fd_index] != first)
+      fd_index++;
+   if (fd_index >= hnd->handle->numFds)
+      return -EINVAL;
 
    for (uint32_t i = 0; i < layouts.size(); i++) {
       out->strides[i] = layouts[i].strideInBytes;

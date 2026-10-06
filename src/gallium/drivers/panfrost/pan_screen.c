@@ -25,6 +25,9 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "drm-uapi/panfrost_drm.h"
+#if defined(HAVE_PAN_KMOD_KBASE)
+#include "kmod/kbase_kmod.h"
+#endif
 
 #include "decode.h"
 #include "pan_afbc.h"
@@ -910,6 +913,18 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->supported_prim_modes_with_restart = modes;
 
    caps->native_fence_fd = true;
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+   /* u_init_pipe_screen_caps() asks drmGetCap(DRM_CAP_PRIME), which kbase
+    * does not answer: without this, every gralloc buffer import (Android
+    * window surfaces, EGLImages) is refused. kbase imports any dma-buf, and
+    * exports what it allocated from a dma-heap. */
+   if (panfrost_device_is_kbase(dev)) {
+      caps->dmabuf = DRM_PRIME_CAP_IMPORT;
+      if (kbase_kmod_supports_dmabuf(dev->kmod.dev))
+         caps->dmabuf |= DRM_PRIME_CAP_EXPORT;
+   }
+#endif
 
    caps->context_priority_mask = from_kmod_group_allow_priority_flags(
       dev->kmod.dev->props.allowed_group_priorities_mask);
