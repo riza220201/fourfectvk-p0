@@ -113,9 +113,29 @@ typedef VkResult (*panvk_kbase_sync_wait_func)(
    const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
    uint64_t abs_timeout_ns);
 
+/* Turn a pending payload into a sync_file: *sync_file is a new fd, or -1 if
+ * the work has already completed. */
+typedef VkResult (*panvk_kbase_sync_export_func)(
+   void *data,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+   int *sync_file);
+
 void panvk_kbase_sync_set_pending(
    struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+   panvk_kbase_sync_export_func export_fn,
    const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT]);
+
+/* What a submit has to wait for before it may run. */
+enum panvk_kbase_sync_payload {
+   PANVK_KBASE_SYNC_PAYLOAD_NONE,    /* signalled: nothing to wait for */
+   PANVK_KBASE_SYNC_PAYLOAD_GPU,     /* our submitted work: *data, targets */
+   PANVK_KBASE_SYNC_PAYLOAD_FILE,    /* an imported sync_file: *sync_file = dup */
+   PANVK_KBASE_SYNC_PAYLOAD_OTHER,   /* anything else: wait on the CPU */
+};
+
+enum panvk_kbase_sync_payload panvk_kbase_sync_get_payload(
+   struct vk_sync *sync, void **data,
+   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT], int *sync_file);
 #endif
 
 void panvk_physical_device_finish(struct panvk_physical_device *device);

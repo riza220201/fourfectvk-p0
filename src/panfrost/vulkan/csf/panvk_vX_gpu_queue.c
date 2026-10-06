@@ -2709,8 +2709,9 @@ panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
    for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
       const struct vk_sync_signal *signal = &vk_submit->signals[i];
       assert(signal->signal_value == 0);
+      /* No kernel fence for SYNC_FD export here: CPU wait + -1. */
       panvk_kbase_sync_set_pending(signal->sync, submit->queue,
-                                   kbase_wait_sync_targets,
+                                   kbase_wait_sync_targets, NULL,
                                    submit->kbase_target_seqnos);
    }
 }
