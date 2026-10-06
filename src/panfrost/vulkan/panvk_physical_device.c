@@ -2278,7 +2278,8 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
         (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
        !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-       !(all_usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+       (!(all_usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        physical_device->vk.supported_features.shaderStorageImageMultisample)) {
       sampleCounts |=
          get_image_format_sample_counts(physical_device, info->format);
    }

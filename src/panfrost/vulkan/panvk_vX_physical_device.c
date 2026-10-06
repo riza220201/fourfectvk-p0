@@ -355,7 +355,19 @@ panvk_per_arch(get_physical_device_features)(
       .shaderTessellationAndGeometryPointSize = PAN_ARCH >= 10,
       .shaderImageGatherExtended = true,
       .shaderStorageImageExtendedFormats = true,
+#if PAN_ARCH == 9
+      /* Multisampled storage images work on v9 once they are described as
+       * 3D textures (panvk_v9_storage_ms_as_3d(), panvk_v9_lower_image_ms()):
+       * loads, stores, atomics and queries measured exact for 4/8/16-byte
+       * texels, 4x and 8x, 1-4 layers. PANVK_V9_NO_MS_STORAGE_FEATURE=1 keeps
+       * the feature off; the old encoding (PANVK_V9_MS_STORAGE_2D=1) cannot
+       * address samples >= 1, so it turns the feature off too. */
+      .shaderStorageImageMultisample =
+         !getenv("PANVK_V9_MS_STORAGE_2D") &&
+         !getenv("PANVK_V9_NO_MS_STORAGE_FEATURE"),
+#else
       .shaderStorageImageMultisample = false,
+#endif
       .shaderStorageImageReadWithoutFormat = true,
       .shaderStorageImageWriteWithoutFormat = true,
       .shaderUniformBufferArrayDynamicIndexing = true,
@@ -1037,7 +1049,12 @@ panvk_per_arch(get_physical_device_properties)(
       .sampledImageIntegerSampleCounts = sample_counts,
       .sampledImageDepthSampleCounts = sample_counts,
       .sampledImageStencilSampleCounts = sample_counts,
-      .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      /* sample_counts holds for the widest colour format, so every storage
+       * format supports at least these counts. */
+      .storageImageSampleCounts =
+         device->vk.supported_features.shaderStorageImageMultisample
+            ? sample_counts
+            : VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics =
          PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
