@@ -13,6 +13,11 @@ struct pipe_fence_handle {
    struct pipe_reference reference;
    uint32_t syncobj;
    bool signaled;
+
+   /* kbase (no DRM syncobjs): either a kbase_kmod_jm submission seqno, or an
+    * imported sync_file (kbase_fd >= 0). */
+   uint64_t kbase_seqno;
+   int kbase_fd;
 };
 
 void panfrost_fence_reference(struct pipe_screen *pscreen,

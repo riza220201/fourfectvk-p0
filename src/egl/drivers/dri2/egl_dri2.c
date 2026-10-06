@@ -855,6 +855,14 @@ dri2_setup_device(_EGLDisplay *disp, EGLBoolean software)
    /* If we're not software, we need a DRM node FD */
    assert(software || dri2_dpy->fd_render_gpu >= 0);
 
+   /* A kbase (/dev/mali*) GPU is not a DRM device, so there is no DRM
+    * EGLDevice for it: report the software device entry. Rendering does not
+    * depend on it; only EGL_EXT_device_query sees the difference. */
+   if (!software && loader_fd_is_kbase(dri2_dpy->fd_render_gpu)) {
+      disp->Device = _eglFindDevice(-1, true);
+      return disp->Device != NULL;
+   }
+
    /* fd_render_gpu is what we got from WSI, so might actually be a lie and
     * not a render node... */
    if (software) {

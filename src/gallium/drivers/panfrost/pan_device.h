@@ -167,6 +167,14 @@ panfrost_device_fd(const struct panfrost_device *dev)
    return dev->kmod.dev->fd;
 }
 
+/* ARM kbase instead of the panfrost/panthor DRM drivers: no syncobjs, no
+ * per-job BO lists; submission and fences go through kbase_kmod_jm_*. */
+static inline bool
+panfrost_device_is_kbase(const struct panfrost_device *dev)
+{
+   return pan_kmod_dev_is_kbase(dev->kmod.dev);
+}
+
 static inline uint64_t
 panfrost_device_gpu_id(const struct panfrost_device *dev)
 {

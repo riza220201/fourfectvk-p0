@@ -65,6 +65,16 @@ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id);
 char *
 loader_get_driver_for_fd(int fd);
 
+/* True if fd is an ARM Mali kbase device (/dev/mali*), which is a character
+ * device and not DRM. Decided from the path only: kbase wants its version
+ * handshake to be the first ioctl on the fd. */
+bool
+loader_fd_is_kbase(int fd);
+
+/* Open the first kbase device (/dev/mali0), or -1. */
+int
+loader_open_kbase_device(void);
+
 void *
 loader_open_driver_lib(const char *driver_name,
                        const char *lib_suffix,

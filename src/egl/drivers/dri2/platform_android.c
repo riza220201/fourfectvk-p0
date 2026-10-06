@@ -1162,6 +1162,15 @@ droid_open_device(_EGLDisplay *disp, bool swrast)
       dev_list = _eglDeviceNext(dev_list);
    }
 
+   /* No DRM device: try an ARM Mali kbase GPU (/dev/mali0). */
+   if (dri2_dpy->fd_render_gpu < 0 && !swrast && !disp->Options.Zink) {
+      dri2_dpy->fd_render_gpu = loader_open_kbase_device();
+      if (dri2_dpy->fd_render_gpu >= 0 && !droid_probe_device(disp, false)) {
+         close(dri2_dpy->fd_render_gpu);
+         dri2_dpy->fd_render_gpu = -1;
+      }
+   }
+
    if (dri2_dpy->fd_render_gpu < 0) {
       _eglLog(_EGL_WARNING, "Failed to open %s DRM device",
               vendor_name ? "desired" : "any");

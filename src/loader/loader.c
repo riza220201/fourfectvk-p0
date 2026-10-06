@@ -776,6 +776,33 @@ out:
    return driver;
 }
 
+bool
+loader_fd_is_kbase(int fd)
+{
+#if defined(HAVE_PAN_KMOD_KBASE)
+   char link[64], path[PATH_MAX];
+
+   snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+   ssize_t len = readlink(link, path, sizeof(path) - 1);
+   if (len <= 0)
+      return false;
+   path[len] = '\0';
+   return strncmp(path, "/dev/mali", 9) == 0;
+#else
+   return false;
+#endif
+}
+
+int
+loader_open_kbase_device(void)
+{
+#if defined(HAVE_PAN_KMOD_KBASE)
+   return loader_open_device("/dev/mali0");
+#else
+   return -1;
+#endif
+}
+
 char *
 loader_get_driver_for_fd(int fd)
 {
@@ -791,6 +818,10 @@ loader_get_driver_for_fd(int fd)
       if (override && strlen(override))
          return strdup(override);
    }
+
+   /* kbase is not DRM: no DRM ioctl may reach it before its handshake. */
+   if (loader_fd_is_kbase(fd))
+      return strdup("kbase");
 
 #if defined(USE_DRICONF)
    driver = loader_get_dri_config_driver(fd);

@@ -16,6 +16,45 @@ extern "C" {
 struct drm_panthor_csif_info;
 
 struct pan_kmod_dev;
+struct pan_kmod_bo;
+
+/* ---- JM job submission (JM kbase only) ----------------------------------
+ * One in-order queue per kbase context: every submission runs after the
+ * previous one. Completion is tracked by seqno; fences are kbase sync_files.
+ */
+#define KBASE_KMOD_JM_MAX_JOBS 120
+
+struct kbase_kmod_jm_job {
+   uint64_t jc;       /* first job descriptor of a job chain */
+   uint32_t core_req; /* BASE_JD_REQ_*: 0x16 vertex/tiler/compute, 0x01 fragment */
+};
+
+/* Submit `count` job chains, each after the previous one, after all earlier
+ * submissions on the device, and after the sync_file wait_fd if >= 0 (the
+ * fd is not consumed). count may be 0 with a wait_fd; with neither, *seqno
+ * is the newest submission. Returns 0, or -errno (-ENODEV: not JM kbase). */
+int kbase_kmod_jm_submit(struct pan_kmod_dev *dev,
+                         const struct kbase_kmod_jm_job *jobs, unsigned count,
+                         int wait_fd, uint64_t *seqno);
+
+/* Wait until submission `seqno` completed. abs_timeout_ns is CLOCK_MONOTONIC
+ * (os_time_get_nano), OS_TIMEOUT_INFINITE waits forever, 0 only polls.
+ * Returns 0, -ETIMEDOUT, or -EIO once the context is lost. */
+int kbase_kmod_jm_wait(struct pan_kmod_dev *dev, uint64_t seqno,
+                       uint64_t abs_timeout_ns);
+
+/* Newest submitted seqno, 0 if none. */
+uint64_t kbase_kmod_jm_last_seqno(struct pan_kmod_dev *dev);
+
+/* *sync_file = a sync_file that signals when `seqno` completes (one
+ * FENCE_TRIGGER per submission; later exports get a dup). If it already
+ * completed: -1, or a signalled sync_file when always_fd. Returns 0/-errno. */
+int kbase_kmod_jm_export_sync_file(struct pan_kmod_dev *dev, uint64_t seqno,
+                                   bool always_fd, int *sync_file);
+
+/* Record that submission `seqno` reads (or writes) `bo`: pan_kmod_bo_wait()
+ * and freeing the BO then wait for it. */
+void kbase_kmod_jm_bo_use(struct pan_kmod_bo *bo, uint64_t seqno, bool write);
 
 /* CSF interface information for a kbase CSF device, presented in the
  * panthor uAPI layout so CSF-generic code can consume either backend.

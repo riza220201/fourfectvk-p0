@@ -35,9 +35,11 @@
  */
 
 #include "c11/threads.h"
+#include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/dma-heap.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,10 +49,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "util/cnd_monotonic.h"
 #include "util/macros.h"
 #include "util/simple_mtx.h"
 #include "util/list.h"
+#include "util/os_file.h"
 #include "util/os_time.h"
+#include "util/timespec.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "util/log.h"
@@ -115,6 +120,14 @@ struct kbase_kmod_dev {
       uint64_t target_minus_one;
       int fence_fd;
    } kcpu;
+
+   /* JM job submission with completion tracking (JM only; created with the
+    * device, used by drivers through kbase_kmod_jm_*). */
+   struct kbase_kmod_jm *jm;
+
+   /* PAN_KBASE_CTRL_NO_BO_WAIT=1: negative control, bo_wait returns at once
+    * (the behaviour before kbase_kmod_jm). */
+   bool ctrl_no_bo_wait;
 };
 
 struct kbase_kmod_vm {
@@ -166,6 +179,11 @@ struct kbase_kmod_bo {
    /* Whether this is a SAME_VA region (freed by munmap()) or a zone
     * region (freed by KBASE_IOCTL_MEM_FREE). */
    bool same_va;
+
+   /* Newest kbase_kmod_jm submission that reads / writes the BO (0: none).
+    * kbase jobs hold no reference to the memory they use, so bo_wait and
+    * bo_free wait for these. Only drivers using kbase_kmod_jm set them. */
+   uint64_t jm_read_seqno, jm_write_seqno;
 };
 
 bool
@@ -1141,6 +1159,514 @@ kbase_kmod_alias_destroy(struct pan_kmod_dev *dev, uint64_t va, uint64_t size,
    munmap((void *)(uintptr_t)va, size * nents);
 }
 
+/* -------------------------------------------------------------------------
+ * JM job submission with completion tracking and sync_file fences
+ *
+ * The same design as PanVK's JM queue (Phase 8.15), for any driver on a JM
+ * kbase device. Every kbase_kmod_jm_submit() is one JOB_SUBMIT, a
+ * "submission" with a seqno: its job atoms depend (DATA) on each other in
+ * order, its first atom depends (ORDER) on the previous submission's last
+ * atom, so everything on the device runs in submission order. A wait on an
+ * imported sync_file is a FENCE_WAIT soft atom; an exported fence is a
+ * FENCE_TRIGGER soft atom after the submission's last atom. Whichever thread
+ * needs progress polls and reads the kbase events, one reader at a time.
+ *
+ * kbase behaviour relied on (a16w_jm r54p1 source; fenceprobe on the RS4):
+ * an atom number can be reused once its event has been read, or at once if
+ * the event was suppressed on success; a dependency on a completed atom is
+ * met if it ended DONE; ORDER never passes a failure on; the FENCE_TRIGGER fd
+ * is written back during the JOB_SUBMIT ioctl.
+ * ---------------------------------------------------------------------- */
+
+#define KBASE_JM_ATOM_STRIDE 64 /* base_jd_atom_v2 + MTK BM_2 frame_nr */
+#define KBASE_JM_MAX_SUB_ATOMS (KBASE_KMOD_JM_MAX_JOBS + 2) /* + WAIT + DEP */
+#define KBASE_JM_MAX_SUBS 255 /* each submission holds >= 1 atom number */
+
+#define KBASE_JM_DEP_DATA (1u << 0)
+#define KBASE_JM_DEP_ORDER (1u << 1)
+#define KBASE_JM_REQ_DEP 0u
+#define KBASE_JM_REQ_SOFT_JOB (1u << 9)
+#define KBASE_JM_REQ_FENCE_TRIGGER (KBASE_JM_REQ_SOFT_JOB | 0x2)
+#define KBASE_JM_REQ_FENCE_WAIT (KBASE_JM_REQ_SOFT_JOB | 0x3)
+#define KBASE_JM_REQ_EVENT_ONLY_ON_FAILURE (1u << 12)
+#define KBASE_JM_EVENT_DONE 0x1
+
+struct kbase_jm_base_fence { /* struct base_fence */
+   int fd;
+   int stream_fd;
+};
+
+struct kbase_jm_event { /* struct base_jd_event_v2 */
+   uint32_t event_code;
+   uint8_t atom_number;
+   uint8_t padding[3];
+   uint64_t udata[2];
+};
+
+struct kbase_jm_sub {
+   uint64_t seqno;
+   uint8_t last;
+   bool done;
+   int fence_fd;
+   uint16_t nr_atoms;
+   uint8_t atoms[KBASE_JM_MAX_SUB_ATOMS];
+};
+
+enum kbase_jm_atom_use {
+   KBASE_JM_ATOM_FREE = 0,
+   KBASE_JM_ATOM_SUB, /* in a submission, freed when it completes */
+   KBASE_JM_ATOM_AUX, /* an export's FENCE_TRIGGER, freed by its event */
+};
+
+struct kbase_kmod_jm {
+   int fd;
+   /* Everything below; held across JOB_SUBMIT so seqno order is kernel
+    * order. The reader polls and reads without it. */
+   mtx_t mtx;
+   struct u_cnd_monotonic cnd;
+   uint64_t last_seqno, completed_seqno;
+   struct kbase_jm_sub subs[KBASE_JM_MAX_SUBS]; /* ring, oldest first */
+   unsigned head, count;
+   uint8_t atom_use[256];
+   unsigned nr_free, cursor;
+   bool lost, reading;
+};
+
+static struct kbase_kmod_jm *
+kbase_jm_get(struct pan_kmod_dev *dev)
+{
+   return container_of(dev, struct kbase_kmod_dev, base)->jm;
+}
+
+static void
+kbase_jm_atom(uint8_t *a, uint8_t num, uint64_t jc, uint32_t core_req,
+              uint8_t dep0, uint8_t type0, uint8_t dep1, uint8_t type1)
+{
+   memset(a, 0, KBASE_JM_ATOM_STRIDE);
+   memcpy(a + 0, &jc, 8);
+   a[36] = dep0; /* pre_dep[0] */
+   a[37] = dep0 ? type0 : 0;
+   a[38] = dep1; /* pre_dep[1] */
+   a[39] = dep1 ? type1 : 0;
+   a[40] = num;  /* atom_number */
+   memcpy(a + 44, &core_req, 4);
+}
+
+static void
+kbase_jm_free_atoms(struct kbase_kmod_jm *k, unsigned n, const uint8_t *nums)
+{
+   for (unsigned i = 0; i < n; i++) {
+      assert(k->atom_use[nums[i]] != KBASE_JM_ATOM_FREE);
+      k->atom_use[nums[i]] = KBASE_JM_ATOM_FREE;
+   }
+   k->nr_free += n;
+}
+
+static struct kbase_jm_sub *
+kbase_jm_find_sub(struct kbase_kmod_jm *k, uint8_t atom)
+{
+   for (unsigned i = 0; i < k->count; i++) {
+      struct kbase_jm_sub *sub = &k->subs[(k->head + i) % KBASE_JM_MAX_SUBS];
+      for (unsigned j = 0; j < sub->nr_atoms; j++) {
+         if (sub->atoms[j] == atom)
+            return sub;
+      }
+   }
+   return NULL;
+}
+
+/* Caller holds k->mtx. */
+static void
+kbase_jm_handle_event(struct kbase_kmod_jm *k, const struct kbase_jm_event *ev)
+{
+   const uint8_t atom = ev->atom_number;
+
+   if (k->atom_use[atom] == KBASE_JM_ATOM_AUX) {
+      if (ev->event_code != KBASE_JM_EVENT_DONE)
+         mesa_loge("kbase: out-fence atom %u: event 0x%x", atom,
+                   ev->event_code);
+      kbase_jm_free_atoms(k, 1, &atom);
+      return;
+   }
+
+   struct kbase_jm_sub *sub = kbase_jm_find_sub(k, atom);
+   if (!sub) {
+      mesa_loge("kbase: event 0x%x for unknown atom %u", ev->event_code, atom);
+      return;
+   }
+
+   if (ev->event_code != KBASE_JM_EVENT_DONE)
+      mesa_loge("kbase: atom %u of submission %" PRIu64 " failed: event 0x%x",
+                atom, sub->seqno, ev->event_code);
+   if (atom == sub->last)
+      sub->done = true;
+
+   /* Submissions complete in order: retire the finished ones. */
+   while (k->count && k->subs[k->head].done) {
+      struct kbase_jm_sub *s = &k->subs[k->head];
+      kbase_jm_free_atoms(k, s->nr_atoms, s->atoms);
+      if (s->fence_fd >= 0)
+         close(s->fence_fd);
+      k->completed_seqno = s->seqno;
+      k->head = (k->head + 1) % KBASE_JM_MAX_SUBS;
+      k->count--;
+   }
+}
+
+/* Wait (until abs_timeout_ns) for kbase events, read and process them. One
+ * thread reads at a time, the others wait for its broadcast. Caller holds
+ * k->mtx, which is dropped while polling. Returns false on timeout. */
+static bool
+kbase_jm_progress_locked(struct kbase_kmod_jm *k, uint64_t abs_timeout_ns)
+{
+   if (k->reading) {
+      if (!abs_timeout_ns)
+         return false;
+      struct timespec ts;
+      timespec_from_nsec(&ts, abs_timeout_ns);
+      return u_cnd_monotonic_timedwait(&k->cnd, &k->mtx, &ts) != thrd_timedout;
+   }
+
+   k->reading = true;
+   mtx_unlock(&k->mtx);
+
+   struct pollfd pfd = {.fd = k->fd, .events = POLLIN};
+   int ret;
+   do {
+      struct timespec rel, *timeout = NULL;
+      if (abs_timeout_ns != OS_TIMEOUT_INFINITE) {
+         uint64_t now = os_time_get_nano();
+         timespec_from_nsec(&rel,
+                            abs_timeout_ns > now ? abs_timeout_ns - now : 0);
+         timeout = &rel;
+      }
+      ret = ppoll(&pfd, 1, timeout, NULL);
+   } while (ret < 0 && errno == EINTR);
+
+   /* poll() said there are events and nobody else reads: read() returns
+    * every pending event that fits without blocking. */
+   struct kbase_jm_event ev[32];
+   ssize_t len = 0;
+   bool failed = ret < 0;
+   if (ret > 0 && (pfd.revents & POLLIN)) {
+      len = read(k->fd, ev, sizeof(ev));
+      failed = len <= 0;
+   } else if (ret > 0) {
+      failed = true; /* POLLERR / POLLHUP / POLLNVAL */
+   }
+   if (failed)
+      mesa_loge("kbase: event poll/read failed: %s", strerror(errno));
+
+   mtx_lock(&k->mtx);
+   for (unsigned i = 0; len > 0 && i < len / sizeof(ev[0]); i++)
+      kbase_jm_handle_event(k, &ev[i]);
+   if (failed)
+      k->lost = true;
+   k->reading = false;
+   u_cnd_monotonic_broadcast(&k->cnd);
+   return ret != 0;
+}
+
+/* Caller holds k->mtx; may wait (dropping it) for numbers to be freed. */
+static int
+kbase_jm_alloc_atoms(struct kbase_kmod_jm *k, unsigned n, uint8_t *nums,
+                     enum kbase_jm_atom_use use)
+{
+   assert(n > 0 && n < 256);
+   while (k->nr_free < n) {
+      if (k->lost)
+         return -EIO;
+      kbase_jm_progress_locked(k, OS_TIMEOUT_INFINITE);
+   }
+
+   for (unsigned i = 0; i < n; i++) {
+      while (k->atom_use[k->cursor] != KBASE_JM_ATOM_FREE)
+         k->cursor = k->cursor % 255 + 1;
+      nums[i] = k->cursor;
+      k->atom_use[k->cursor] = use;
+      k->cursor = k->cursor % 255 + 1;
+   }
+   k->nr_free -= n;
+   return 0;
+}
+
+static int
+kbase_jm_wait_locked(struct kbase_kmod_jm *k, uint64_t seqno,
+                     uint64_t abs_timeout_ns)
+{
+   while (k->completed_seqno < seqno) {
+      if (k->lost)
+         return -EIO;
+      if (!kbase_jm_progress_locked(k, abs_timeout_ns) &&
+          k->completed_seqno < seqno)
+         return -ETIMEDOUT;
+   }
+   return 0;
+}
+
+static struct kbase_kmod_jm *
+kbase_jm_create(int fd)
+{
+   struct kbase_kmod_jm *k = calloc(1, sizeof(*k));
+   if (!k)
+      return NULL;
+   if (mtx_init(&k->mtx, mtx_plain) != thrd_success)
+      goto err_free;
+   if (u_cnd_monotonic_init(&k->cnd) != thrd_success)
+      goto err_mtx;
+   k->fd = fd;
+   k->atom_use[0] = KBASE_JM_ATOM_SUB; /* 0 means "no dependency" */
+   k->nr_free = 255;
+   k->cursor = 1;
+   return k;
+
+err_mtx:
+   mtx_destroy(&k->mtx);
+err_free:
+   free(k);
+   return NULL;
+}
+
+static void
+kbase_jm_destroy(struct kbase_kmod_jm *k)
+{
+   if (!k)
+      return;
+
+   /* Never free what the GPU may still use; kbase stops hung jobs itself,
+    * so the wait is bounded. */
+   mtx_lock(&k->mtx);
+   if (kbase_jm_wait_locked(k, k->last_seqno,
+                            os_time_get_absolute_timeout(10000000000ll)))
+      mesa_loge("kbase: JM work still pending at device destroy");
+   for (unsigned i = 0; i < k->count; i++) {
+      struct kbase_jm_sub *sub = &k->subs[(k->head + i) % KBASE_JM_MAX_SUBS];
+      if (sub->fence_fd >= 0)
+         close(sub->fence_fd);
+   }
+   mtx_unlock(&k->mtx);
+   u_cnd_monotonic_destroy(&k->cnd);
+   mtx_destroy(&k->mtx);
+   free(k);
+}
+
+int
+kbase_kmod_jm_submit(struct pan_kmod_dev *dev,
+                     const struct kbase_kmod_jm_job *jobs, unsigned n,
+                     int wait_fd, uint64_t *seqno)
+{
+   struct kbase_kmod_jm *k = kbase_jm_get(dev);
+   if (!k)
+      return -ENODEV;
+   assert(n <= KBASE_KMOD_JM_MAX_JOBS);
+
+   mtx_lock(&k->mtx);
+   if (!n && wait_fd < 0) {
+      *seqno = k->last_seqno;
+      mtx_unlock(&k->mtx);
+      return 0;
+   }
+
+   const unsigned nr_atoms = n + (wait_fd >= 0) + (n == 0);
+   uint8_t nums[KBASE_JM_MAX_SUB_ATOMS];
+   int ret = kbase_jm_alloc_atoms(k, nr_atoms, nums, KBASE_JM_ATOM_SUB);
+   if (ret) {
+      mtx_unlock(&k->mtx);
+      return ret;
+   }
+
+   /* The previous submission's last atom, while it is in flight. */
+   const uint8_t prev =
+      k->count ? k->subs[(k->head + k->count - 1) % KBASE_JM_MAX_SUBS].last
+               : 0;
+   uint8_t atoms[KBASE_JM_MAX_SUB_ATOMS][KBASE_JM_ATOM_STRIDE];
+   struct kbase_jm_base_fence wait_fence = {.fd = wait_fd, .stream_fd = -1};
+   uint8_t wait_atom = 0;
+   unsigned a = 0;
+
+   if (wait_fd >= 0) {
+      wait_atom = nums[a];
+      kbase_jm_atom(atoms[a], nums[a], (uintptr_t)&wait_fence,
+                    KBASE_JM_REQ_FENCE_WAIT |
+                       KBASE_JM_REQ_EVENT_ONLY_ON_FAILURE,
+                    0, 0, 0, 0);
+      a++;
+   }
+
+   /* ORDER on the previous submission and on the wait: a failure there does
+    * not cancel this work. */
+   for (unsigned i = 0; i < n; i++, a++) {
+      uint32_t core_req = jobs[i].core_req;
+      if (i + 1 < n)
+         core_req |= KBASE_JM_REQ_EVENT_ONLY_ON_FAILURE;
+      if (i == 0)
+         kbase_jm_atom(atoms[a], nums[a], jobs[i].jc, core_req, prev,
+                       KBASE_JM_DEP_ORDER, wait_atom, KBASE_JM_DEP_ORDER);
+      else
+         kbase_jm_atom(atoms[a], nums[a], jobs[i].jc, core_req, nums[a - 1],
+                       KBASE_JM_DEP_DATA, 0, 0);
+   }
+
+   if (!n) {
+      /* Only a wait: a dependency-only atom completes the submission. */
+      kbase_jm_atom(atoms[a], nums[a], 0, KBASE_JM_REQ_DEP, prev,
+                    KBASE_JM_DEP_ORDER, wait_atom, KBASE_JM_DEP_ORDER);
+      a++;
+   }
+   assert(a == nr_atoms);
+
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uint64_t)(uintptr_t)atoms,
+      .nr_atoms = nr_atoms,
+      .stride = KBASE_JM_ATOM_STRIDE,
+   };
+   if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+      /* Some atoms may be in the kernel: keep their numbers, give up. */
+      ret = -errno;
+      mesa_loge("kbase: JOB_SUBMIT of %u atoms failed: %s", nr_atoms,
+                strerror(errno));
+      k->lost = true;
+      u_cnd_monotonic_broadcast(&k->cnd);
+      mtx_unlock(&k->mtx);
+      return ret;
+   }
+
+   assert(k->count < KBASE_JM_MAX_SUBS);
+   struct kbase_jm_sub *sub =
+      &k->subs[(k->head + k->count) % KBASE_JM_MAX_SUBS];
+   k->count++;
+   *sub = (struct kbase_jm_sub){
+      .seqno = ++k->last_seqno,
+      .last = nums[nr_atoms - 1],
+      .fence_fd = -1,
+      .nr_atoms = nr_atoms,
+   };
+   memcpy(sub->atoms, nums, nr_atoms);
+   *seqno = sub->seqno;
+   mtx_unlock(&k->mtx);
+   return 0;
+}
+
+int
+kbase_kmod_jm_wait(struct pan_kmod_dev *dev, uint64_t seqno,
+                   uint64_t abs_timeout_ns)
+{
+   struct kbase_kmod_jm *k = kbase_jm_get(dev);
+   if (!k || !seqno)
+      return 0;
+
+   mtx_lock(&k->mtx);
+   int ret = kbase_jm_wait_locked(k, seqno, abs_timeout_ns);
+   mtx_unlock(&k->mtx);
+   return ret;
+}
+
+uint64_t
+kbase_kmod_jm_last_seqno(struct pan_kmod_dev *dev)
+{
+   struct kbase_kmod_jm *k = kbase_jm_get(dev);
+   if (!k)
+      return 0;
+
+   mtx_lock(&k->mtx);
+   uint64_t seqno = k->last_seqno;
+   mtx_unlock(&k->mtx);
+   return seqno;
+}
+
+/* A FENCE_TRIGGER atom: after `dep` (0: none, signals at once). Caller holds
+ * k->mtx. Returns the fd, or -errno. */
+static int
+kbase_jm_trigger_locked(struct kbase_kmod_jm *k, uint8_t dep)
+{
+   uint8_t num;
+   int ret = kbase_jm_alloc_atoms(k, 1, &num, KBASE_JM_ATOM_AUX);
+   if (ret)
+      return ret;
+
+   struct kbase_jm_base_fence fence = {.fd = -1, .stream_fd = -1};
+   uint8_t atom[KBASE_JM_ATOM_STRIDE];
+   kbase_jm_atom(atom, num, (uintptr_t)&fence, KBASE_JM_REQ_FENCE_TRIGGER, dep,
+                 KBASE_JM_DEP_DATA, 0, 0);
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uint64_t)(uintptr_t)atom,
+      .nr_atoms = 1,
+      .stride = KBASE_JM_ATOM_STRIDE,
+   };
+   if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+      ret = -errno;
+      mesa_loge("kbase: FENCE_TRIGGER submit failed: %s", strerror(errno));
+      k->lost = true;
+      u_cnd_monotonic_broadcast(&k->cnd);
+      return ret;
+   }
+   /* fd < 0: the atom completes with an error, its event frees the number */
+   return fence.fd >= 0 ? fence.fd : -EIO;
+}
+
+int
+kbase_kmod_jm_export_sync_file(struct pan_kmod_dev *dev, uint64_t seqno,
+                               bool always_fd, int *sync_file)
+{
+   struct kbase_kmod_jm *k = kbase_jm_get(dev);
+   int ret = 0;
+
+   *sync_file = -1;
+   if (!k)
+      return -ENODEV;
+
+   mtx_lock(&k->mtx);
+   while (k->completed_seqno < seqno) {
+      struct kbase_jm_sub *sub =
+         &k->subs[(k->head + (seqno - k->subs[k->head].seqno)) %
+                  KBASE_JM_MAX_SUBS];
+      assert(k->count && sub->seqno == seqno);
+
+      if (sub->fence_fd < 0) {
+         int fd = kbase_jm_trigger_locked(k, sub->last);
+         if (fd < 0) {
+            ret = fd;
+            break;
+         }
+         /* The allocation may have waited: the submission may have
+          * completed, or another export may have made its fence. */
+         if (k->completed_seqno >= seqno || sub->fence_fd >= 0) {
+            close(fd);
+            continue;
+         }
+         sub->fence_fd = fd;
+      }
+
+      *sync_file = os_dupfd_cloexec(sub->fence_fd);
+      if (*sync_file < 0)
+         ret = -errno;
+      break;
+   }
+
+   /* Already complete: a signalled sync_file if the caller needs an fd. */
+   if (!ret && *sync_file < 0 && always_fd) {
+      int fd = kbase_jm_trigger_locked(k, 0);
+      if (fd < 0)
+         ret = fd;
+      else
+         *sync_file = fd;
+   }
+   mtx_unlock(&k->mtx);
+   return ret;
+}
+
+void
+kbase_kmod_jm_bo_use(struct pan_kmod_bo *bo, uint64_t seqno, bool write)
+{
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+
+   /* Seqnos only grow; submissions on a device are serialised. */
+   if (write)
+      p_atomic_set(&kbase_bo->jm_write_seqno, seqno);
+   p_atomic_set(&kbase_bo->jm_read_seqno, seqno);
+}
+
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
                       UNUSED const struct pan_kmod_driver *drv_info,
@@ -1315,6 +1841,13 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    kbase_dev_query_props(kbase_dev, props_buf, props_size);
    free(props_buf);
 
+   if (!is_csf) {
+      kbase_dev->jm = kbase_jm_create(fd);
+      if (!kbase_dev->jm)
+         mesa_logw("kbase: no JM submission state (kbase_kmod_jm_* disabled)");
+   }
+   kbase_dev->ctrl_no_bo_wait = getenv("PAN_KBASE_CTRL_NO_BO_WAIT") != NULL;
+
    const char *dma_heap = getenv("PANVK_KBASE_DMA_HEAP");
    const char *cached_heap = dma_heap;
    const bool jm_v9 = !is_csf && pan_arch(kbase_dev->base.props.gpu_id) == 9;
@@ -1378,6 +1911,9 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
+
+   kbase_jm_destroy(kbase_dev->jm);
+   kbase_dev->jm = NULL;
 
    kbase_quar_reap(dev->fd, true);
 
@@ -2107,6 +2643,13 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    struct kbase_kmod_bo *kbase_bo =
       container_of(bo, struct kbase_kmod_bo, base);
 
+   /* kbase jobs hold no reference to their memory (the panfrost DRM driver
+    * keeps a job's BOs alive until it completes): don't free under the GPU. */
+   uint64_t busy = p_atomic_read(&kbase_bo->jm_read_seqno);
+   if (busy && kbase_kmod_jm_wait(bo->dev, busy, OS_TIMEOUT_INFINITE))
+      mesa_loge("kbase: freeing a BO whose submission %" PRIu64
+                " did not complete", busy);
+
    pan_kmod_bo_cleanup(bo);
 
    if (kbase_bo->growable) {
@@ -2271,21 +2814,30 @@ kbase_kmod_bo_munmap(UNUSED struct pan_kmod_bo *bo, UNUSED void *host_addr,
    return 0;
 }
 
-/* kbase does not expose per-BO fence objects.
- *
- * Returning true here is safe for non-shared BOs that have an exclusive_vm
- * (the common case for compute/render work) because the GPU is serialised by
- * the queue-submission path before the CPU touches the buffer.  For shared /
- * exported BOs proper inter-process synchronisation must be handled at a
- * higher level (e.g. via sync_file / Android fence).
- *
- * A full implementation would use KBASE_IOCTL_KCPU_QUEUE_ENQUEUE with a
- * fence-wait operation to block until the GPU has finished with the BO. */
+/* kbase has no per-BO fences. Drivers that submit through kbase_kmod_jm
+ * record which submission last used a BO (kbase_kmod_jm_bo_use), and this
+ * waits for it: for a CPU read only the last writer, otherwise any use. A BO
+ * no such submission used (seqno 0) is idle as far as we know -- PanVK, which
+ * still has its own queue, never sets them, so it keeps the old behaviour.
+ * Other processes' use of shared buffers is synchronised with sync_files. */
 static bool
 kbase_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
                    bool for_read_only_access)
 {
-   return true;
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+   uint64_t seqno = for_read_only_access
+                       ? p_atomic_read(&kbase_bo->jm_write_seqno)
+                       : p_atomic_read(&kbase_bo->jm_read_seqno);
+   if (!seqno ||
+       container_of(bo->dev, struct kbase_kmod_dev, base)->ctrl_no_bo_wait)
+      return true;
+
+   uint64_t abs = timeout_ns == 0 ? 0
+                  : timeout_ns < 0 || timeout_ns == INT64_MAX
+                     ? OS_TIMEOUT_INFINITE
+                     : os_time_get_absolute_timeout(timeout_ns);
+   return kbase_kmod_jm_wait(bo->dev, seqno, abs) == 0;
 }
 
 static int

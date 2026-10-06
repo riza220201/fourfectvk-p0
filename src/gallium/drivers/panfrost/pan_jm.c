@@ -17,6 +17,11 @@
 #include "pan_precomp.h"
 #include "pan_trace.h"
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+#include "kmod/kbase_kmod.h"
+#include "util/os_time.h"
+#endif
+
 #if PAN_ARCH >= 10
 #error "JM helpers are only used for gen < 10"
 #endif
@@ -172,6 +177,106 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    return 0;
 }
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+static void
+jm_kbase_mark_pool(struct panfrost_device *dev, struct panfrost_pool *pool,
+                   uint64_t seqno)
+{
+   unsigned n = panfrost_pool_num_bos(pool);
+   uint32_t *handles = calloc(n ? n : 1, sizeof(*handles));
+   if (!handles)
+      return;
+   panfrost_pool_get_bo_handles(pool, handles);
+   /* Job headers and GPU-only data are written by the GPU too. */
+   for (unsigned i = 0; i < n; i++)
+      kbase_kmod_jm_bo_use(pan_lookup_bo(dev, handles[i])->kmod_bo, seqno,
+                           true);
+   free(handles);
+}
+
+/* kbase: no DRM scheduler, no syncobjs, no per-job BO list. Both job chains
+ * of the batch go out as one kbase_kmod_jm submission (the device's in-order
+ * queue keeps other contexts' tiler jobs from landing between them), after
+ * the imported fences gathered in ctx->in_sync_fd (FENCE_WAIT). Every BO the
+ * batch uses is marked with the submission's seqno, which pan_kmod_bo_wait()
+ * and freeing the BO wait for. The cycle-count requirement has no kbase
+ * equivalent here and is dropped. */
+static int
+jm_submit_batch_kbase(struct panfrost_batch *batch, bool has_draws,
+                      bool has_frag)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   struct kbase_kmod_jm_job jobs[2];
+   unsigned n = 0;
+   uint64_t seqno = 0;
+   int ret = 0;
+
+   if (has_draws)
+      jobs[n++] = (struct kbase_kmod_jm_job){
+         .jc = batch->jm.jobs.vtc_jc.first_job, .core_req = 0x16};
+   if (has_frag)
+      jobs[n++] = (struct kbase_kmod_jm_job){
+         .jc = batch->jm.jobs.frag, .core_req = 0x01};
+
+   /* PAN_KBASE_CTRL_NO_SUBMIT=1: negative control, nothing reaches the GPU. */
+   static int ctrl_no_submit = -1;
+   if (ctrl_no_submit < 0)
+      ctrl_no_submit = getenv("PAN_KBASE_CTRL_NO_SUBMIT") != NULL;
+   if (ctrl_no_submit)
+      n = 0;
+
+   if (!ctx->is_noop)
+      ret = kbase_kmod_jm_submit(dev->kmod.dev, jobs, n, ctx->in_sync_fd,
+                                 &seqno);
+   if (ctx->in_sync_fd >= 0) {
+      close(ctx->in_sync_fd);
+      ctx->in_sync_fd = -1;
+   }
+   if (ret)
+      return -ret;
+   if (ctx->is_noop)
+      return 0;
+
+   ctx->kbase_seqno = seqno;
+
+   pan_bo_access *flags = util_dynarray_begin(&batch->bos);
+   unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
+   for (unsigned i = 0; i < end_bo; ++i) {
+      if (!flags[i])
+         continue;
+      struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+      kbase_kmod_jm_bo_use(bo->kmod_bo, seqno, flags[i] & PAN_BO_ACCESS_WRITE);
+      panfrost_context_report_bo_access(ctx, bo, flags[i]);
+   }
+   jm_kbase_mark_pool(dev, &batch->pool, seqno);
+   jm_kbase_mark_pool(dev, &batch->invisible_pool, seqno);
+   if (batch->jm.jobs.vtc_jc.first_tiler)
+      kbase_kmod_jm_bo_use(dev->tiler_heap->kmod_bo, seqno, true);
+   kbase_kmod_jm_bo_use(dev->sample_positions->kmod_bo, seqno, false);
+
+   if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+      /* Wait so we can get errors reported back */
+      ret = kbase_kmod_jm_wait(dev->kmod.dev, seqno, OS_TIMEOUT_INFINITE);
+      if (ret)
+         return -ret;
+
+      for (unsigned i = 0; i < n; i++) {
+         if (dev->debug & PAN_DBG_TRACE)
+            pandecode_jc(dev->decode_ctx, jobs[i].jc,
+                         panfrost_device_gpu_id(dev));
+         if (dev->debug & PAN_DBG_SYNC)
+            pandecode_abort_on_fault(dev->decode_ctx, jobs[i].jc,
+                                     panfrost_device_gpu_id(dev));
+      }
+      if (dev->debug & PAN_DBG_DUMP)
+         pandecode_dump_mappings(dev->decode_ctx);
+   }
+
+   return 0;
+}
+#endif
+
 /* Submit both vertex/tiler and fragment jobs for a batch, possibly with an
  * outsync corresponding to the later of the two (since there will be an
  * implicit dep between them) */
@@ -188,6 +293,11 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
    bool has_frag = panfrost_has_fragment_job(batch);
    uint32_t out_sync = batch->ctx->syncobj;
    int ret = 0;
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+   if (panfrost_device_is_kbase(dev))
+      return jm_submit_batch_kbase(batch, has_draws, has_frag);
+#endif
 
    unsigned reqs =
       batch->need_job_req_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0;
@@ -1102,8 +1212,10 @@ GENX(jm_init_context)(struct panfrost_context *ctx)
 {
    PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
 
-   /* The default context is medium prio, so we use that one. */
-   if (!(ctx->flags &
+   /* The default context is medium prio, so we use that one. kbase has no
+    * JM contexts: every GL context shares the device's queue. */
+   if (panfrost_device_is_kbase(pan_device(ctx->base.screen)) ||
+       !(ctx->flags &
          (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_LOW_PRIORITY))) {
       ctx->jm.handle = 0;
       return 0;
@@ -1139,6 +1251,15 @@ GENX(jm_cleanup_context)(struct panfrost_context *ctx)
    PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
 
    struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+   /* Same reason as below: nothing keeps the memory of in-flight jobs alive
+    * on kbase either. */
+   if (panfrost_device_is_kbase(dev)) {
+      kbase_kmod_jm_wait(dev->kmod.dev, ctx->kbase_seqno, OS_TIMEOUT_INFINITE);
+      return;
+   }
+#endif
 
    if (!ctx->jm.handle) {
       /* Without an explicit JM context, nothing kills the jobs this context

@@ -690,6 +690,9 @@ pan_kmod_dev_create_with_driver(int fd, uint32_t flags,
 
 void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
 
+/* True if the device runs on the ARM kbase backend (not DRM). */
+bool pan_kmod_dev_is_kbase(const struct pan_kmod_dev *dev);
+
 static inline struct pan_kmod_va_range
 pan_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
 {

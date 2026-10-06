@@ -339,6 +339,40 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
    return true;
 }
 
+/* No DRM device: try an ARM Mali kbase GPU (/dev/mali0). */
+static bool
+surfaceless_probe_device_kbase(_EGLDisplay *disp)
+{
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+
+   dri2_dpy->fd_render_gpu = loader_open_kbase_device();
+   if (dri2_dpy->fd_render_gpu < 0)
+      return false;
+
+   if (!dri2_setup_device(disp, false))
+      goto fail;
+
+   dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
+   if (!dri2_dpy->driver_name)
+      goto fail;
+
+   dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
+   dri2_dpy->loader_extensions = image_loader_extensions;
+   if (!dri2_create_screen(disp)) {
+      _eglLog(_EGL_WARNING, "DRI2: failed to create a kbase screen");
+      goto fail;
+   }
+   return true;
+
+fail:
+   free(dri2_dpy->driver_name);
+   dri2_dpy->driver_name = NULL;
+   close(dri2_dpy->fd_render_gpu);
+   dri2_dpy->fd_render_gpu = -1;
+   dri2_dpy->fd_display_gpu = -1;
+   return false;
+}
+
 static bool
 surfaceless_probe_device_sw(_EGLDisplay *disp)
 {
@@ -389,6 +423,8 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
     */
    driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
                                             disp->Options.Zink);
+   if (!driver_loaded && !disp->Options.ForceSoftware && !disp->Options.Zink)
+      driver_loaded = surfaceless_probe_device_kbase(disp);
    if (!driver_loaded && disp->Options.ForceSoftware) {
       _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
       driver_loaded = surfaceless_probe_device_sw(disp);

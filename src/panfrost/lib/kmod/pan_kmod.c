@@ -124,6 +124,16 @@ pan_kmod_dev_create(int fd, uint32_t flags,
    return dev;
 }
 
+bool
+pan_kmod_dev_is_kbase(const struct pan_kmod_dev *dev)
+{
+#if defined(HAVE_PAN_KMOD_KBASE)
+   return dev->ops == &kbase_kmod_ops;
+#else
+   return false;
+#endif
+}
+
 void
 pan_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {

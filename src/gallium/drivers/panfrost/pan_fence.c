@@ -12,8 +12,14 @@
 #include "pan_context.h"
 #include "pan_screen.h"
 
+#include "util/libsync.h"
+#include "util/os_file.h"
 #include "util/os_time.h"
 #include "util/u_inlines.h"
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+#include "kmod/kbase_kmod.h"
+#endif
 
 void
 panfrost_fence_reference(struct pipe_screen *pscreen,
@@ -24,7 +30,12 @@ panfrost_fence_reference(struct pipe_screen *pscreen,
    struct pipe_fence_handle *old = *ptr;
 
    if (pipe_reference(&old->reference, &fence->reference)) {
-      drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
+      if (panfrost_device_is_kbase(dev)) {
+         if (old->kbase_fd >= 0)
+            close(old->kbase_fd);
+      } else {
+         drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
+      }
       free(old);
    }
 
@@ -42,6 +53,23 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
       return true;
 
    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+
+#if defined(HAVE_PAN_KMOD_KBASE)
+   if (panfrost_device_is_kbase(dev)) {
+      if (fence->kbase_fd >= 0) {
+         int timeout_ms = timeout == OS_TIMEOUT_INFINITE
+                             ? -1
+                             : (int)MIN2(DIV_ROUND_UP(timeout, 1000000), INT32_MAX);
+         ret = sync_wait(fence->kbase_fd, timeout_ms);
+      } else {
+         ret = kbase_kmod_jm_wait(dev->kmod.dev, fence->kbase_seqno,
+                                  abs_timeout);
+      }
+      fence->signaled = ret == 0;
+      return fence->signaled;
+   }
+#endif
+
    if (abs_timeout == OS_TIMEOUT_INFINITE)
       abs_timeout = INT64_MAX;
 
@@ -58,6 +86,17 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
    struct panfrost_device *dev = pan_device(screen);
    int fd = -1;
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+   if (panfrost_device_is_kbase(dev)) {
+      if (f->kbase_fd >= 0)
+         return os_dupfd_cloexec(f->kbase_fd);
+      /* A real sync_file, signalled already if the work is done: EGL native
+       * fences and Android's queueBuffer want an fd. */
+      kbase_kmod_jm_export_sync_file(dev->kmod.dev, f->kbase_seqno, true, &fd);
+      return fd;
+   }
+#endif
+
    drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
    return fd;
 }
@@ -72,6 +111,18 @@ panfrost_fence_from_fd(struct panfrost_context *ctx, int fd,
    struct pipe_fence_handle *f = calloc(1, sizeof(*f));
    if (!f)
       return NULL;
+   f->kbase_fd = -1;
+
+   if (panfrost_device_is_kbase(dev)) {
+      /* Only sync_files exist on kbase; keep our own reference. */
+      if (type != PIPE_FD_TYPE_NATIVE_SYNC ||
+          (f->kbase_fd = os_dupfd_cloexec(fd)) < 0) {
+         free(f);
+         return NULL;
+      }
+      pipe_reference_init(&f->reference, 1);
+      return f;
+   }
 
    if (type == PIPE_FD_TYPE_NATIVE_SYNC) {
       ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &f->syncobj);
@@ -110,6 +161,18 @@ panfrost_fence_create(struct panfrost_context *ctx)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
    int fd = -1, ret;
+
+   if (panfrost_device_is_kbase(dev)) {
+      /* The context's newest submission (0: nothing submitted yet). */
+      struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+      if (!f)
+         return NULL;
+      f->kbase_fd = -1;
+      f->kbase_seqno = ctx->kbase_seqno;
+      f->signaled = !ctx->kbase_seqno;
+      pipe_reference_init(&f->reference, 1);
+      return f;
+   }
 
    /* Snapshot the last rendering out fence. We'd rather have another
     * syncobj instead of a sync file, but this is all we get.

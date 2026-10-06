@@ -237,6 +237,10 @@ struct panfrost_context {
    int in_sync_fd;
    uint32_t in_sync_obj;
 
+   /* kbase: the newest kbase_kmod_jm submission of this context (what
+    * ctx->syncobj tracks on DRM). */
+   uint64_t kbase_seqno;
+
    union {
       struct panfrost_csf_context csf;
       struct panfrost_jm_context jm;
