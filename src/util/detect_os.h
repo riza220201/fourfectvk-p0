@@ -25,7 +25,13 @@
  * also be defined.
  */
 #if defined(__ANDROID__)
+#if defined(HAVE_ANDROID_PLATFORM)
+/* -Dplatforms=android: a real Android platform build (the EGL/GLES libs and the Vulkan HAL loaded by
+ * the platform loaders). Upstream's value: logs go to logcat, options also come from properties. */
+#define DETECT_OS_ANDROID 1
+#else
 #define DETECT_OS_ANDROID 0 /* PATCH: Termux clang targets android triple but lacks AOSP userland (liblog, libsync); forcing portable code paths */
+#endif
 #endif
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
