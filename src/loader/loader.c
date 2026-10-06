@@ -726,6 +726,10 @@ loader_get_linux_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
 bool
 loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
 {
+   /* A kbase GPU is a platform device, never PCI; don't probe it as DRM. */
+   if (loader_fd_is_kbase(fd))
+      return false;
+
 #ifdef __linux__
    /* Implementation without causing full enumeration of DRM devices. */
    if (loader_get_linux_pci_id_for_fd(fd, vendor_id, chip_id))
