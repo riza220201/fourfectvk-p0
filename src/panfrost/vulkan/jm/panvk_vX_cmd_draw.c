@@ -2553,8 +2553,8 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
        * update and occlusion counting happened before the fragment shader,
        * so samples killed by `discard` were still counted (CTS
        * occlusion_query.*precise*discard). Same selection as CSF
-       * build_dcd_flags() and gallium jm_emit_draw(). FPK bits stay false
-       * (conservative). PANVK_V9_DCD_NO_EARLYZS=1 restores the old flags
+       * build_dcd_flags() and gallium jm_emit_draw(). FPK: see below.
+       * PANVK_V9_DCD_NO_EARLYZS=1 restores the old flags
        * (negative control). */
       if (fs) {
          static int no_earlyzs = -1;
@@ -2584,6 +2584,46 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
             cfg.flags_0.shader_modifies_coverage =
                fs->info.fs.writes_coverage || fs->info.fs.can_discard ||
                alpha_to_coverage;
+         }
+
+         /* Forward pixel kill: a later opaque fragment may kill earlier ones
+          * still in flight at the same pixel. Same rule as CSF
+          * build_dcd_flags() and the v6/v7 RENDERER_STATE path above: only
+          * when the shader can be killed safely (can_fpk), writes every bound
+          * colour target, reads none of them back, nothing reads the
+          * destination (blending), no alpha-to-coverage, no rasterization
+          * order access. PANVK_V9_NO_FPK=1 keeps both bits off (the old,
+          * conservative behaviour; A/B control). */
+         static int no_fpk = -1;
+         if (no_fpk < 0)
+            no_fpk = getenv("PANVK_V9_NO_FPK") != NULL;
+         if (!no_earlyzs && !no_fpk) {
+            uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
+                              MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+            uint8_t rt_written = color_attachment_written_mask(fs, &dyns->cal);
+            uint8_t rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+            bool roa_color =
+               dyns->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+
+            /* A target the shader writes but whose write mask is zero (or
+             * whose colour writes are disabled) keeps its old contents, so
+             * it is not "written": FPK would kill those contents. Partial
+             * masks are already caught by any_dest_read
+             * (pan_blend_reads_dest), a zero mask is not -- the CSF and
+             * v6/v7 rules share that gap; gallium masks with the blend's
+             * enabled_mask. Found by mrt_alias_test (RT1 write mask 0). */
+            for (unsigned i = 0; i < MAX_RTS; i++) {
+               if (!dyns->cb.attachments[i].write_mask ||
+                   !(dyns->cb.color_write_enables & BITFIELD_BIT(i)))
+                  rt_written &= ~BITFIELD_BIT(i);
+            }
+
+            cfg.flags_0.allow_forward_pixel_to_kill =
+               fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
+               !(rt_read & rt_written) && !alpha_to_coverage &&
+               !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
+            cfg.flags_0.allow_forward_pixel_to_be_killed =
+               !fs->info.writes_global;
          }
 
          /* PATCH v9: per-sample shading was never requested on v9, so the
