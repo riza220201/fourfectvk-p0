@@ -1621,7 +1621,14 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
     * because that's what switches it between tc_draw_vbo and u_vbuf_draw_vbo.
     */
    struct st_context *st = st_context(ctx);
-   if (index_bo && ctx->Driver.DrawGallium == st_draw_gallium &&
+   /* Only a threaded context can ever have tc_draw_vbo in cso_context: for any other context the
+    * prepare below is followed by DrawGallium -> st_draw_gallium, which prepares again. The first
+    * prepare can dirty core state (the framebuffer atom picks up a new window buffer and calls
+    * _mesa_resize_framebuffer -> _NEW_BUFFERS), so the second one then runs on unvalidated state
+    * (with asserts: "ctx->NewState == 0x0" in st_prepare_draw; seen with HWUI's first indexed draw
+    * of a frame on Android, panfrost on kbase).
+    */
+   if (st->is_threaded_context && index_bo && ctx->Driver.DrawGallium == st_draw_gallium &&
        ctx->DrawID == 0) {
       st_prepare_stipple_input_prim(ctx->st, mode);
       ST_PIPELINE_RENDER_STATE_MASK(mask);
@@ -1662,6 +1669,12 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
          draw->index_bias = basevertex;
          return;
       }
+
+      /* Falling through to DrawGallium, which prepares again: re-validate the core state the
+       * prepare above may have dirtied (see above).
+       */
+      if (ctx->NewState)
+         _mesa_update_state(ctx);
    }
 
    struct pipe_draw_info info;
