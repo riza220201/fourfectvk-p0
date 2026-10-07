@@ -338,6 +338,15 @@ droid_create_surface(_EGLDisplay *disp, EGLint type, _EGLConfig *conf,
             ? GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN
             : GRALLOC_USAGE_HW_RENDER;
 
+      /* Mali kbase (MT6789 / G57): MediaTek's display controller shows the AFBC that panfrost writes as
+       * grey when it scans the buffer out as an overlay (the GPU composition path decodes it fine), so ask
+       * gralloc for a linear window buffer: it picks LINEAR as soon as CPU usage is present.
+       * PAN_KBASE_WINDOW_AFBC=1 (or debug.mesa.pan.kbase.window.afbc=1) keeps gralloc's choice.
+       */
+      if (loader_fd_is_kbase(dri2_dpy->fd_render_gpu) &&
+          !debug_get_bool_option("PAN_KBASE_WINDOW_AFBC", false))
+         dri2_surf->gralloc_usage |= GRALLOC_USAGE_SW_READ_RARELY | GRALLOC_USAGE_SW_WRITE_RARELY;
+
       if (dri2_surf->base.ActiveRenderBuffer == EGL_SINGLE_BUFFER)
          dri2_surf->gralloc_usage |= dri2_dpy->front_rendering_usage;
 
