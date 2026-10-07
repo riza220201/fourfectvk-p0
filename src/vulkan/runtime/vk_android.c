@@ -310,8 +310,16 @@ static bool vk_android_ahb_linear_fix_disabled(void);
 static bool vk_android_gralloc_is_fallback(void);
 
 /* Phase 8.5 (ANB counterpart of panvk-g99-jm 0054). PANVK_ANB_NO_LINEAR_FIX=1
- * restores the old behaviour (negative control). PANVK_ANB_FORCE_LINEAR=1 keeps
- * it on with a real mapper too (linear swapchains for A/B measurements).
+ * restores the old behaviour (negative control).
+ *
+ * Phase 8.16: linear swapchains by default with a real mapper too.
+ * MediaTek's display controller (MT6789) shows the AFBC that panfrost writes as
+ * a grey rectangle when it scans the buffer out as an overlay, while GPU
+ * composition (screen captures, "Disable HW overlays") decodes it; the blob's
+ * AFBC with the same modifier displays fine. Seen by eye on the panel; linear
+ * (the old PANVK_ANB_FORCE_LINEAR=1) displays correctly. PANVK_ANB_AFBC=1 keeps
+ * gralloc's AFBC choice (for the root-cause work); PANVK_ANB_FORCE_LINEAR is
+ * now the default and ignored.
  */
 static bool
 vk_android_anb_linear_fix_active(void)
@@ -319,7 +327,7 @@ vk_android_anb_linear_fix_active(void)
    return !vk_android_ahb_linear_fix_disabled() &&
           os_get_option("PANVK_ANB_NO_LINEAR_FIX") == NULL &&
           (vk_android_gralloc_is_fallback() ||
-           os_get_option("PANVK_ANB_FORCE_LINEAR") != NULL);
+           os_get_option("PANVK_ANB_AFBC") == NULL);
 }
 
 VkResult
