@@ -120,3 +120,13 @@ struct panlib_tess_indirect_params {
    uint32_t draw_index;
    uint32_t pad;
 };
+
+struct panlib_tes_xfb_params {
+   uint64_t draw;
+   uint64_t offsets;
+   uint64_t job;
+   uint32_t stride[4];
+   uint32_t size[4];
+   uint32_t verts_per_prim;
+   uint32_t count;
+};

@@ -4570,6 +4570,84 @@ launch_xfb_only_v9(struct panvk_cmd_buffer *cmdbuf,
    launch_xfb_v9(cmdbuf, draw);
 }
 
+static VkResult
+launch_tes_xfb_v9(struct panvk_cmd_buffer *cmdbuf,
+                  const struct panvk_draw_data *tess_draw)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   const struct panvk_shader *tes = gfx->tess.tes;
+   const struct panvk_shader_variant *xfb =
+      &tes->variants[PANVK_TES_VARIANT_XFB];
+
+   if (!gfx->xfb.enabled || !gfx->xfb.offsets.gpu || !xfb->bin_size ||
+       pan_env_flag("PANVK_V9_XFB_SKIP"))
+      return VK_SUCCESS;
+
+   struct pan_ptr params = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct panlib_tes_xfb_params), 16);
+   if (!params.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct panlib_tes_xfb_params *p = params.cpu;
+   memset(p, 0, sizeof(*p));
+   p->draw = tess_draw->info.indirect.buffer_dev_addr;
+   p->offsets = gfx->xfb.offsets.gpu;
+   p->verts_per_prim = gfx->tess.prim == MESA_PRIM_POINTS  ? 1
+                       : gfx->tess.prim == MESA_PRIM_LINES ? 2
+                                                           : 3;
+   for (uint32_t i = 0; i < PANVK_MAX_XFB_BUFFERS; i++) {
+      p->stride[i] = tes->tess.xfb_stride[i];
+      p->size[i] = MIN2(gfx->xfb.buffers[i].size, UINT32_MAX);
+      gfx->sysvals.xfb.base[i] = gfx->xfb.buffers[i].address;
+      gfx->sysvals.xfb.offset_ptr[i] =
+         gfx->xfb.offsets.gpu + i * sizeof(uint32_t);
+   }
+   gfx->sysvals.xfb.num_vertices = 0;
+
+   VkResult result = panvk_per_arch(cmd_prepare_push_descs)(
+      cmdbuf, &gfx->desc_state, tes->desc_info.used_set_mask);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = prepare_vs_driver_set(cmdbuf, tes, &gfx->tess.vs_desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, &gfx->desc_state, &tes->desc_info, &gfx->tess.vs_desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct pan_ptr push;
+   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, xfb, &push,
+                                                         1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct pan_ptr job;
+   result = prepare_gfx_cs_job_v9(cmdbuf, xfb, &gfx->tess.vs_desc, push.gpu,
+                                  1, 1, 1, true, &job);
+   if (result != VK_SUCCESS)
+      return result;
+   if (!job.gpu)
+      return VK_SUCCESS;
+   p->job = job.gpu;
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   panlib_tes_xfb_setup(
+      &precomp_ctx, panlib_1d(1),
+      (enum panlib_barrier)(PANLIB_BARRIER_JM_BARRIER |
+                            PANLIB_BARRIER_JM_SUPPRESS_PREFETCH),
+      params.gpu);
+   queue_gfx_cs_job_v9(cmdbuf, &job, true);
+   panlib_tes_xfb_add(&precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_BARRIER,
+                      params.gpu);
+
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+   gfx_state_set_dirty(cmdbuf, DESC_STATE);
+   return VK_SUCCESS;
+}
+
 /* Layered rendering and multiview on v9 JM, same scheme as the Bifrost path
  * (prepare_draw_layer): every draw is recorded once per framebuffer layer (or
  * per view in the view mask) with its own tiler context and layer_id sysval.
@@ -4628,6 +4706,9 @@ panvk_cmd_draw_v9_impl(struct panvk_cmd_buffer *cmdbuf,
          return;
       draw = &tess_draw;
       stats_tess = &tess_draw;
+      if (!cmdbuf->state.gfx.gs.shader &&
+          launch_tes_xfb_v9(cmdbuf, &tess_draw) != VK_SUCCESS)
+         return;
    }
 
    /* PATCH v9: geometry shader prepass, then draw the GS RAST variant. The

@@ -556,6 +556,7 @@ enum panvk_vs_variant {
 enum panvk_tes_variant {
    PANVK_TES_VARIANT_HW,
    PANVK_TES_VARIANT_SW,
+   PANVK_TES_VARIANT_XFB,
 
    PANVK_TES_VARIANTS,
 };
@@ -589,6 +590,7 @@ struct panvk_shader {
       uint32_t tcs_output_stride;
       uint8_t tcs_output_patch_size;
       uint8_t tcs_nr_patch_outputs;
+      uint16_t xfb_stride[MAX_XFB_BUFFERS];
 
       struct panvk_tess_info info;
    } tess;
@@ -666,7 +668,7 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
    }
 
    if (shader->vk.stage == MESA_SHADER_TESS_EVAL && i > 0)
-      return "tes-sw";
+      return i == PANVK_TES_VARIANT_XFB ? "tes-xfb" : "tes-sw";
 
    assert(panvk_shader_num_variants(shader->vk.stage) == 1);
 

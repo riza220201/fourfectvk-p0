@@ -319,4 +319,32 @@ panlib_tess_setup_indirect(constant struct panlib_tess_indirect_params *a)
    panlib_gs_patch_job(a->jobs[PANLIB_TESS_JOB_TCS], in_patches,
                        instance_count);
 }
+
+KERNEL(1)
+panlib_tes_xfb_setup(global struct panlib_tes_xfb_params *p)
+{
+   global uint *offsets = (global uint *)p->offsets;
+   uint vpp = p->verts_per_prim;
+   uint count = *(global uint *)p->draw;
+
+   for (uint b = 0; b < 4; b++) {
+      if (!p->stride[b])
+         continue;
+
+      uint avail = p->size[b] > offsets[b] ? p->size[b] - offsets[b] : 0;
+      count = min(count, avail / (p->stride[b] * vpp) * vpp);
+   }
+
+   p->count = count / vpp * vpp;
+   panlib_gs_patch_job(p->job, p->count, 1);
+}
+
+KERNEL(1)
+panlib_tes_xfb_add(global struct panlib_tes_xfb_params *p)
+{
+   global uint *offsets = (global uint *)p->offsets;
+
+   for (uint b = 0; b < 4; b++)
+      offsets[b] += p->count * p->stride[b];
+}
 #endif

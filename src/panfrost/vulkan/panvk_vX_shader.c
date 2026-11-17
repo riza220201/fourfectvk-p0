@@ -1922,6 +1922,30 @@ panvk_v9_strip_api_side_effects(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static bool
+panvk_v9_tes_xfb_ids(nir_builder *b, nir_intrinsic_instr *intr,
+                     UNUSED void *data)
+{
+   nir_def *repl;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_raw_vertex_id:
+      repl = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+      break;
+   case nir_intrinsic_load_instance_id:
+   case nir_intrinsic_load_num_vertices:
+      repl = nir_imm_int(b, 0);
+      break;
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, repl);
+   return true;
+}
+
 #endif
 
 /* PATCH v9: transform feedback from a geometry shader. libpoly writes the
@@ -3274,6 +3298,63 @@ panvk_compile_shader(struct panvk_device *dev,
                                     noperspective_varyings,
                                     &shader->desc_info, sw_variant);
          ralloc_free(sw);
+         if (result != VK_SUCCESS) {
+            panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+            return result;
+         }
+      }
+#endif
+
+#if PAN_ARCH == 9
+      if (nir->xfb_info) {
+         struct panvk_shader_variant *xfb_variant =
+            &shader->variants[PANVK_TES_VARIANT_XFB];
+         nir_shader *xfb = nir_shader_clone(NULL, nir);
+
+         for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
+            shader->tess.xfb_stride[i] = xfb->xfb_info->buffers[i].stride;
+
+         if (xfb->info.writes_memory)
+            NIR_PASS(_, xfb, nir_shader_intrinsics_pass,
+                     panvk_v9_strip_api_side_effects,
+                     nir_metadata_control_flow, NULL);
+
+         nir_assign_io_var_locations(xfb, nir_var_shader_in);
+         nir_assign_io_var_locations(xfb, nir_var_shader_out);
+         panvk_lower_nir_io(xfb);
+         NIR_PASS(_, xfb, poly_nir_lower_tes, false);
+         NIR_PASS(_, xfb, poly_nir_lower_sysvals);
+
+         xfb->info.stage = MESA_SHADER_VERTEX;
+         memset(&xfb->info.vs, 0, sizeof(xfb->info.vs));
+         xfb->info.vs.tes_poly = true;
+         panvk_lower_nir(dev, xfb, info->set_layout_count, info->set_layouts,
+                         info->robustness, state, &shader->desc_info, false);
+
+         static const nir_lower_xfb_to_stores_options tes_xfb_options = {
+            .address_format = nir_address_format_64bit_global,
+         };
+         NIR_PASS(_, xfb, nir_opt_constant_folding);
+         NIR_PASS(_, xfb, nir_io_add_intrinsic_xfb_info);
+         NIR_PASS(_, xfb, nir_lower_xfb_to_stores, &tes_xfb_options);
+         NIR_PASS(_, xfb, nir_shader_intrinsics_pass, panvk_v9_tes_xfb_ids,
+                  nir_metadata_control_flow, NULL);
+
+         xfb->info.stage = MESA_SHADER_COMPUTE;
+         memset(&xfb->info.cs, 0, sizeof(xfb->info.cs));
+         xfb->info.workgroup_size[0] = 1;
+         xfb->info.workgroup_size[1] = 1;
+         xfb->info.workgroup_size[2] = 1;
+         xfb->xfb_info = NULL;
+         NIR_PASS(_, xfb, poly_nir_lower_sysvals);
+         nir_shader_gather_info(xfb, nir_shader_get_entrypoint(xfb));
+
+         inputs.varying_layout = NULL;
+         xfb_variant->own_bin = true;
+         result = panvk_compile_nir(dev, xfb, info->flags, &inputs, state,
+                                    noperspective_varyings,
+                                    &shader->desc_info, xfb_variant);
+         ralloc_free(xfb);
          if (result != VK_SUCCESS) {
             panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
             return result;
