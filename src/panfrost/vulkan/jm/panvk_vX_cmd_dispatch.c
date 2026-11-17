@@ -204,8 +204,6 @@ cmd_dispatch_impl(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *i
    if (!job.gpu)
       return;
 
-   util_dynarray_append(&batch->jobs, job.cpu);
-
    /* PATCH v9: satu section PAYLOAD flat, ganti INVOCATION+PARAMETERS+DRAW
     * terpisah ala Bifrost. */
    pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
