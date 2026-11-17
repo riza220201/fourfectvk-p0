@@ -278,6 +278,7 @@ panvk_AllocateMemory(VkDevice _device,
 
    p_atomic_add(&physical_device->memory.heap_used,
                 (uint64_t)pan_kmod_bo_size(mem->bo));
+   p_atomic_add(&panvk_process_heap_used, (uint64_t)pan_kmod_bo_size(mem->bo));
 
    *pMem = panvk_device_memory_to_handle(mem);
 
@@ -313,6 +314,7 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
 
    p_atomic_add(&physical_device->memory.heap_used,
                 -((int64_t)pan_kmod_bo_size(mem->bo)));
+   p_atomic_add(&panvk_process_heap_used, -((int64_t)pan_kmod_bo_size(mem->bo)));
 
    if (device->debug.decode_ctx) {
       pandecode_inject_free(device->debug.decode_ctx, mem->addr.dev,

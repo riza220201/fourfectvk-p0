@@ -172,7 +172,10 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
+#ifdef PANVK_USE_WSI_PLATFORM
+      /* Requires VK_KHR_swapchain. */
       .EXT_hdr_metadata = true,
+#endif
       .EXT_host_image_copy = true,
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,

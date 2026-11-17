@@ -1740,6 +1740,8 @@ panvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
    return vk_outarray_status(&out);
 }
 
+uint64_t panvk_process_heap_used;
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDevice physicalDevice,
@@ -1766,7 +1768,8 @@ panvk_GetPhysicalDeviceMemoryProperties2(
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
 
-         uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
+         /* heapUsage is per process: count memory of every instance. */
+         uint64_t used = p_atomic_read(&panvk_process_heap_used);
          uint64_t heap_size = physical_device->memory.heaps[0].size;
 
          /* From the Vulkan 1.3.278 spec:

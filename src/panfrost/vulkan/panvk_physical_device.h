@@ -26,6 +26,10 @@ struct pan_blendable_format;
 struct pan_format;
 struct panvk_instance;
 
+/* VkDeviceMemory bytes allocated by this process, across all instances
+ * (VK_EXT_memory_budget heapUsage is per process). */
+extern uint64_t panvk_process_heap_used;
+
 struct panvk_physical_device {
    struct vk_physical_device vk;
 

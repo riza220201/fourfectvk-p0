@@ -134,7 +134,9 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
 #endif
    .EXT_debug_report = true,
    .EXT_debug_utils = true,
-#ifndef VK_USE_PLATFORM_WIN32_KHR
+   /* Requires VK_KHR_surface, which only the WSI platforms expose. Android
+    * builds get surfaces from the platform loader or a wrapper instead. */
+#if defined(PANVK_USE_WSI_PLATFORM) && !defined(VK_USE_PLATFORM_WIN32_KHR)
    .EXT_headless_surface = true,
 #endif
 };
