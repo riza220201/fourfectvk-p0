@@ -1,0 +1,15 @@
+{
+	global:
+		# The Android platform loader and adrenotools load the HAL through HMI.
+		HMI;
+		# Loader-less harnesses and the CTS vkshim dlsym the ICD entry points
+		# from the same Android package.
+		vk_icdGetInstanceProcAddr;
+		vk_icdGetPhysicalDeviceProcAddr;
+		vk_icdNegotiateLoaderICDInterfaceVersion;
+
+	local:
+		# Statically linked SPIRV-Tools (and LLVM, when enabled) would otherwise
+		# export its whole API; demote everything else.
+		*;
+};
