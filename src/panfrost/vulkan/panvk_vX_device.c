@@ -689,6 +689,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       };
       panvk_priv_bo_flush(device->poly_heap, 0, sizeof(*poly_heap));
    }
+
+   if (device->vk.enabled_features.nullDescriptor) {
+      result = panvk_priv_bo_create(
+         device, PANVK_V9_NULL_INDEX_BUFFER_SIZE,
+         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->null_index_buffer);
+      if (result != VK_SUCCESS)
+         goto err_free_priv_bos;
+   }
 #endif
 
 #if PAN_ARCH >= 10
@@ -825,6 +834,7 @@ err_free_priv_bos:
    panvk_priv_bo_unref(device->sample_positions);
    panvk_priv_bo_unref(device->poly_heap);
    panvk_priv_bo_unref(device->poly_heap_data);
+   panvk_priv_bo_unref(device->null_index_buffer);
    panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_device_cleanup_mempools(device);
@@ -875,6 +885,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->poly_heap);
    panvk_priv_bo_unref(device->poly_heap_data);
+   panvk_priv_bo_unref(device->null_index_buffer);
    panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);

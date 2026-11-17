@@ -68,6 +68,9 @@ struct panvk_va_heap {
    uint64_t end;
 };
 
+/* Virtual size of the v9 null index buffer region: 16M 32-bit indices. */
+#define PANVK_V9_NULL_INDEX_BUFFER_SIZE (64ull * 1024 * 1024)
+
 struct panvk_device {
    struct vk_device vk;
 
@@ -87,6 +90,10 @@ struct panvk_device {
    /* PATCH v9: heap storage, separate from the header so it can grow on GPU
     * page fault (nothing committed until tessellation runs). */
    struct panvk_priv_bo *poly_heap_data;
+   /* v9 has no index-buffer size, so a null index buffer (nullDescriptor +
+    * maintenance6) points at this zero-on-fault region instead of address 0.
+    * Only VA is reserved; pages are committed (zeroed) when the GPU reads. */
+   struct panvk_priv_bo *null_index_buffer;
    struct panvk_priv_bo *indirect_varying_buffer;
    struct panvk_priv_bo *sample_positions;
 

@@ -3041,6 +3041,12 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
       cfg.address = draw->info.index.buffer_dev_addr +
                     (uint64_t)draw->info.index.offset *
                        draw->info.index.index_size;
+      /* Null index buffer: all indices are zero, firstIndex is irrelevant and
+       * must not move the fetch out of the zero region. */
+      const struct panvk_device *ndev = to_panvk_device(cmdbuf->vk.base.device);
+      if (ndev->null_index_buffer &&
+          draw->info.index.buffer_dev_addr == ndev->null_index_buffer->addr.dev)
+         cfg.address = draw->info.index.buffer_dev_addr;
    }
 
    VkResult result = panvk_emit_fs_draw_v9(
@@ -5323,6 +5329,17 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    panvk_cmd_draw_v9(cmdbuf, &draw);
 }
 
+/* An indexed indirect draw with an empty index range can only draw nothing,
+ * except for a null index buffer, which reads zero indices (robustness2). */
+static bool
+v9_index_buffer_empty(const struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   return cmdbuf->state.gfx.ib.size == 0 &&
+          !(dev->null_index_buffer &&
+            cmdbuf->state.gfx.ib.dev_addr == dev->null_index_buffer->addr.dev);
+}
+
 /* Job Manager hardware has no indirect-draw descriptor, so each draw becomes a
  * job plus a helper kernel that patches its counts. There is no multi-draw
  * descriptor either, so drawCount (or maxDrawCount) is unrolled into that many
@@ -5396,7 +5413,7 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
 
-   if (drawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
+   if (drawCount == 0 || v9_index_buffer_empty(cmdbuf))
       return;
 
    draw_indirect_unrolled_v9(cmdbuf, buffer, offset, drawCount, stride, true,
@@ -5436,7 +5453,7 @@ panvk_per_arch(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
    VK_FROM_HANDLE(panvk_buffer, count_buffer, countBuffer);
 
-   if (maxDrawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
+   if (maxDrawCount == 0 || v9_index_buffer_empty(cmdbuf))
       return;
 
    draw_indirect_unrolled_v9(cmdbuf, buffer, offset, maxDrawCount, stride,

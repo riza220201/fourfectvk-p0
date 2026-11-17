@@ -1163,6 +1163,14 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
        * that this only works for v10+, as v9 does not have a way to specify the
        * index buffer size. */
       cmdbuf->state.gfx.ib.dev_addr = PAN_ARCH >= 10 ? 0x1000 : 0;
+#if PAN_ARCH == 9
+      /* v9 reads exactly the indices the draw needs, so point them at a
+       * zero-filled region: every fetched index is 0, as robustness2 requires
+       * for a null index buffer. */
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      if (dev->null_index_buffer)
+         cmdbuf->state.gfx.ib.dev_addr = dev->null_index_buffer->addr.dev;
+#endif
    }
    cmdbuf->state.gfx.ib.index_size = vk_index_type_to_bytes(indexType);
 }
