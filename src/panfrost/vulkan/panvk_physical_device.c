@@ -746,6 +746,8 @@ struct kbase_cpu_sync {
    enum kbase_cpu_sync_state state;
    VkResult result;
    void *pending_data;
+   struct panvk_kbase_owner *pending_owner;
+   uint64_t payload_serial;
    panvk_kbase_sync_wait_func pending_wait;
    /* Makes a sync_file for the pending GPU work, NULL if it cannot. */
    panvk_kbase_sync_export_func pending_export;
@@ -761,6 +763,17 @@ kbase_cpu_sync_drop_file(struct kbase_cpu_sync *ks)
    if (ks->sync_file >= 0)
       close(ks->sync_file);
    ks->sync_file = -1;
+}
+
+static void
+kbase_cpu_sync_drop_pending(struct kbase_cpu_sync *ks)
+{
+   panvk_kbase_owner_unref(ks->pending_owner);
+   ks->pending_owner = NULL;
+   ks->pending_data = NULL;
+   ks->pending_wait = NULL;
+   ks->pending_export = NULL;
+   ks->payload_serial++;
 }
 
 static VkResult
@@ -783,6 +796,8 @@ kbase_cpu_sync_init(struct vk_device *device, struct vk_sync *sync,
    ks->pending_data = NULL;
    ks->pending_wait = NULL;
    ks->pending_export = NULL;
+   ks->pending_owner = NULL;
+   ks->payload_serial = 0;
    memset(ks->targets, 0, sizeof(ks->targets));
    ks->sync_file = -1;
    return VK_SUCCESS;
@@ -793,6 +808,7 @@ kbase_cpu_sync_finish(UNUSED struct vk_device *device, struct vk_sync *sync)
 {
    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
    kbase_cpu_sync_drop_file(ks);
+   kbase_cpu_sync_drop_pending(ks);
    u_cnd_monotonic_destroy(&ks->cond);
    mtx_destroy(&ks->mutex);
 }
@@ -804,6 +820,7 @@ kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
    mtx_lock(&ks->mutex);
    kbase_cpu_sync_drop_file(ks);
+   kbase_cpu_sync_drop_pending(ks);
    ks->state = KBASE_CPU_SYNC_SIGNALED;
    ks->result = VK_SUCCESS;
    ks->pending_data = NULL;
@@ -821,6 +838,7 @@ kbase_cpu_sync_reset(UNUSED struct vk_device *device, struct vk_sync *sync)
    mtx_lock(&ks->mutex);
    assert(ks->state != KBASE_CPU_SYNC_WAITING);
    kbase_cpu_sync_drop_file(ks);
+   kbase_cpu_sync_drop_pending(ks);
    ks->state = KBASE_CPU_SYNC_RESET;
    ks->result = VK_SUCCESS;
    ks->pending_data = NULL;
@@ -837,9 +855,10 @@ kbase_cpu_sync_wait_many(struct vk_device *device, uint32_t wait_count,
                          enum vk_sync_wait_flags wait_flags,
                          uint64_t abs_timeout_ns);
 
-void
-panvk_kbase_sync_set_pending(
-   struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+static void
+kbase_cpu_sync_set_pending(
+   struct vk_sync *sync, void *data, struct panvk_kbase_owner *owner,
+   panvk_kbase_sync_wait_func wait,
    panvk_kbase_sync_export_func export_fn,
    const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT])
 {
@@ -853,6 +872,8 @@ panvk_kbase_sync_set_pending(
     * in-progress wait on the old payload would be a genuine bug. */
    assert(ks->state != KBASE_CPU_SYNC_WAITING);
    kbase_cpu_sync_drop_file(ks);
+   kbase_cpu_sync_drop_pending(ks);
+   ks->pending_owner = panvk_kbase_owner_ref(owner);
    ks->pending_data = data;
    ks->pending_wait = wait;
    ks->pending_export = export_fn;
@@ -861,6 +882,24 @@ panvk_kbase_sync_set_pending(
    ks->state = KBASE_CPU_SYNC_PENDING;
    u_cnd_monotonic_broadcast(&ks->cond);
    mtx_unlock(&ks->mutex);
+}
+
+void
+panvk_kbase_sync_set_pending(
+   struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+   panvk_kbase_sync_export_func export_fn,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT])
+{
+   kbase_cpu_sync_set_pending(sync, data, NULL, wait, export_fn, targets);
+}
+
+void
+panvk_kbase_sync_set_pending_owned(
+   struct vk_sync *sync, struct panvk_kbase_owner *owner,
+   panvk_kbase_sync_wait_func wait, panvk_kbase_sync_export_func export_fn,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT])
+{
+   kbase_cpu_sync_set_pending(sync, owner, owner, wait, export_fn, targets);
 }
 
 enum panvk_kbase_sync_payload
@@ -917,15 +956,34 @@ kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
 
          panvk_kbase_sync_wait_func wait = ks->pending_wait;
          void *data = ks->pending_data;
+         struct panvk_kbase_owner *owner =
+            panvk_kbase_owner_ref(ks->pending_owner);
+         uint64_t serial = ks->payload_serial;
+         int file = ks->sync_file >= 0 ? os_dupfd_cloexec(ks->sync_file) : -1;
+         if (ks->sync_file >= 0 && file < 0) {
+            panvk_kbase_owner_unref(owner);
+            mtx_unlock(&ks->mutex);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
          uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
          memcpy(targets, ks->targets, sizeof(targets));
+         if (file >= 0)
+            targets[0] = file;
          ks->state = KBASE_CPU_SYNC_WAITING;
          mtx_unlock(&ks->mutex);
 
          VkResult result = wait(data, targets, abs_timeout_ns);
+         if (file >= 0)
+            close(file);
+         panvk_kbase_owner_unref(owner);
 
          mtx_lock(&ks->mutex);
+         if (ks->payload_serial != serial) {
+            mtx_unlock(&ks->mutex);
+            return result;
+         }
          if (result == VK_SUCCESS) {
+            kbase_cpu_sync_drop_pending(ks);
             ks->state = KBASE_CPU_SYNC_SIGNALED;
             ks->pending_data = NULL;
             ks->pending_wait = NULL;
@@ -1019,6 +1077,10 @@ kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
    assert(ks_src->state != KBASE_CPU_SYNC_WAITING);
    assert(ks_dst->state != KBASE_CPU_SYNC_WAITING);
 
+   kbase_cpu_sync_drop_pending(ks_dst);
+   ks_dst->pending_owner = ks_src->pending_owner;
+   ks_src->pending_owner = NULL;
+   ks_src->payload_serial++;
    ks_dst->state = ks_src->state;
    ks_dst->result = ks_src->result;
    ks_dst->pending_data = ks_src->pending_data;
@@ -1086,6 +1148,7 @@ kbase_cpu_sync_import_sync_file(struct vk_device *device, struct vk_sync *sync,
    mtx_lock(&ks->mutex);
    assert(ks->state != KBASE_CPU_SYNC_WAITING);
    kbase_cpu_sync_drop_file(ks);
+   kbase_cpu_sync_drop_pending(ks);
    ks->sync_file = fd;
    memset(ks->targets, 0, sizeof(ks->targets));
    ks->targets[0] = (uint64_t)fd;
@@ -1123,10 +1186,14 @@ kbase_cpu_sync_export_sync_file(struct vk_device *device, struct vk_sync *sync,
    if (ks->state == KBASE_CPU_SYNC_PENDING && ks->pending_export) {
       panvk_kbase_sync_export_func export_fn = ks->pending_export;
       void *data = ks->pending_data;
+      struct panvk_kbase_owner *owner =
+         panvk_kbase_owner_ref(ks->pending_owner);
       uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT];
       memcpy(targets, ks->targets, sizeof(targets));
       mtx_unlock(&ks->mutex);
-      return export_fn(data, targets, sync_file);
+      VkResult result = export_fn(data, targets, sync_file);
+      panvk_kbase_owner_unref(owner);
+      return result;
    }
    mtx_unlock(&ks->mutex);
 

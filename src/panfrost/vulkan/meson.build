@@ -64,6 +64,7 @@ libpanvk_files = files(
   'panvk_nir_lower_cooperative_matrix.c',
   'panvk_nir_lower_tile_image.c',
   'panvk_physical_device.c',
+  'panvk_kbase_owner.c',
   'panvk_priv_bo.c',
   'panvk_utrace.c',
   'panvk_wsi.c',

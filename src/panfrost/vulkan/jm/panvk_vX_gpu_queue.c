@@ -36,6 +36,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include "util/cnd_monotonic.h"
 #include "util/libsync.h"
@@ -407,6 +408,9 @@ enum panvk_kbase_atom_use {
 
 struct panvk_kbase_jm {
    int fd;
+   int wake_fd;
+   bool closing;
+   struct panvk_kbase_owner *owner;
    /* Protects everything below, and is held across JOB_SUBMIT so that seqno
     * order is kernel submission order. The reader polls and reads without
     * it. */
@@ -1065,7 +1069,10 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    k->reading = true;
    mtx_unlock(&k->mtx);
 
-   struct pollfd pfd = {.fd = k->fd, .events = POLLIN};
+   struct pollfd pfds[2] = {
+      {.fd = k->fd, .events = POLLIN},
+      {.fd = k->wake_fd, .events = POLLIN},
+   };
    int ret;
    do {
       struct timespec rel, *timeout = NULL;
@@ -1074,7 +1081,7 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
          timespec_from_nsec(&rel, abs_timeout_ns > now ? abs_timeout_ns - now : 0);
          timeout = &rel;
       }
-      ret = ppoll(&pfd, 1, timeout, NULL);
+      ret = ppoll(pfds, 2, timeout, NULL);
    } while (ret < 0 && errno == EINTR);
 
    /* poll() said there are events and nobody else reads: read() returns
@@ -1082,10 +1089,10 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    struct panvk_kbase_event_v2 ev[32];
    ssize_t len = 0;
    bool failed = ret < 0;
-   if (ret > 0 && (pfd.revents & POLLIN)) {
+   if (ret > 0 && (pfds[0].revents & POLLIN)) {
       len = read(k->fd, ev, sizeof(ev));
       failed = len <= 0;
-   } else if (ret > 0) {
+   } else if (ret > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
       failed = true; /* POLLERR / POLLHUP / POLLNVAL */
    }
    if (failed)
@@ -1109,12 +1116,12 @@ panvk_kbase_alloc_atoms(struct panvk_kbase_jm *k, unsigned n, uint8_t *nums,
 {
    assert(n > 0 && n < 256);
    while (k->nr_free < n) {
-      if (k->lost)
+      if (k->lost || k->closing)
          return VK_ERROR_DEVICE_LOST;
       panvk_kbase_progress_locked(k, OS_TIMEOUT_INFINITE);
    }
 
-   if (k->lost)
+   if (k->lost || k->closing)
       return VK_ERROR_DEVICE_LOST;
 
    for (unsigned i = 0; i < n; i++) {
@@ -1136,7 +1143,7 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
                           const struct panvk_kbase_job *jobs, unsigned n,
                           int wait_fd, uint64_t *seqno)
 {
-   if (k->lost)
+   if (k->lost || k->closing)
       return VK_ERROR_DEVICE_LOST;
 
    if (!n && wait_fd < 0) {
@@ -1258,7 +1265,7 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
    mtx_lock(&k->mtx);
    while (k->completed_seqno < seqno) {
       waited = true;
-      if (k->lost) {
+      if (k->lost || k->closing) {
          result = VK_ERROR_DEVICE_LOST;
          break;
       }
@@ -1268,7 +1275,7 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
          break;
       }
    }
-   if (k->lost)
+   if (k->lost || k->closing)
       result = VK_ERROR_DEVICE_LOST;
    mtx_unlock(&k->mtx);
    if (t0 && waited)
@@ -1492,13 +1499,19 @@ panvk_kbase_sync_wait_cb(void *data,
                          const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
                          uint64_t abs_timeout_ns)
 {
-   return panvk_kbase_wait_seqno(data, targets[0], abs_timeout_ns);
+   struct panvk_kbase_owner *owner = data;
+   struct panvk_kbase_jm *k = panvk_kbase_owner_enter(owner);
+   if (!k)
+      return VK_ERROR_DEVICE_LOST;
+   VkResult result = panvk_kbase_wait_seqno(k, targets[0], abs_timeout_ns);
+   panvk_kbase_owner_leave(owner);
+   return result;
 }
 
 /* panvk_kbase_sync_export_func: a FENCE_TRIGGER atom after the submission,
  * one per submission (later exports get a dup of the same sync_file). */
 static VkResult
-panvk_kbase_sync_export_cb(
+panvk_kbase_sync_export_active(
    void *data, const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
    int *sync_file)
 {
@@ -1512,7 +1525,7 @@ panvk_kbase_sync_export_cb(
       return VK_SUCCESS;
 
    mtx_lock(&k->mtx);
-   if (k->lost) {
+   if (k->lost || k->closing) {
       mtx_unlock(&k->mtx);
       return VK_ERROR_DEVICE_LOST;
    }
@@ -1577,6 +1590,20 @@ panvk_kbase_sync_export_cb(
 
    if (cpu_wait && result == VK_SUCCESS)
       result = panvk_kbase_wait_seqno(k, seqno, OS_TIMEOUT_INFINITE);
+   return result;
+}
+
+static VkResult
+panvk_kbase_sync_export_cb(
+   void *data, const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+   int *sync_file)
+{
+   struct panvk_kbase_owner *owner = data;
+   struct panvk_kbase_jm *k = panvk_kbase_owner_enter(owner);
+   if (!k)
+      return VK_ERROR_DEVICE_LOST;
+   VkResult result = panvk_kbase_sync_export_active(k, targets, sync_file);
+   panvk_kbase_owner_leave(owner);
    return result;
 }
 
@@ -1923,8 +1950,25 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
    }
 }
 
-VkResult
-panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+static VkResult
+panvk_kbase_wait_external(struct panvk_kbase_jm *k, struct vk_sync *sync,
+                          uint64_t value)
+{
+   VkResult result;
+   do {
+      mtx_lock(&k->mtx);
+      const bool stopped = k->closing || k->lost;
+      mtx_unlock(&k->mtx);
+      if (stopped)
+         return VK_ERROR_DEVICE_LOST;
+      result = vk_sync_wait(&k->dev->vk, sync, value, VK_SYNC_WAIT_COMPLETE,
+                            os_time_get_absolute_timeout(50000000));
+   } while (result == VK_TIMEOUT);
+   return result;
+}
+
+static VkResult
+panvk_kbase_queue_submit_active(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -1973,7 +2017,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          k->stats.wait_none++;
          continue;
       }
-      if (payload == PANVK_KBASE_SYNC_PAYLOAD_GPU && data == k) {
+      if (payload == PANVK_KBASE_SYNC_PAYLOAD_GPU && data == k->owner) {
          k->stats.wait_own++;
          continue;
       }
@@ -1988,8 +2032,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       }
       k->stats.wait_cpu++;
 
-      VkResult wr = vk_sync_wait(&dev->vk, sync, submit->waits[i].wait_value,
-                                 VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      VkResult wr = panvk_kbase_wait_external(
+         k, sync, submit->waits[i].wait_value);
       if (wr != VK_SUCCESS) {
          if (wait_fd >= 0)
             close(wait_fd);
@@ -2110,7 +2154,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
             if (sr != VK_SUCCESS)
                return sr;
          } else {
-            panvk_kbase_sync_set_pending(submit->signals[i].sync, k,
+            panvk_kbase_sync_set_pending_owned(submit->signals[i].sync, k->owner,
                                          panvk_kbase_sync_wait_cb,
                                          panvk_kbase_sync_export_cb, targets);
          }
@@ -2138,6 +2182,35 @@ err_submit:
    u_cnd_monotonic_broadcast(&k->cnd);
    mtx_unlock(&k->mtx);
    return vk_device_set_lost(&dev->vk, "kbase submission failed: %d", result);
+}
+
+VkResult
+panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue,
+                                  struct vk_queue_submit *submit)
+{
+   struct panvk_gpu_queue *queue =
+      container_of(vk_queue, struct panvk_gpu_queue, vk);
+   struct panvk_kbase_owner *owner = queue->kjm->owner;
+   if (!panvk_kbase_owner_enter(owner))
+      return VK_ERROR_DEVICE_LOST;
+   VkResult result = panvk_kbase_queue_submit_active(vk_queue, submit);
+   panvk_kbase_owner_leave(owner);
+   return result;
+}
+
+static void
+panvk_kbase_jm_close(struct panvk_kbase_jm *k)
+{
+   mtx_lock(&k->mtx);
+   k->closing = true;
+   const uint64_t wake = 1;
+   ssize_t ret;
+   do {
+      ret = write(k->wake_fd, &wake, sizeof(wake));
+   } while (ret < 0 && errno == EINTR);
+   u_cnd_monotonic_broadcast(&k->cnd);
+   mtx_unlock(&k->mtx);
+   panvk_kbase_owner_close(k->owner);
 }
 
 static void
@@ -2195,9 +2268,20 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    if (u_cnd_monotonic_init(&k->cnd) != thrd_success)
       goto err_mtx;
 
+   k->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+   if (k->wake_fd < 0)
+      goto err_cnd;
+   k->owner = panvk_kbase_owner_create(k);
+   if (!k->owner) {
+      close(k->wake_fd);
+      goto err_cnd;
+   }
+
    *out = k;
    return VK_SUCCESS;
 
+err_cnd:
+   u_cnd_monotonic_destroy(&k->cnd);
 err_mtx:
    mtx_destroy(&k->mtx);
 err_free:
@@ -2211,15 +2295,21 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
    if (!k)
       return;
 
-   /* The app must have waited, but never free what the GPU may still use;
-    * a hung GPU gets a bounded wait (kbase stops hung jobs by itself). */
-   uint64_t seqno;
+   panvk_kbase_jm_close(k);
+   uint64_t wake;
+   while (read(k->wake_fd, &wake, sizeof(wake)) < 0 && errno == EINTR)
+      ;
    mtx_lock(&k->mtx);
-   seqno = k->last_seqno;
+   assert(!k->reading);
+   const uint64_t timeout = os_time_get_absolute_timeout(
+      10ull * 1000 * 1000 * 1000);
+   while (!k->lost && k->completed_seqno < k->last_seqno) {
+      if (!panvk_kbase_progress_locked(k, timeout))
+         break;
+   }
+   if (k->lost || k->completed_seqno < k->last_seqno)
+      mesa_loge("panvk: kbase GPU retirement unproven at destroy");
    mtx_unlock(&k->mtx);
-   if (panvk_kbase_wait_seqno(k, seqno, os_time_get_absolute_timeout(
-                                           10ull * 1000 * 1000 * 1000)))
-      mesa_loge("panvk: kbase queue not idle at destroy");
 
    panvk_kbase_log_stats(k);
 
@@ -2236,6 +2326,8 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
       panvk_priv_bo_unref(k->overlap_banks[i].tls);
       panvk_priv_bo_unref(k->overlap_banks[i].wls);
    }
+   close(k->wake_fd);
+   panvk_kbase_owner_unref(k->owner);
    u_cnd_monotonic_destroy(&k->cnd);
    mtx_destroy(&k->mtx);
    vk_free(&device->vk.alloc, k);
@@ -2293,6 +2385,7 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
+   panvk_kbase_jm_close(queue->kjm);
    vk_queue_finish(&queue->vk);
    panvk_kbase_jm_destroy(dev, queue->kjm);
    /* PATCH: no drm_syncobj to destroy */
@@ -2305,8 +2398,8 @@ panvk_per_arch(gpu_queue_check_status)(struct vk_queue *vk_queue)
    return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+static VkResult
+panvk_kbase_queue_wait_idle_active(VkQueue _queue)
 {
    VK_FROM_HANDLE(panvk_gpu_queue, queue, _queue);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -2333,4 +2426,16 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
    panvk_kbase_log_stats(k);
 
    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
+{
+   VK_FROM_HANDLE(panvk_gpu_queue, queue, _queue);
+   struct panvk_kbase_owner *owner = queue->kjm->owner;
+   if (!panvk_kbase_owner_enter(owner))
+      return VK_ERROR_DEVICE_LOST;
+   VkResult result = panvk_kbase_queue_wait_idle_active(_queue);
+   panvk_kbase_owner_leave(owner);
+   return result;
 }

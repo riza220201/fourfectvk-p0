@@ -113,6 +113,8 @@ VkResult panvk_physical_device_init_kbase(struct panvk_physical_device *device,
                                           struct panvk_instance *instance,
                                           const char *path);
 
+#include "panvk_kbase_owner.h"
+
 #define PANVK_KBASE_SYNC_TARGET_COUNT 3
 
 typedef VkResult (*panvk_kbase_sync_wait_func)(
@@ -129,6 +131,12 @@ typedef VkResult (*panvk_kbase_sync_export_func)(
 
 void panvk_kbase_sync_set_pending(
    struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+   panvk_kbase_sync_export_func export_fn,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT]);
+
+void panvk_kbase_sync_set_pending_owned(
+   struct vk_sync *sync, struct panvk_kbase_owner *owner,
+   panvk_kbase_sync_wait_func wait,
    panvk_kbase_sync_export_func export_fn,
    const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT]);
 
