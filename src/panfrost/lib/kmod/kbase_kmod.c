@@ -2026,21 +2026,54 @@ kbase_dmabuf_mapping_flags(struct pan_kmod_dev *dev, int fd,
       return PAN_KMOD_BO_FLAG_NO_MMAP;
 
    uint32_t flags = PAN_KMOD_BO_FLAG_NO_MMAP;
+   bool known = false;
+   exporter[0] = '\0';
    while (fgets(line, sizeof(line), info)) {
       if (sscanf(line, "exp_name: %63s", exporter) != 1)
          continue;
 
-      if (!strcmp(exporter, "system-uncached")) {
+      /* MediaTek's gralloc allocates from its own dma-buf heaps: mtk_mm
+       * (cached) and mtk_mm-uncached. They map like the generic system heaps.
+       * Protected/secure heaps (mtk_prot_*, mtk_svp_*, mtk_wfd_*, ...) are
+       * deliberately not listed: they must never get a CPU mapping. */
+      if (!strcmp(exporter, "system-uncached") ||
+          !strcmp(exporter, "mtk_mm-uncached")) {
          flags = 0;
-      } else if (!strcmp(exporter, "system") &&
-                 pan_kmod_can_sync_bo_map_from_userland(dev)) {
-         flags = PAN_KMOD_BO_FLAG_WB_MMAP;
-         if (import_flags & BASE_MEM_COHERENT_SYSTEM)
-            flags |= PAN_KMOD_BO_FLAG_IO_COHERENT;
+         known = true;
+      } else if (!strcmp(exporter, "system") || !strcmp(exporter, "mtk_mm")) {
+         known = true;
+         if (pan_kmod_can_sync_bo_map_from_userland(dev)) {
+            flags = PAN_KMOD_BO_FLAG_WB_MMAP;
+            if (import_flags & BASE_MEM_COHERENT_SYSTEM)
+               flags |= PAN_KMOD_BO_FLAG_IO_COHERENT;
+         }
       }
       break;
    }
    fclose(info);
+
+   /* Without a CPU mapping every CPU-side transfer into this buffer (e.g.
+    * glTexSubImage2D into a gralloc-backed EGLImage, as HWUI's hardware
+    * bitmap uploader does) fails, and gallium drops the data without a GL
+    * error. Say so once per exporter instead of failing silently. */
+   if (flags & PAN_KMOD_BO_FLAG_NO_MMAP) {
+      static char warned[8][64];
+      static simple_mtx_t warned_lock = SIMPLE_MTX_INITIALIZER;
+      simple_mtx_lock(&warned_lock);
+      bool seen = false;
+      unsigned i;
+      for (i = 0; i < ARRAY_SIZE(warned) && warned[i][0]; i++)
+         seen |= !strcmp(warned[i], exporter);
+      if (!seen && i < ARRAY_SIZE(warned)) {
+         snprintf(warned[i], sizeof(warned[i]), "%s", exporter);
+         mesa_logw("kbase: dma-buf exporter '%s' is %s: no CPU mapping for "
+                   "imported buffers, CPU uploads into them are unsupported",
+                   exporter[0] ? exporter : "(unknown)",
+                   known ? "cached without userland cache maintenance"
+                         : "not on the CPU-mappable list");
+      }
+      simple_mtx_unlock(&warned_lock);
+   }
    return flags;
 }
 
