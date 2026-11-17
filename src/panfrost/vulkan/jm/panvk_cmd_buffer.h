@@ -70,6 +70,13 @@ struct panvk_batch {
    /* PANVK_FRAME_PROF_PASSES: what this batch renders (set at close). */
    struct panvk_frame_prof_pass prof;
 #if PAN_ARCH == 9
+   struct util_dynarray vertex_jobs;
+   struct {
+      struct mali_job_header_packed *job;
+      struct mali_job_header_packed *unconditional_job;
+      uint64_t *list;
+      unsigned index;
+   } cond_render;
    /* PANVK_UBO_PUSH: the panlib_ubo_gather job of this batch (queued before
     * the first draw that pushes UBO words) and its entries
     * (struct panlib_ubo_word), uploaded when the batch is closed. */
@@ -108,6 +115,17 @@ struct panvk_cmd_buffer {
       /* PATCH v9: the poly heap was reset by this command buffer. */
       bool uses_poly_heap;
       uint64_t sync_epoch;
+#if PAN_ARCH == 9
+      struct {
+         uint64_t addr;
+         uint64_t inherited_addr;
+         bool enabled;
+         bool inherited;
+         bool inverted;
+         bool inherited_inverted;
+         bool active;
+      } cond_render;
+#endif
       /* PATCH v9: active pipeline statistics query (addr 0: none). The
        * counters are 64-bit, one per enabled statistic in bit order. */
       struct {
@@ -182,6 +200,11 @@ panvk_cmd_get_desc_state(struct panvk_cmd_buffer *cmdbuf,
 }
 
 extern const struct vk_command_buffer_ops panvk_per_arch(cmd_buffer_ops);
+
+#if PAN_ARCH == 9
+void panvk_per_arch(cmd_cond_render_begin)(struct panvk_cmd_buffer *cmdbuf);
+void panvk_per_arch(cmd_cond_render_end)(struct panvk_cmd_buffer *cmdbuf);
+#endif
 
 struct panvk_batch *
    panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf);

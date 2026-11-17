@@ -130,7 +130,7 @@ prepare_driver_set(struct panvk_cmd_buffer *cmdbuf)
 }
 
 static void
-cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+cmd_dispatch_impl(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 {
    const struct panvk_shader_variant *cs =
       panvk_shader_only_variant(cmdbuf->state.compute.shader);
@@ -144,7 +144,9 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    bool indirect = info->indirect.buffer_dev_addr != 0;
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);
-   struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+   panvk_per_arch(cmd_cond_render_begin)(cmdbuf);
+   struct panvk_batch *batch = cmdbuf->cur_batch
+      ? cmdbuf->cur_batch : panvk_per_arch(cmd_open_batch)(cmdbuf);
 
    const struct panvk_shader_desc_info *cs_desc_info =
       &cmdbuf->state.compute.shader->desc_info;
@@ -304,7 +306,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 }
 #else
 static void
-cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+cmd_dispatch_impl(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 {
    const struct panvk_shader_variant *cs =
       panvk_shader_only_variant(cmdbuf->state.compute.shader);
@@ -460,6 +462,15 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    clear_dirty_after_dispatch(cmdbuf);
 }
 #endif
+
+static void
+cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+{
+   cmd_dispatch_impl(cmdbuf, info);
+#if PAN_ARCH == 9
+   panvk_per_arch(cmd_cond_render_end)(cmdbuf);
+#endif
+}
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDispatchBase)(VkCommandBuffer commandBuffer,

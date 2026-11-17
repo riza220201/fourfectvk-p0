@@ -16,6 +16,8 @@
 #include "panvk_cmd_buffer.h"
 #if PAN_ARCH == 9
 #include "libpan_copy.h"
+#include "draw_helper.h"
+#include "panvk_cmd_precomp.h"
 #endif
 #include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_draw.h"
@@ -127,6 +129,182 @@ panvk_ubo_gather_close(struct panvk_cmd_buffer *cmdbuf,
       }
    }
    util_dynarray_fini(&batch->ubo_gather.words);
+   batch->ubo_gather.hdr = NULL;
+   batch->ubo_gather.job_index = 0;
+}
+
+static struct mali_job_header_packed *
+panvk_cond_job_cpu(struct panvk_cmd_buffer *cmdbuf, uint64_t gpu)
+{
+   struct list_head *lists[] = {&cmdbuf->desc_pool.bos,
+                                &cmdbuf->desc_pool.big_bos};
+   for (unsigned i = 0; i < ARRAY_SIZE(lists); i++) {
+      list_for_each_entry(struct panvk_priv_bo, bo, lists[i], node) {
+         if (gpu >= bo->addr.dev &&
+             gpu - bo->addr.dev <= pan_kmod_bo_size(bo->bo) - pan_size(JOB_HEADER))
+            return (void *)((uint8_t *)bo->addr.host + gpu - bo->addr.dev);
+      }
+   }
+   UNREACHABLE("Conditional job outside descriptor pool");
+}
+
+static void
+panvk_cond_render_dirty(struct panvk_cmd_buffer *cmdbuf)
+{
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+   gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+   compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
+}
+
+static void
+panvk_cond_render_open(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   assert(batch && !batch->cond_render.job);
+
+   struct pan_ptr list =
+      panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(uint64_t), 8);
+   if (!list.gpu)
+      return;
+   *(uint64_t *)list.cpu = 0;
+
+   const unsigned before = batch->vtc_jc.job_index;
+   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const uint64_t addr = cmdbuf->state.cond_render.enabled
+                            ? cmdbuf->state.cond_render.addr
+                            : cmdbuf->state.cond_render.inherited_addr;
+   const bool inverted = cmdbuf->state.cond_render.enabled
+                            ? cmdbuf->state.cond_render.inverted
+                            : cmdbuf->state.cond_render.inherited_inverted;
+   panlib_v9_cond_render(
+      &ctx, panlib_1d(1),
+      PANLIB_BARRIER_JM_BARRIER | PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+      addr, inverted, list.gpu);
+   if (batch->vtc_jc.job_index != before + 1) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   batch->cond_render.job = batch->vtc_jc.prev_job;
+   batch->cond_render.index = batch->vtc_jc.job_index;
+   batch->cond_render.list = list.cpu;
+}
+
+static void
+panvk_cond_render_close(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   if (!batch || !batch->cond_render.job)
+      return;
+
+   panvk_ubo_gather_close(cmdbuf, batch);
+   pan_unpack(batch->cond_render.job, JOB_HEADER, pred);
+   const unsigned count = batch->vtc_jc.job_index - pred.index;
+   struct pan_ptr list = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, (1 + 2 * count) * sizeof(uint64_t), 8);
+   if (!list.gpu)
+      return;
+   uint64_t *entries = list.cpu;
+   entries[0] = 0;
+   for (uint64_t next = pred.next; next;) {
+      struct mali_job_header_packed *job = panvk_cond_job_cpu(cmdbuf, next);
+      pan_unpack(job, JOB_HEADER, h);
+      if (job != batch->cond_render.unconditional_job) {
+         assert(entries[0] < count);
+         entries[1 + 2 * entries[0]] = next;
+         entries[2 + 2 * entries[0]] = h.type;
+         entries[0]++;
+
+         if (!h.dependency_1)
+            h.dependency_1 = pred.index;
+         else if (!h.dependency_2)
+            h.dependency_2 = pred.index;
+         else if (h.dependency_1 < pred.index && h.dependency_2 < pred.index)
+            h.barrier = true;
+         pan_pack(job, JOB_HEADER, cfg) {
+            cfg = h;
+         }
+      }
+      next = h.next;
+   }
+   *batch->cond_render.list = list.gpu;
+   memset(&batch->cond_render, 0, sizeof(batch->cond_render));
+   panvk_cond_render_dirty(cmdbuf);
+}
+
+void
+panvk_per_arch(cmd_cond_render_begin)(struct panvk_cmd_buffer *cmdbuf)
+{
+   assert(!cmdbuf->state.cond_render.active);
+   if (!cmdbuf->state.cond_render.enabled && !cmdbuf->state.cond_render.inherited)
+      return;
+
+   if (cmdbuf->cur_batch &&
+       cmdbuf->cur_batch->vtc_jc.job_index + 32 >= UINT16_MAX)
+      panvk_per_arch(cmd_close_batch)(cmdbuf);
+   if (cmdbuf->cur_batch)
+      panvk_ubo_gather_close(cmdbuf, cmdbuf->cur_batch);
+   panvk_cond_render_dirty(cmdbuf);
+   cmdbuf->state.cond_render.active = true;
+   if (cmdbuf->cur_batch)
+      panvk_cond_render_open(cmdbuf);
+   else
+      panvk_per_arch(cmd_open_batch)(cmdbuf);
+}
+
+void
+panvk_per_arch(cmd_cond_render_end)(struct panvk_cmd_buffer *cmdbuf)
+{
+   if (!cmdbuf->state.cond_render.active)
+      return;
+   panvk_cond_render_close(cmdbuf);
+   cmdbuf->state.cond_render.active = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBeginConditionalRendering2EXT)(
+   VkCommandBuffer commandBuffer,
+   const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   cmdbuf->state.cond_render.enabled = true;
+   cmdbuf->state.cond_render.addr =
+      pConditionalRenderingBegin->addressRange.address;
+   cmdbuf->state.cond_render.inverted =
+      pConditionalRenderingBegin->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdEndConditionalRenderingEXT)(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   cmdbuf->state.cond_render.enabled = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+                                   uint32_t commandBufferCount,
+                                   const VkCommandBuffer *pCommandBuffers)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, primary, commandBuffer);
+   const struct vk_device_dispatch_table *disp =
+      primary->vk.base.device->command_dispatch_table;
+   const __typeof__(primary->state.cond_render) saved = primary->state.cond_render;
+   assert(!saved.active);
+
+   for (uint32_t i = 0; i < commandBufferCount; i++) {
+      VK_FROM_HANDLE(panvk_cmd_buffer, secondary, pCommandBuffers[i]);
+
+      primary->state.cond_render.enabled = false;
+      primary->state.cond_render.inherited = saved.enabled || saved.inherited;
+      primary->state.cond_render.inherited_addr =
+         saved.enabled ? saved.addr : saved.inherited_addr;
+      primary->state.cond_render.inherited_inverted =
+         saved.enabled ? saved.inverted : saved.inherited_inverted;
+
+      vk_cmd_queue_execute(&secondary->vk.cmd_queue, commandBuffer, disp);
+      assert(!primary->state.cond_render.active);
+      primary->state.cond_render = saved;
+   }
 }
 #endif
 
@@ -139,6 +317,7 @@ panvk_destroy_batch(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
    util_dynarray_fini(&batch->event_ops);
 #if PAN_ARCH == 9
    util_dynarray_fini(&batch->ubo_gather.words);
+   util_dynarray_fini(&batch->vertex_jobs);
 #endif
    vk_free(&cmdbuf->vk.pool->alloc, batch);
 }
@@ -164,6 +343,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
    assert(batch);
 
 #if PAN_ARCH == 9
+   panvk_cond_render_close(cmdbuf);
    panvk_ubo_gather_close(cmdbuf, batch);
 #endif
 
@@ -543,6 +723,7 @@ panvk_alloc_batch(struct panvk_cmd_buffer *cmdbuf)
    batch->sync_epoch = cmdbuf->state.sync_epoch;
 #if PAN_ARCH == 9
    batch->ubo_gather.words = UTIL_DYNARRAY_INIT;
+   batch->vertex_jobs = UTIL_DYNARRAY_INIT;
 #endif
 #if PAN_ARCH >= 9
    /* See pan_jc::no_tiler_chain. */
@@ -559,6 +740,10 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
 {
    assert(!cmdbuf->cur_batch);
    cmdbuf->cur_batch = panvk_alloc_batch(cmdbuf);
+#if PAN_ARCH == 9
+   if (cmdbuf->cur_batch && cmdbuf->state.cond_render.active)
+      panvk_cond_render_open(cmdbuf);
+#endif
    return cmdbuf->cur_batch;
 }
 

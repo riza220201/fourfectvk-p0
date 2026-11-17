@@ -1647,27 +1647,19 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
       util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
+      }
 #if PAN_ARCH == 9
-         /* PATCH v9 (0072): a MALLOC_VERTEX job writes the vertex packet
-          * pointer and strides into its own Draw.vertex_array (the CPU only
-          * sets packet). Left in place, the next run of the same command
-          * buffer starts from that pointer and faults (kbase 0x58
-          * DATA_INVALID_FAULT on every re-submit, nothing drawn). Put back
-          * what the CPU wrote. PANVK_V9_NO_REISSUE_VA_RESET=1 skips this
-          * (control). The clear above covers words 0-3; the job type is in
-          * word 4. */
-         const uint32_t *hdr = *job;
-         if (((hdr[4] >> 1) & 0x7f) == MALI_JOB_TYPE_MALLOC_VERTEX &&
-             !reissue_no_va_reset()) {
+      if (!reissue_no_va_reset()) {
+         util_dynarray_foreach(&batch->vertex_jobs, void *, job) {
             uint32_t *va = (uint32_t *)((uint8_t *)(*job) +
                                         pan_section_offset(MALLOC_VERTEX_JOB,
                                                            DRAW)) + 2;
-            va[0] = 1; /* packet = true, pointer = 0 */
+            va[0] = 1;
             va[1] = 0;
-            va[2] = 0; /* strides */
+            va[2] = 0;
          }
-#endif
       }
+#endif
 
       /* Reset the tiler before re-issuing the batch */
       if (batch->tiler.ctx_descs.cpu) {

@@ -147,7 +147,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps =
          device->kmod.dev->props.gpu_can_query_timestamp,
-      .EXT_conditional_rendering = PAN_ARCH >= 10,
+      .EXT_conditional_rendering = PAN_ARCH >= 9,
       .EXT_color_write_enable = true,
       .EXT_conservative_rasterization = PAN_ARCH >= 11,
       .EXT_custom_border_color = true,
@@ -624,8 +624,8 @@ panvk_per_arch(get_physical_device_features)(
       .indirectMemoryCopy = PAN_ARCH >= 10,
 
       /* VK_EXT_conditional_rendering */
-      .conditionalRendering = PAN_ARCH >= 10,
-      .inheritedConditionalRendering = PAN_ARCH >= 10,
+      .conditionalRendering = PAN_ARCH >= 9,
+      .inheritedConditionalRendering = PAN_ARCH >= 9,
 
       /* VK_EXT_transform_feedback */
       .transformFeedback = PAN_ARCH >= 9, /* PATCH v9: JM XFB */

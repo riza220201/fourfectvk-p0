@@ -2990,6 +2990,7 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
       }
    }
 
+   util_dynarray_append(&batch->vertex_jobs, ptr.cpu);
    draw->jobs.idvs = ptr;
    return VK_SUCCESS;
 }
@@ -3543,6 +3544,9 @@ reset_poly_heap_once_v9(struct panvk_cmd_buffer *cmdbuf)
                       dev->poly_heap->addr.dev +
                          offsetof(struct poly_heap, bottom),
                       0);
+   if (cmdbuf->state.cond_render.active)
+      cmdbuf->cur_batch->cond_render.unconditional_job =
+         cmdbuf->cur_batch->vtc_jc.prev_job;
    cmdbuf->state.uses_poly_heap = true;
 }
 
@@ -4546,7 +4550,7 @@ launch_xfb_only_v9(struct panvk_cmd_buffer *cmdbuf,
  * through the graphics path) left layers 1..5 unwritten.
  * PANVK_V9_LAYER0_ONLY=1 restores the old behaviour as a negative control. */
 static void
-panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
+panvk_cmd_draw_v9_impl(struct panvk_cmd_buffer *cmdbuf,
                   struct panvk_draw_data *draw)
 {
    /* Test hook: PANVK_V9_FORCE_INDIRECT=1 turns a direct draw that goes
@@ -4948,6 +4952,15 @@ indirect_chain_done:
            batch->vtc_jc.tiler_dep);
 
    clear_dirty_after_draw(cmdbuf);
+}
+
+static void
+panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
+                  struct panvk_draw_data *draw)
+{
+   panvk_per_arch(cmd_cond_render_begin)(cmdbuf);
+   panvk_cmd_draw_v9_impl(cmdbuf, draw);
+   panvk_per_arch(cmd_cond_render_end)(cmdbuf);
 }
 
 VKAPI_ATTR void VKAPI_CALL

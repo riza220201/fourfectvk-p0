@@ -644,6 +644,22 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
 #endif
 
 #if PAN_ARCH == 9
+
+KERNEL(1)
+panlib_v9_cond_render(global const uint32_t *pred, uint32_t inverted,
+                      global const uint64_t *list_ptr)
+{
+   const bool run = (*pred != 0) != (inverted != 0);
+   global const uint64_t *list = (global const uint64_t *)*list_ptr;
+   if (!list)
+      return;
+
+   for (uint64_t i = 0; i < list[0]; i++) {
+      global uint32_t *header = (global uint32_t *)list[1 + 2 * i];
+      const uint32_t type = run ? list[2 + 2 * i] : MALI_JOB_TYPE_NULL;
+      header[4] = (header[4] & ~(0x7fu << 1)) | (type << 1);
+   }
+}
 /* Instance-rate vertex attributes start fetching at firstInstance. The CPU
  * folds base_instance * stride into each such descriptor's Offset when it knows
  * firstInstance (emit_vs_attrib, same scheme as the CSF path); for an indirect
