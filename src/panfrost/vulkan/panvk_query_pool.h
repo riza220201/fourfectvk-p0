@@ -19,6 +19,25 @@
 #include "panvk_cmd_buffer.h"
 #endif
 
+#if PAN_ARCH == 9
+#include "panvk_instance.h"
+
+/* PATCH v9: timestamp queries, PANVK_V9_TIMESTAMP=1 or the driconf option
+ * pan_v9_timestamps (default off, on for Naruto Shippuden Storm 2). The
+ * queue reports timestampValidBits = 0, so this only matters for
+ * applications that write timestamps anyway, such as D3D11 games through
+ * DXVK: without it they poll a query that never becomes available. */
+static inline bool
+panvk_v9_timestamps(const struct vk_device *dev)
+{
+   const struct panvk_instance *instance =
+      to_panvk_instance(dev->physical->instance);
+
+   return pan_env_flag("PANVK_V9_TIMESTAMP") != NULL ||
+          instance->drirc.misc.v9_timestamps;
+}
+#endif
+
 struct panvk_query_report {
    uint64_t value;
 };

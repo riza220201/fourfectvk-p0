@@ -42,6 +42,12 @@ def declare_options():
           "Faster where the application writes clip distances; clipping "
           "planes are then ignored (the Winlator wrapper drops the writes).",
           c_name="disable_clip_cull_distance"),
+        B("pan_v9_timestamps", False,
+          "v9: write GPU timestamps for timestamp queries although the queue "
+          "reports timestampValidBits = 0. For D3D11 games through DXVK "
+          "that poll timestamp queries and hang while they never become "
+          "available.",
+          c_name="v9_timestamps"),
     ]
 
     debug_options = []

@@ -132,6 +132,10 @@ panlib_copy_query_result(uint64_t pool_addr, global uint32_t *available_addr,
          write_occlusion_query_result(dst, 0, flags, report_addr, report_count);
          break;
 #if PAN_ARCH == 9
+      case VK_QUERY_TYPE_TIMESTAMP:
+         /* PATCH v9: PANVK_V9_TIMESTAMP, one report per query. */
+         vk_write_query(dst, 0, flags, report_addr[0]);
+         break;
       case VK_QUERY_TYPE_PIPELINE_STATISTICS:
          /* PATCH v9: one counter per enabled statistic, in bit order. */
          for (uint32_t r = 0; r < report_count; r++)

@@ -81,6 +81,24 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       break;
    }
 #endif
+#if PAN_ARCH == 9
+   case VK_QUERY_TYPE_TIMESTAMP: {
+      /* PATCH v9: one GPU system timestamp per query, written by
+       * CmdWriteTimestamp2. */
+      if (panvk_v9_timestamps(&device->vk)) {
+         reports_per_query = 1;
+         break;
+      }
+      static bool warned;
+      if (!warned) {
+         warned = true;
+         mesa_logw("panvk: timestamp query pool created but timestamps are "
+                   "not supported (PANVK_V9_TIMESTAMP=1 or pan_v9_timestamps=true "
+                   "enables them)");
+      }
+      FALLTHROUGH;
+   }
+#endif
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -295,6 +313,12 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
          }
 #endif
 #if PAN_ARCH == 9
+         case VK_QUERY_TYPE_TIMESTAMP: {
+            /* PATCH v9: PANVK_V9_TIMESTAMP, one report per query. */
+            if (write_results)
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+            break;
+         }
          case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
             if (write_results) {
                const uint32_t n =

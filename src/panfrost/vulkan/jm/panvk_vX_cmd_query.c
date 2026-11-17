@@ -124,6 +124,30 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
    UNUSED VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    UNUSED VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
+#if PAN_ARCH == 9
+   if (panvk_v9_timestamps(cmd->vk.base.device)) {
+      /* PATCH v9: same ordering as CmdEndQuery. Close the current batch so
+       * the timestamp is taken after the work recorded so far, then write
+       * the GPU system timestamp and mark the query available. */
+      bool end_sync = cmd->cur_batch != NULL;
+
+      if (end_sync)
+         panvk_per_arch(cmd_close_batch)(cmd);
+
+      bool had_batch;
+      struct panvk_batch *batch = open_batch(cmd, &had_batch);
+      had_batch |= end_sync;
+
+      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
+                           panvk_query_report_dev_addr(pool, query), 0);
+      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                           panvk_query_available_dev_addr(pool, query), 1);
+
+      close_batch(cmd, had_batch);
+      return;
+   }
+#endif
+
    panvk_stub();
 }
 
