@@ -2083,23 +2083,27 @@ panvk_lower_nir_io(nir_shader *nir)
 }
 
 #if PAN_ARCH == 9
-/* PANVK_UBO_PUSH=<words> (v9 experiment, off by default; 1 means 32 words):
+/* PANVK_UBO_PUSH=<words> (v9, default 32 words; 0 disables, 1 means 32 words):
  * constant-offset 32-bit UBO loads read from the FAU instead of the UBO.
- * The words are copied on the CPU when the draw is recorded
- * (panvk_vX_cmd_push_constant.c), which is only right when the UBO contents
- * are final at record time. This measures what pushing UBO data would gain;
- * it is not a conformant implementation. */
+ * Gathered on the GPU per batch by panlib_ubo_gather before the first draw
+ * that reads pushed words (PANVK_UBO_PUSH=0 restores memory UBO loads). */
 static unsigned
 panvk_ubo_push_budget(void)
 {
    static int budget = -1;
 
    if (budget < 0) {
-      const char *e = pan_env_flag("PANVK_UBO_PUSH");
-      int v = e ? atoi(e) : 0;
+      const char *raw = getenv("PANVK_UBO_PUSH");
+      int v;
 
-      if (v == 1)
+      if (!raw || !*raw) {
          v = 32;
+      } else {
+         const char *e = pan_env_flag("PANVK_UBO_PUSH");
+         v = e ? atoi(e) : 0;
+         if (v == 1)
+            v = 32;
+      }
       budget = CLAMP(v, 0, PANVK_MAX_UBO_PUSH_WORDS);
    }
    return budget;
@@ -3243,6 +3247,7 @@ panvk_compile_shader(struct panvk_device *dev,
 
 #if PAN_ARCH == 9
       const bool api_discard = nir->info.fs.uses_discard;
+      const bool api_writes_mem = nir->info.writes_memory;
       variant->fs.clip_cull =
          panvk_v9_lower_fs_clip_cull(nir, vs_varying_layout,
                                      panvk_dev_clip_cull_off(dev));
@@ -3295,13 +3300,27 @@ panvk_compile_shader(struct panvk_device *dev,
        * stage has distances: keep the API discard state for the early-ZS
        * table of the other draws (panvk_v9_fs_earlyzs_lut). */
       if (variant->fs.clip_cull) {
-         variant->info.fs.can_discard = api_discard;
-         variant->fs.earlyzs_lut =
-            pan_earlyzs_analyze(&variant->info, PAN_ARCH);
          struct pan_shader_info clip_info = variant->info;
          clip_info.fs.can_discard = true;
          variant->fs.earlyzs_lut_clip =
             pan_earlyzs_analyze(&clip_info, PAN_ARCH);
+
+         variant->info.fs.can_discard = api_discard;
+         if (!pan_env_flag("PANVK_V9_CLIP_KILL_FPK")) {
+            variant->info.fs.sidefx = api_writes_mem || api_discard;
+            variant->info.fs.can_early_z =
+               !variant->info.fs.sidefx && !variant->info.fs.writes_depth &&
+               !variant->info.fs.writes_stencil &&
+               !variant->info.fs.writes_coverage;
+            variant->info.fs.can_fpk =
+               !variant->info.fs.writes_depth &&
+               !variant->info.fs.writes_stencil &&
+               !variant->info.fs.writes_coverage &&
+               !variant->info.fs.can_discard &&
+               !variant->info.fs.outputs_read;
+         }
+         variant->fs.earlyzs_lut =
+            pan_earlyzs_analyze(&variant->info, PAN_ARCH);
       }
 #endif
 
@@ -3656,6 +3675,9 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
       if (shader->fs.clip_cull) {
          struct pan_shader_info clip_info = shader->info;
          clip_info.fs.can_discard = true;
+         clip_info.fs.sidefx = true;
+         clip_info.fs.can_early_z = false;
+         clip_info.fs.can_fpk = false;
          shader->fs.earlyzs_lut_clip =
             pan_earlyzs_analyze(&clip_info, PAN_ARCH);
       }

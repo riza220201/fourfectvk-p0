@@ -126,10 +126,19 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
 
 #if PAN_ARCH == 9
    if (panvk_v9_timestamps(cmd->vk.base.device)) {
-      /* PATCH v9: same ordering as CmdEndQuery. Close the current batch so
-       * the timestamp is taken after the work recorded so far, then write
-       * the GPU system timestamp and mark the query available. */
-      bool end_sync = cmd->cur_batch != NULL;
+      static int split_batch = -1;
+      if (split_batch < 0)
+         split_batch = pan_env_flag("PANVK_V9_TIMESTAMP_SPLIT_BATCH") != NULL;
+
+      /* PATCH v9: close the current batch only when it has fragment/tiler work
+       * (whose fragment job runs at batch close). When cur_batch only has
+       * vtc_jc work, the WRITE_VALUE job's barrier bit orders it after prior
+       * vtc_jc jobs without splitting the batch.
+       * PANVK_V9_TIMESTAMP_SPLIT_BATCH=1 restores unconditional split. */
+      bool end_sync =
+         cmd->cur_batch != NULL &&
+         (split_batch || cmd->cur_batch->fb.desc.gpu ||
+          cmd->cur_batch->vtc_jc.first_tiler);
 
       if (end_sync)
          panvk_per_arch(cmd_close_batch)(cmd);

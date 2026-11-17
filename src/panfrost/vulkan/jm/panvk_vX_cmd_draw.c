@@ -2585,6 +2585,13 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
             &cmdbuf->vk.dynamic_graphics_state;
          bool alpha_to_coverage = dyns->ms.alpha_to_coverage_enable;
 
+         /* The clip/cull distance discard of the FS only runs when the
+          * last pre-rasterization stage has distances. */
+         const struct panvk_shader *last_vtx = cmdbuf->state.gfx.vs.shader;
+         const bool clip_discard =
+            fs->fs.clip_cull && last_vtx &&
+            (last_vtx->clip_size || last_vtx->cull_size);
+
          if (!no_earlyzs) {
             enum pan_earlyzs_zs_tilebuf_read zs_read =
                (z_attachment_read(fs, &dyns->ial) ||
@@ -2593,12 +2600,6 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
                   : PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
             bool oq = cmdbuf->state.gfx.occlusion_query.mode !=
                       MALI_OCCLUSION_MODE_DISABLED;
-            /* The clip/cull distance discard of the FS only runs when the
-             * last pre-rasterization stage has distances. */
-            const struct panvk_shader *last_vtx = cmdbuf->state.gfx.vs.shader;
-            const bool clip_discard =
-               fs->fs.clip_cull && last_vtx &&
-               (last_vtx->clip_size || last_vtx->cull_size);
             struct pan_earlyzs_state earlyzs = pan_earlyzs_get(
                clip_discard ? fs->fs.earlyzs_lut_clip : fs->fs.earlyzs_lut,
                writes_z || writes_stencil_v9(cmdbuf) || oq, alpha_to_coverage,
@@ -2645,7 +2646,7 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
             }
 
             cfg.flags_0.allow_forward_pixel_to_kill =
-               fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
+               fs->info.fs.can_fpk && !clip_discard && !(rt_mask & ~rt_written) &&
                !(rt_read & rt_written) && !alpha_to_coverage &&
                !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
             cfg.flags_0.allow_forward_pixel_to_be_killed =
