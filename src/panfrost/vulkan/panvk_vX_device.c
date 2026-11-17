@@ -889,12 +889,13 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    if (!device)
       return;
 
-   panvk_mem_prof_finish(device);
-   panvk_frame_prof_finish(device);
    panvk_per_arch(utrace_context_fini)(device);
 
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
+
+   panvk_mem_prof_finish(device);
+   panvk_frame_prof_finish(device);
 
    if (device->depth_bounds_fs)
       vk_shader_destroy(&device->vk, &device->depth_bounds_fs->vk, NULL);
