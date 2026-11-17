@@ -85,6 +85,7 @@ struct panvk_batch {
       void *hdr;
       unsigned job_index;
    } ubo_gather;
+   uint64_t tiler_vertex_bytes;
 #endif
 };
 
