@@ -130,6 +130,29 @@ panvk_ubo_gather_close(struct panvk_cmd_buffer *cmdbuf,
 }
 #endif
 
+static void
+panvk_destroy_batch(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
+{
+   if (batch->query_batch)
+      panvk_destroy_batch(cmdbuf, batch->query_batch);
+   util_dynarray_fini(&batch->jobs);
+   util_dynarray_fini(&batch->event_ops);
+#if PAN_ARCH == 9
+   util_dynarray_fini(&batch->ubo_gather.words);
+#endif
+   vk_free(&cmdbuf->vk.pool->alloc, batch);
+}
+
+static void
+panvk_close_query_batch(struct panvk_cmd_buffer *cmdbuf,
+                       struct panvk_batch *batch)
+{
+   if (batch->query_batch) {
+      list_addtail(&batch->query_batch->node, &cmdbuf->batches);
+      batch->query_batch = NULL;
+   }
+}
+
 void
 panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -148,7 +171,8 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       if (util_dynarray_num_elements(&batch->event_ops,
                                      struct panvk_cmd_event_op) == 0) {
          /* Content-less batch, let's drop it */
-         vk_free(&cmdbuf->vk.pool->alloc, batch);
+         panvk_close_query_batch(cmdbuf, batch);
+         panvk_destroy_batch(cmdbuf, batch);
       } else {
          /* Batch has no jobs but is needed for synchronization, let's add a
           * NULL job so the SUBMIT ioctl doesn't choke on it.
@@ -162,6 +186,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          }
 
          list_addtail(&batch->node, &cmdbuf->batches);
+         panvk_close_query_batch(cmdbuf, batch);
       }
       cmdbuf->cur_batch = NULL;
       return;
@@ -247,8 +272,10 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
          cmdbuf, &render->fb.layout, fbd_info.load,
          render->fb.needs_store ? &render->fb.resolve : NULL, &fs);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         cmdbuf->cur_batch = NULL;
          return;
+      }
 
       if (dev->frame_prof.passes) {
          const struct pan_fb_layout *l = &render->fb.layout;
@@ -337,6 +364,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       cmdbuf->state.gfx.render.fb.needs_load = false;
    }
 
+   panvk_close_query_batch(cmdbuf, batch);
    cmdbuf->cur_batch = NULL;
 }
 
@@ -495,27 +523,46 @@ out_set_layer_ctx:
    return VK_SUCCESS;
 }
 
-struct panvk_batch *
-panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+static struct panvk_batch *
+panvk_alloc_batch(struct panvk_cmd_buffer *cmdbuf)
 {
-   assert(!cmdbuf->cur_batch);
-   cmdbuf->cur_batch =
-      vk_zalloc(&cmdbuf->vk.pool->alloc, sizeof(*cmdbuf->cur_batch), 8,
+   struct panvk_batch *batch =
+      vk_zalloc(&cmdbuf->vk.pool->alloc, sizeof(*batch), 8,
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
-   cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
-   assert(cmdbuf->cur_batch);
+   if (!batch) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
+   batch->jobs = UTIL_DYNARRAY_INIT;
+   batch->event_ops = UTIL_DYNARRAY_INIT;
 #if PAN_ARCH == 9
-   cmdbuf->cur_batch->ubo_gather.words = UTIL_DYNARRAY_INIT;
+   batch->ubo_gather.words = UTIL_DYNARRAY_INIT;
 #endif
 #if PAN_ARCH >= 9
    /* See pan_jc::no_tiler_chain. */
    static int no_tiler_chain = -1;
    if (no_tiler_chain < 0)
       no_tiler_chain = pan_env_flag("PANVK_V9_NO_TILER_CHAIN") != NULL;
-   cmdbuf->cur_batch->vtc_jc.no_tiler_chain = no_tiler_chain;
+   batch->vtc_jc.no_tiler_chain = no_tiler_chain;
 #endif
+   return batch;
+}
+
+struct panvk_batch *
+panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+{
+   assert(!cmdbuf->cur_batch);
+   cmdbuf->cur_batch = panvk_alloc_batch(cmdbuf);
    return cmdbuf->cur_batch;
+}
+
+struct panvk_batch *
+panvk_per_arch(cmd_query_batch)(struct panvk_cmd_buffer *cmdbuf)
+{
+   assert(cmdbuf->cur_batch);
+   if (!cmdbuf->cur_batch->query_batch)
+      cmdbuf->cur_batch->query_batch = panvk_alloc_batch(cmdbuf);
+   return cmdbuf->cur_batch->query_batch;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -557,15 +604,14 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
 
    vk_command_buffer_reset(&cmdbuf->vk);
 
+   if (cmdbuf->cur_batch) {
+      panvk_destroy_batch(cmdbuf, cmdbuf->cur_batch);
+      cmdbuf->cur_batch = NULL;
+   }
+
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
-      util_dynarray_fini(&batch->jobs);
-      util_dynarray_fini(&batch->event_ops);
-#if PAN_ARCH == 9
-      util_dynarray_fini(&batch->ubo_gather.words);
-#endif
-
-      vk_free(&cmdbuf->vk.pool->alloc, batch);
+      panvk_destroy_batch(cmdbuf, batch);
    }
 
    panvk_pool_reset(&cmdbuf->desc_pool);
@@ -583,15 +629,12 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
 
+   if (cmdbuf->cur_batch)
+      panvk_destroy_batch(cmdbuf, cmdbuf->cur_batch);
+
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
-      util_dynarray_fini(&batch->jobs);
-      util_dynarray_fini(&batch->event_ops);
-#if PAN_ARCH == 9
-      util_dynarray_fini(&batch->ubo_gather.words);
-#endif
-
-      vk_free(&cmdbuf->vk.pool->alloc, batch);
+      panvk_destroy_batch(cmdbuf, batch);
    }
 
 #if PAN_ARCH < 9

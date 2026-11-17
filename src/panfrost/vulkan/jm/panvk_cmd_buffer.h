@@ -37,6 +37,7 @@ struct panvk_batch {
    struct util_dynarray event_ops;
    struct pan_jc vtc_jc;
    struct pan_jc frag_jc;
+   struct panvk_batch *query_batch;
    struct {
       struct pan_ptr desc;
       uint32_t desc_stride;
@@ -181,6 +182,9 @@ struct panvk_batch *
    panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf);
 
 void panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf);
+
+struct panvk_batch *
+   panvk_per_arch(cmd_query_batch)(struct panvk_cmd_buffer *cmdbuf);
 
 VkResult panvk_per_arch(cmd_alloc_fb_desc)(struct panvk_cmd_buffer *cmdbuf);
 

@@ -15,6 +15,7 @@
 #include "genxml/gen_macros.h"
 
 #include "panvk_buffer.h"
+#include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_cmd_precomp.h"
@@ -46,7 +47,16 @@ panvk_emit_write_job(struct panvk_cmd_buffer *cmd, struct panvk_batch *batch,
                      uint64_t value)
 {
    struct pan_ptr job =
-      pan_pool_alloc_desc(&cmd->desc_pool.base, WRITE_VALUE_JOB);
+      panvk_cmd_alloc_desc(cmd, WRITE_VALUE_JOB);
+   if (!job.gpu)
+      return;
+
+   void **job_ptr = util_dynarray_grow(&batch->jobs, void *, 1);
+   if (!job_ptr) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   *job_ptr = job.cpu;
 
    pan_section_pack(job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
       payload.type = type;
@@ -56,7 +66,6 @@ panvk_emit_write_job(struct panvk_cmd_buffer *cmd, struct panvk_batch *batch,
 
    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, true, false, 0, 0,
                   &job, false);
-   util_dynarray_append(&batch->jobs, job.cpu);
 }
 
 static struct panvk_batch *
@@ -112,6 +121,9 @@ panvk_per_arch(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
 
    if (queryCount == 0)
       return;
+
+   if (cmd->cur_batch && cmd->cur_batch->query_batch)
+      panvk_per_arch(cmd_close_batch)(cmd);
 
    panvk_emit_clear_queries(cmd, pool, false, firstQuery, queryCount);
 }
@@ -171,6 +183,15 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
 
    /* TODO: transform feedback */
    assert(index == 0);
+
+   if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION && cmd->cur_batch &&
+       cmd->cur_batch->query_batch)
+      panvk_per_arch(cmd_close_batch)(cmd);
+
+   if (cmd->cur_batch && cmd->cur_batch->query_batch &&
+       cmd->cur_batch->vtc_jc.job_index >=
+          UINT16_MAX - pool->reports_per_query - 2)
+      panvk_per_arch(cmd_close_batch)(cmd);
 
    bool had_batch;
    struct panvk_batch *batch = open_batch(cmd, &had_batch);
@@ -242,7 +263,12 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    /* TODO: transform feedback */
    assert(index == 0);
 
-   bool end_sync = cmd->cur_batch != NULL;
+   bool defer = false;
+#if PAN_ARCH == 9
+   defer = pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION &&
+           !cmd->state.stats.addr && pan_env_flag("PANVK_DEFER_OQ");
+#endif
+   bool end_sync = cmd->cur_batch != NULL && !defer;
 
    /* Close to ensure we are sync and flush caches */
    if (end_sync)
@@ -250,6 +276,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
 
    bool had_batch;
    struct panvk_batch *batch = open_batch(cmd, &had_batch);
+   if (!batch)
+      return;
    had_batch |= end_sync;
 
    switch (pool->vk.query_type) {
@@ -285,6 +313,11 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    }
 
    uint64_t available_addr = panvk_query_available_dev_addr(pool, query);
+   if (defer && !pan_env_flag("PANVK_DEFER_OQ_EARLY_CONTROL")) {
+      batch = panvk_per_arch(cmd_query_batch)(cmd);
+      if (!batch)
+         return;
+   }
    panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
                         available_addr, 1);
 
@@ -329,10 +362,8 @@ panvk_per_arch(CmdCopyQueryPoolResults)(
    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
    VK_FROM_HANDLE(panvk_buffer, dst_buffer, dstBuffer);
 
-   /* XXX: Do we really need that barrier when EndQuery already handle it? */
-   if ((flags & VK_QUERY_RESULT_WAIT_BIT) && cmd->cur_batch != NULL) {
-      close_batch(cmd, true);
-   }
+   if (cmd->cur_batch && cmd->cur_batch->query_batch)
+      panvk_per_arch(cmd_close_batch)(cmd);
 
    uint64_t dst_addr = panvk_buffer_gpu_ptr(dst_buffer, dstOffset);
    panvk_meta_copy_query_pool_results(cmd, pool, firstQuery, queryCount,
