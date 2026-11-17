@@ -45,6 +45,7 @@
 #include "pan_props.h"
 #include "pan_samples.h"
 #include "poly/geometry.h"
+#include "nir_builder.h"
 
 static void *
 panvk_kmod_zalloc(const struct pan_kmod_allocator *allocator, size_t size,
@@ -750,6 +751,24 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    if (result != VK_SUCCESS)
       goto err_free_draw_ctx;
 
+#if PAN_ARCH == 9
+   if (device->vk.enabled_features.depthBounds) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT,
+         pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_FRAGMENT,
+                                             false),
+         "depth_bounds");
+      b.shader->info.fs.early_fragment_tests = true;
+      panvk_per_arch(compiler_lock)();
+      result = panvk_per_arch(create_shader)(device, b.shader,
+                                             &device->depth_bounds_fs);
+      panvk_per_arch(compiler_unlock)();
+      ralloc_free(b.shader);
+      if (result != VK_SUCCESS)
+         goto err_finish_queues;
+   }
+#endif
+
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create =
          &pCreateInfo->pQueueCreateInfos[i];
@@ -786,6 +805,8 @@ err_finish_queues:
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
 
+   if (device->depth_bounds_fs)
+      vk_shader_destroy(&device->vk, &device->depth_bounds_fs->vk, NULL);
    panvk_meta_cleanup(device);
 
 err_free_draw_ctx:
@@ -840,6 +861,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
 
+   if (device->depth_bounds_fs)
+      vk_shader_destroy(&device->vk, &device->depth_bounds_fs->vk, NULL);
    panvk_precomp_cleanup(device);
 #if PAN_ARCH >= 10 && PAN_ARCH < 14
    panvk_per_arch(device_draw_context_cleanup)(device);

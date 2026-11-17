@@ -46,6 +46,9 @@
 #include "compiler/bifrost/bifrost_compile.h"
 #include "compiler/pan_compiler.h"
 #include "compiler/pan_nir.h"
+#if PAN_ARCH == 9
+#include "panvk_v9_coverage.h"
+#endif
 #include "pan_shader.h"
 #include "poly/nir/poly_nir.h"
 #include "poly/geometry.h"
@@ -990,6 +993,8 @@ panvk_hash_state(struct vk_physical_device *device,
 
    const unsigned ubo_push = panvk_ubo_push_budget();
    _mesa_blake3_update(&blake3_ctx, &ubo_push, sizeof(ubo_push));
+   _mesa_blake3_update(&blake3_ctx, &enabled_features->depthBounds,
+                       sizeof(enabled_features->depthBounds));
 
    const bool clip_cull_off =
       panvk_clip_cull_disabled(to_panvk_instance(device->instance));
@@ -1008,6 +1013,7 @@ panvk_hash_state(struct vk_physical_device *device,
       pan_env_flag("PANVK_V9_GS_RAST_BASE0") != NULL,
       pan_env_flag("PANVK_V9_CLIP_KILL_FPK") != NULL,
       pan_env_flag("PANVK_V9_ALLOW_TESS_GS") != NULL,
+      pan_env_flag("PANVK_V9_EARLY_COVERAGE") != NULL,
       pan_env_flag("PANVK_V9_NO_TESS") != NULL,
       pan_env_flag("PANVK_V9_NO_GS") != NULL,
       pan_env_flag("PANVK_V9_NO_TES_GS") != NULL,
@@ -2294,6 +2300,117 @@ panvk_v9_lower_robust_attr(nir_builder *b, nir_intrinsic_instr *intr,
 }
 #endif
 
+#if PAN_ARCH == 9
+static nir_def *
+panvk_v9_prepare_early_zs(nir_shader *nir, bool depth_bounds)
+{
+   if (!nir->info.fs.early_fragment_tests ||
+       (!depth_bounds && !pan_env_flag("PANVK_V9_EARLY_COVERAGE")))
+      return NULL;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *coverage = nir_load_cumulative_coverage_pan(&b);
+   nir_demote_if(&b, nir_ieq_imm(&b, coverage, 0));
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_control_flow);
+   return coverage;
+}
+
+static nir_def *
+panvk_v9_depth_bounds_mask(nir_builder *b, nir_def *coverage)
+{
+   nir_def *bounds = load_sysval(b, graphics, 32, depth_bounds);
+   nir_def *samples = load_sysval(b, graphics, 32, depth_bounds_samples);
+   nir_def *scale = load_sysval(b, graphics, 32, depth_bounds_scale);
+   nir_def *fixed_point = nir_fneu_imm(b, scale, 0.0f);
+   bounds = nir_bcsel(b, fixed_point,
+                     nir_fround_even(b, nir_fmul(b, nir_fsat(b, bounds), scale)),
+                     bounds);
+   nir_def *mask = nir_imm_int(b, 0);
+
+   for (unsigned i = 0; i < 16; i++) {
+      nir_def *bit = nir_iand_imm(b, coverage, BITFIELD_BIT(i));
+      nir_push_if(b, nir_iand(b, nir_ult(b, nir_imm_int(b, i), samples),
+                              nir_ine_imm(b, bit, 0)));
+      nir_def *depth = nir_load_tile_pan(
+         b, 1, 32,
+         pan_nir_tile_location_sample(b, FRAG_RESULT_DEPTH, nir_imm_int(b, i)),
+         pan_nir_tile_default_coverage(b), nir_imm_int(b, 0),
+         .dest_type = nir_type_float32,
+         .io_semantics = { .location = FRAG_RESULT_DEPTH, .num_slots = 1 });
+      depth = nir_bcsel(b, fixed_point,
+                       nir_fround_even(b, nir_fmul(b, nir_fsat(b, depth), scale)),
+                       depth);
+      nir_def *pass = nir_iand(b, nir_fge(b, depth, nir_channel(b, bounds, 0)),
+                                 nir_fge(b, nir_channel(b, bounds, 1), depth));
+      nir_def *accepted = nir_bcsel(b, pass, bit, nir_imm_int(b, 0));
+      nir_push_else(b, NULL);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_pop_if(b, NULL);
+      mask = nir_ior(b, mask, nir_if_phi(b, accepted, zero));
+   }
+
+   return mask;
+}
+
+static bool
+panvk_v9_probe_early_zs(nir_shader *nir, nir_def *entry_coverage,
+                       bool depth_bounds)
+{
+   if (!entry_coverage && !depth_bounds)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_intrinsic_instr *output_atest = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_atest_pan) {
+            assert(!output_atest);
+            output_atest = nir_instr_as_intrinsic(instr);
+         }
+      }
+   }
+   assert(output_atest);
+
+   if (!entry_coverage) {
+      nir_builder b = nir_builder_at(nir_before_instr(&output_atest->instr));
+      nir_def *mask = panvk_v9_depth_bounds_mask(&b, output_atest->src[0].ssa);
+      nir_src_rewrite(&output_atest->src[0], mask);
+      nir->info.fs.uses_discard = true;
+      return nir_progress(true, impl, nir_metadata_none);
+   }
+
+   nir_builder b = nir_builder_at(nir_before_def(entry_coverage));
+   nir_def *input_coverage = nir_load_sample_mask(&b);
+   if (depth_bounds)
+      input_coverage = panvk_v9_depth_bounds_mask(&b, input_coverage);
+   nir_def *coverage = nir_atest_pan(
+      &b, input_coverage, nir_imm_float(&b, 1.0));
+   nir_def_replace(entry_coverage, coverage);
+
+   b.cursor = nir_before_instr(&output_atest->instr);
+   nir_def *final_coverage =
+      nir_iand(&b, output_atest->src[0].ssa, coverage);
+   nir_def *alpha_mask = panvk_v9_alpha_to_coverage(
+      &b, nir_f2f32(&b, output_atest->src[1].ssa), false);
+   nir_def *alpha_enabled = nir_ine_imm(
+      &b, load_sysval(&b, graphics, 32, early_alpha_to_coverage), 0);
+   final_coverage = nir_iand(
+      &b, final_coverage,
+      nir_bcsel(&b, alpha_enabled, alpha_mask, nir_imm_int(&b, 0xffff)));
+   nir_def_rewrite_uses(&output_atest->def, final_coverage);
+   nir_instr_remove(&output_atest->instr);
+
+   nir->info.fs.early_fragment_tests = false;
+   nir->info.fs.uses_discard = true;
+   nir->info.outputs_written &= ~(BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+                                  BITFIELD64_BIT(FRAG_RESULT_STENCIL));
+   return nir_progress(true, impl, nir_metadata_none);
+}
+#endif
+
 static VkResult
 panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
                   VkShaderCreateFlagsEXT shader_flags,
@@ -2707,6 +2824,11 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    struct panvk_shader *shader =
       container_of(vk_shader, struct panvk_shader, vk);
 
+#if PAN_ARCH == 9
+   if (shader->bounded)
+      panvk_shader_destroy(vk_dev, &shader->bounded->vk, pAllocator);
+#endif
+
    panvk_shader_foreach_variant(shader, variant) {
       panvk_shader_variant_destroy(variant);
    }
@@ -2748,7 +2870,7 @@ panvk_compile_shader(struct panvk_device *dev,
                      const struct pan_varying_layout *vs_varying_layout,
                      const uint32_t *noperspective_varyings,
                      const VkAllocationCallbacks *pAllocator,
-                     struct vk_shader **shader_out)
+                     struct vk_shader **shader_out, bool depth_bounds)
 {
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
@@ -2763,6 +2885,28 @@ panvk_compile_shader(struct panvk_device *dev,
                              pAllocator, size);
    if (shader == NULL)
       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+#if PAN_ARCH == 9
+   if (info->stage == MESA_SHADER_FRAGMENT &&
+       dev->vk.enabled_features.depthBounds && !depth_bounds) {
+      struct vk_shader_compile_info bounded_info = *info;
+      bounded_info.nir = nir_shader_clone(NULL, info->nir);
+      if (!bounded_info.nir) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      struct vk_shader *bounded;
+      result = panvk_compile_shader(dev, &bounded_info, state,
+                                    vs_varying_layout, noperspective_varyings,
+                                    pAllocator, &bounded, true);
+      ralloc_free(bounded_info.nir);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+      shader->bounded = container_of(bounded, struct panvk_shader, vk);
+   }
+#endif
 
    nir_variable_mode robust_modes = 0;
    if (info->robustness->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
@@ -3335,6 +3479,7 @@ panvk_compile_shader(struct panvk_device *dev,
 #if PAN_ARCH == 9
       const bool api_discard = nir->info.fs.uses_discard;
       const bool api_writes_mem = nir->info.writes_memory;
+      nir_def *early_coverage = panvk_v9_prepare_early_zs(nir, depth_bounds);
       variant->fs.clip_cull =
          panvk_v9_lower_fs_clip_cull(nir, vs_varying_layout,
                                      panvk_dev_clip_cull_off(dev));
@@ -3361,6 +3506,13 @@ panvk_compile_shader(struct panvk_device *dev,
        */
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, false,
                0 /* fragcolor_nr_cbufs */);
+
+#if PAN_ARCH == 9
+      variant->fs.early_zs_probe = early_coverage != NULL;
+      variant->fs.depth_bounds = depth_bounds;
+      variant->fs.tile_image_z_read |= depth_bounds;
+      NIR_PASS(_, nir, panvk_v9_probe_early_zs, early_coverage, depth_bounds);
+#endif
 
       variant->own_bin = true;
 
@@ -3392,9 +3544,11 @@ panvk_compile_shader(struct panvk_device *dev,
          variant->fs.earlyzs_lut_clip =
             pan_earlyzs_analyze(&clip_info, PAN_ARCH);
 
-         variant->info.fs.can_discard = api_discard;
+         variant->info.fs.can_discard =
+            api_discard || variant->fs.early_zs_probe || depth_bounds;
          if (!pan_env_flag("PANVK_V9_CLIP_KILL_FPK")) {
-            variant->info.fs.sidefx = api_writes_mem || api_discard;
+            variant->info.fs.sidefx =
+               api_writes_mem || variant->info.fs.can_discard;
             variant->info.fs.can_early_z =
                !variant->info.fs.sidefx && !variant->info.fs.writes_depth &&
                !variant->info.fs.writes_stencil &&
@@ -3608,7 +3762,7 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
       result = panvk_compile_shader(dev, &infos[i], state, vs_varying_layout,
                                     noperspective_varyings_ptr, pAllocator,
-                                    &shaders_out[i]);
+                                    &shaders_out[i], false);
 
       if (result != VK_SUCCESS)
          goto err_cleanup;
@@ -3759,6 +3913,8 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
    case MESA_SHADER_FRAGMENT:
       shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
       shader->fs.clip_cull = blob_read_uint8(blob);
+      shader->fs.early_zs_probe = blob_read_uint8(blob);
+      shader->fs.depth_bounds = blob_read_uint8(blob);
       if (shader->fs.clip_cull) {
          struct pan_shader_info clip_info = shader->info;
          clip_info.fs.can_discard = true;
@@ -3845,8 +4001,13 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    struct panvk_shader *shader;
    VkResult result;
 
+#if PAN_ARCH == 9
+   if (blob_read_uint32(blob) != 0x44424e32 || blob->overrun)
+      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+#endif
+
    mesa_shader_stage stage = blob_read_uint8(blob);
-   if (blob->overrun)
+   if (blob->overrun || stage >= MESA_SHADER_STAGES)
       return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    size_t size =
@@ -3884,6 +4045,34 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
          return result;
       }
    }
+
+#if PAN_ARCH == 9
+   const bool has_bounds = blob_read_uint8(blob);
+   if (blob->overrun || (has_bounds && stage != MESA_SHADER_FRAGMENT)) {
+      panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
+      return vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   }
+   if (has_bounds) {
+      shader->bounded = vk_shader_zalloc(vk_dev, &panvk_shader_ops,
+                                         MESA_SHADER_FRAGMENT, pAllocator,
+                                         sizeof(*shader) + sizeof(shader->variants[0]));
+      if (!shader->bounded) {
+         panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      result = shader_desc_info_deserialize(device, blob, shader->bounded);
+      if (result == VK_SUCCESS)
+         result = panvk_deserialize_shader_variant(
+            vk_dev, blob, pAllocator, &shader->bounded->variants[0]);
+      if (result != VK_SUCCESS || blob->overrun ||
+          shader->bounded->variants[0].info.stage != MESA_SHADER_FRAGMENT ||
+          !shader->bounded->variants[0].fs.depth_bounds) {
+         panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
+         return result != VK_SUCCESS ? result :
+            vk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+#endif
 
    *shader_out = &shader->vk;
 
@@ -3943,6 +4132,8 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
 
    case MESA_SHADER_FRAGMENT:
       blob_write_uint8(blob, shader->fs.clip_cull);
+      blob_write_uint8(blob, shader->fs.early_zs_probe);
+      blob_write_uint8(blob, shader->fs.depth_bounds);
       blob_write_bytes(blob, &shader->fs.input_attachment_read,
                        sizeof(shader->fs.input_attachment_read));
       blob_write_bytes(blob, &shader->fs.tile_image_color_read,
@@ -3983,6 +4174,9 @@ panvk_shader_serialize(struct vk_device *vk_dev,
    struct panvk_shader *shader =
       container_of(vk_shader, struct panvk_shader, vk);
 
+#if PAN_ARCH == 9
+   blob_write_uint32(blob, 0x44424e32);
+#endif
    blob_write_uint8(blob, vk_shader->stage);
 
    shader_desc_info_serialize(blob, shader);
@@ -3999,6 +4193,16 @@ panvk_shader_serialize(struct vk_device *vk_dev,
    panvk_shader_foreach_variant(shader, variant) {
       panvk_shader_serialize_variant(vk_dev, variant, blob);
    }
+
+#if PAN_ARCH == 9
+   blob_write_uint8(blob, shader->bounded != NULL);
+   if (shader->bounded) {
+      assert(shader->vk.stage == MESA_SHADER_FRAGMENT);
+      assert(!shader->bounded->bounded);
+      shader_desc_info_serialize(blob, shader->bounded);
+      panvk_shader_serialize_variant(vk_dev, &shader->bounded->variants[0], blob);
+   }
+#endif
 
    return !blob->out_of_memory;
 }
@@ -4603,7 +4807,7 @@ VkResult panvk_per_arch(create_shader)(
 
    struct vk_shader *vk_shader;
    VkResult result = panvk_compile_shader(dev, &info, NULL, NULL, NULL, NULL,
-                                          &vk_shader);
+                                          &vk_shader, false);
    if (result != VK_SUCCESS)
       return result;
 

@@ -336,7 +336,7 @@ panvk_per_arch(get_physical_device_features)(
        * handled separately from the native point/line topology path.
        */
       .fillModeNonSolid = true,
-      .depthBounds = false,
+      .depthBounds = PAN_ARCH == 9 && pan_env_flag("PANVK_V9_DEPTH_BOUNDS"),
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,

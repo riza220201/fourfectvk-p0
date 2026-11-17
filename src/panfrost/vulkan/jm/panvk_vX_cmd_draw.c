@@ -2195,7 +2195,7 @@ static VkResult
 prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
 {
    const struct panvk_shader_desc_info *fs_desc_info =
-      &cmdbuf->state.gfx.fs.shader->desc_info;
+      &get_fs(cmdbuf)->desc_info;
    struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
    const struct panvk_descriptor_state *desc_state =
       &cmdbuf->state.gfx.desc_state;
@@ -2272,7 +2272,7 @@ prepare_gfx_desc(struct panvk_cmd_buffer *cmdbuf)
       return result;
 
    return panvk_per_arch(cmd_prepare_shader_res_table)(
-      cmdbuf, desc_state, &cmdbuf->state.gfx.fs.shader->desc_info,
+      cmdbuf, desc_state, &get_fs(cmdbuf)->desc_info,
       fs_desc_state, 1);
 }
 
@@ -2493,6 +2493,8 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
             cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
          if (fs)
             cfg.depth_source = pan_depth_source(&fs->info);
+         if (fs && fs->fs.early_zs_probe)
+            cfg.depth_source = MALI_DEPTH_SOURCE_FIXED_FUNCTION;
       }
 
       cfg.stencil_test_enable = test_s;
@@ -2613,6 +2615,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
                clip_discard || alpha_to_coverage;
          }
 
+         if (fs->fs.early_zs_probe || fs->fs.depth_bounds) {
+            cfg.flags_0.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_LATE;
+            cfg.flags_0.zs_update_operation = MALI_PIXEL_KILL_FORCE_LATE;
+            cfg.flags_0.shader_modifies_coverage = true;
+         }
+
          /* Forward pixel kill: a later opaque fragment may kill earlier ones
           * still in flight at the same pixel. Same rule as CSF
           * build_dcd_flags() and the v6/v7 RENDERER_STATE path above: only
@@ -2646,11 +2654,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
             }
 
             cfg.flags_0.allow_forward_pixel_to_kill =
-               fs->info.fs.can_fpk && !clip_discard && !(rt_mask & ~rt_written) &&
+               fs->info.fs.can_fpk && !fs->fs.depth_bounds &&
+               !clip_discard && !(rt_mask & ~rt_written) &&
                !(rt_read & rt_written) && !alpha_to_coverage &&
                !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
             cfg.flags_0.allow_forward_pixel_to_be_killed =
-               !fs->info.writes_global;
+               !fs->info.writes_global && !fs->fs.depth_bounds;
          }
 
          /* PATCH v9: per-sample shading was never requested on v9, so the
@@ -2674,7 +2683,8 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
           * alpha_invisible / alpha_translucent). CSF sets the same bit.
           * Covered by the same control. */
          if (!no_per_sample)
-            cfg.flags_0.alpha_to_coverage = alpha_to_coverage;
+            cfg.flags_0.alpha_to_coverage =
+               alpha_to_coverage && !fs->fs.early_zs_probe;
       } else {
          /* PATCH v9: no fragment shader (no colour attachment written and no
           * other FS side effect, e.g. depth-only passes). Same as gallium
@@ -3124,7 +3134,7 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    const struct panvk_shader_desc_info *vs_desc_info =
       &cmdbuf->state.gfx.vs.shader->desc_info;
    const struct panvk_shader_desc_info *fs_desc_info =
-      fs ? &cmdbuf->state.gfx.fs.shader->desc_info : NULL;
+      fs ? &get_fs(cmdbuf)->desc_info : NULL;
    uint32_t used_set_mask =
       vs_desc_info->used_set_mask | (fs ? fs_desc_info->used_set_mask : 0);
 

@@ -108,3 +108,21 @@ TEST_F(ValidateFau, MessageInstructionConstraints)
    INVALID(bi_ld_pka_to(b, 32, bi_register(1), bi_register(2), warp_id));
    INVALID(bi_ld_pka_to(b, 32, bi_register(1), bi_register(2), core_id));
 }
+
+TEST_F(ValidateFau, BlendCoverageRequiresRegister)
+{
+   for (bi_index coverage : {zero, unif, core_id}) {
+      bi_instr *I = bi_blend_to(b, bi_register(48), bi_register(0), coverage,
+                               bi_register(4), bi_register(5), bi_null(),
+                               BI_REGISTER_FORMAT_F32, 4, 4);
+      INVALID(I);
+      b->cursor = bi_before_instr(I);
+      va_repair_fau(b, I);
+      VALID(I);
+      EXPECT_TRUE(bi_is_ssa(I->src[1]));
+      EXPECT_TRUE(bi_is_equiv(I->src[2], bi_register(4)));
+   }
+
+   VALID(bi_blend_to(b, bi_register(48), bi_register(0), bi_register(60),
+                    unif, unif_hi, bi_null(), BI_REGISTER_FORMAT_F32, 4, 4));
+}

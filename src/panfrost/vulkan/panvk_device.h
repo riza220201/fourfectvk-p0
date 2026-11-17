@@ -102,6 +102,8 @@ struct panvk_device {
 
    struct vk_meta_device meta;
 
+   struct panvk_shader *depth_bounds_fs;
+
    struct {
       struct panvk_pool rw;
       struct panvk_pool rw_nc;

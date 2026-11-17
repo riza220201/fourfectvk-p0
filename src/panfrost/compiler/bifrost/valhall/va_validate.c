@@ -114,10 +114,13 @@ fau_state_special(struct fau_state *fau, bi_index idx, enum bi_opcode op)
 
 static bool
 valid_src(struct fau_state *fau, unsigned fau_page, bi_index src,
-          enum bi_opcode op)
+          enum bi_opcode op, unsigned source)
 {
    if (src.type != BI_INDEX_FAU)
       return true;
+
+   if (op == BI_OPCODE_BLEND && source == 1)
+      return false;
 
    if (src.value & BIR_FAU_IMMEDIATE) {
       /* There are no small constant restrictions in message instructions */
@@ -147,7 +150,7 @@ va_validate_fau(bi_instr *I)
    unsigned fau_page = va_select_fau_page(I);
 
    bi_foreach_src(I, s) {
-      valid &= valid_src(&fau, fau_page, I->src[s], I->op);
+      valid &= valid_src(&fau, fau_page, I->src[s], I->op, s);
    }
 
    return valid;
@@ -163,7 +166,7 @@ va_repair_fau(bi_builder *b, bi_instr *I)
       struct fau_state push = fau;
       bi_index src = I->src[s];
 
-      if (!valid_src(&fau, fau_page, src, I->op)) {
+      if (!valid_src(&fau, fau_page, src, I->op, s)) {
          bi_replace_src(I, s, bi_mov_i32(b, bi_strip_index(src)));
 
          /* Rollback update. Since the replacement move doesn't affect FAU

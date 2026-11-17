@@ -357,7 +357,16 @@ fs_required(const struct panvk_cmd_graphics_state *state,
    const struct vk_color_blend_state *cb = &dyn_state->cb;
    const struct vk_rasterization_state *rs = &dyn_state->rs;
 
-   if (rs->rasterizer_discard_enable || !fs_info)
+   if (rs->rasterizer_discard_enable)
+      return false;
+
+#if PAN_ARCH == 9
+   if (dyn_state->ds.depth.bounds_test.enable &&
+       (state->render.bound_attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT))
+      return true;
+#endif
+
+   if (!fs_info)
       return false;
 
    /* If we generally have side effects */
@@ -398,12 +407,18 @@ cached_fs_required(ASSERTED const struct panvk_cmd_graphics_state *state,
    return cached_value;
 }
 
+#if PAN_ARCH == 9
+const struct panvk_shader *
+panvk_per_arch(cmd_get_fs)(const struct panvk_cmd_buffer *cmdbuf);
+#define get_fs(__cmdbuf) panvk_per_arch(cmd_get_fs)(__cmdbuf)
+#else
 #define get_fs(__cmdbuf)                                                       \
    (cached_fs_required(&(__cmdbuf)->state.gfx,                                 \
                        &(__cmdbuf)->vk.dynamic_graphics_state,                 \
                        (__cmdbuf)->state.gfx.fs.required)                      \
        ? (__cmdbuf)->state.gfx.fs.shader                                       \
        : NULL)
+#endif
 
 /* Anything that might change the value returned by get_fs() makes users of the
  * fragment shader dirty, because not using the fragment shader (when
@@ -414,6 +429,8 @@ cached_fs_required(ASSERTED const struct panvk_cmd_graphics_state *state,
 
 #define fs_user_dirty(__cmdbuf)                                                \
    (gfx_state_dirty(cmdbuf, FS) ||                                             \
+    gfx_state_dirty(cmdbuf, RENDER_STATE) ||                                  \
+    dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_BOUNDS_TEST_ENABLE) ||                \
     dyn_gfx_state_dirty(cmdbuf, RS_RASTERIZER_DISCARD_ENABLE) ||               \
     dyn_gfx_state_dirty(cmdbuf, CB_ATTACHMENT_COUNT) ||                        \
     dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||                     \
@@ -426,7 +443,7 @@ cached_fs_required(ASSERTED const struct panvk_cmd_graphics_state *state,
 #define clear_dirty_after_draw(__cmdbuf)                                       \
    do {                                                                        \
       bool __set_fs_dirty =                                                    \
-         (__cmdbuf)->state.gfx.fs.shader != get_fs(__cmdbuf);                  \
+         (__cmdbuf)->state.gfx.fs.shader && !get_fs(__cmdbuf);                 \
       bool __set_fs_push_dirty =                                               \
          __set_fs_dirty && gfx_state_dirty(__cmdbuf, FS_PUSH_UNIFORMS);        \
       vk_dynamic_graphics_state_clear_dirty(                                   \

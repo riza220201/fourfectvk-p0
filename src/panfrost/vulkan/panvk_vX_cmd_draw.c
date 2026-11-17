@@ -17,6 +17,29 @@
 #include "vk_android.h"
 #include "vk_render_pass.h"
 
+#if PAN_ARCH == 9
+const struct panvk_shader *
+panvk_per_arch(cmd_get_fs)(const struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   if (!cached_fs_required(state, dyns, state->fs.required))
+      return NULL;
+
+   if (dyns->ds.depth.bounds_test.enable &&
+       (state->render.bound_attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT)) {
+      const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      const struct panvk_shader *shader =
+         state->fs.shader ? state->fs.shader : dev->depth_bounds_fs;
+      assert(shader && shader->bounded);
+      return shader->bounded;
+   }
+
+   return state->fs.shader;
+}
+#endif
+
 static enum pan_fb_load_op
 get_att_fb_load_op(const VkRenderingAttachmentInfo *att)
 {
@@ -898,6 +921,29 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
    set_gfx_sysval(cmdbuf, dirty_sysvals, clip_cull,
                   last_vtx ? last_vtx->clip_size | (last_vtx->cull_size << 8)
                            : 0);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, early_alpha_to_coverage,
+                  cmdbuf->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, depth_bounds[0],
+                  cmdbuf->vk.dynamic_graphics_state.ds.depth.bounds_test.min);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, depth_bounds[1],
+                  cmdbuf->vk.dynamic_graphics_state.ds.depth.bounds_test.max);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, depth_bounds_samples,
+                  cmdbuf->state.gfx.render.fb.nr_samples);
+   float depth_bounds_scale = 0.0f;
+   switch (cmdbuf->state.gfx.render.z_attachment.fmt) {
+   case VK_FORMAT_D16_UNORM:
+   case VK_FORMAT_D16_UNORM_S8_UINT:
+      depth_bounds_scale = 65535.0f;
+      break;
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
+   case VK_FORMAT_D24_UNORM_S8_UINT:
+      depth_bounds_scale = 16777215.0f;
+      break;
+   default:
+      break;
+   }
+   set_gfx_sysval(cmdbuf, dirty_sysvals, depth_bounds_scale,
+                  depth_bounds_scale);
 #endif
 
    if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {

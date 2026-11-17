@@ -212,6 +212,10 @@ struct panvk_graphics_sysvals {
    /* PATCH v9: clip distance count | cull distance count << 8 of the last
     * pre-rasterization stage, read by the fragment shader. */
    uint32_t clip_cull;
+   uint32_t early_alpha_to_coverage;
+   float depth_bounds[2];
+   uint32_t depth_bounds_samples;
+   float depth_bounds_scale;
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
@@ -458,6 +462,8 @@ struct panvk_shader_variant {
           * runs (clip_cull set), earlyzs_lut otherwise. */
          struct pan_earlyzs_lut earlyzs_lut_clip;
          bool clip_cull;
+         bool early_zs_probe;
+         bool depth_bounds;
          uint32_t input_attachment_read;
          uint32_t tile_image_color_read;
          bool tile_image_z_read;
@@ -568,6 +574,10 @@ enum panvk_gs_variant {
 
 struct panvk_shader {
    struct vk_shader vk;
+
+#if PAN_ARCH == 9
+   struct panvk_shader *bounded;
+#endif
 
    struct panvk_shader_desc_info desc_info;
 
