@@ -24,12 +24,14 @@ panlib_indirect_dispatch(constant VkDispatchIndirectCommand *cmd,
    /* In case there is nothing to dispatch, set a null job otherwise we ensure
     * that the type is compute */
    const bool is_no_op = num_x * num_y * num_z == 0;
-   struct mali_job_header_packed job_header;
+   global struct mali_job_header_packed *job_header =
+      (global struct mali_job_header_packed *)indirect_job;
+   pan_unpack(job_header, JOB_HEADER, old_header);
 
-   pan_pack(&job_header, JOB_HEADER, cfg) {
+   pan_pack(job_header, JOB_HEADER, cfg) {
+      cfg = old_header;
       cfg.type = is_no_op ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_COMPUTE;
    }
-   pan_merge((global struct mali_job_header_packed *)indirect_job, &job_header, JOB_HEADER);
 
    /* If there is nothing else to do, let's just return now */
    if (is_no_op)
