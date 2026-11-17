@@ -9,6 +9,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "c11/threads.h"
+#include "util/u_atomic.h"
 #include "genxml/gen_macros.h"
 
 #include "decode.h"
@@ -107,32 +109,34 @@ struct panvk_kbase_event_v2 {
  * of the original patch. The file is opened once, appended to, and line
  * buffered so a crash mid-run still leaves the lines already written.
  */
+static once_flag panvk_debug_log_once = ONCE_FLAG_INIT;
+static FILE *panvk_debug_log_stream;
+
+static void
+panvk_debug_log_init(void)
+{
+   const char *path = getenv("PANVK_HEAP_LOG");
+
+   if (path && path[0]) {
+      panvk_debug_log_stream = fopen(path, "ae");
+      if (panvk_debug_log_stream) {
+         setvbuf(panvk_debug_log_stream, NULL, _IOLBF, 0);
+         fprintf(panvk_debug_log_stream, "[PANVK_DEBUG_HEAP] --- log dibuka, pid=%d ---\n",
+                 (int)getpid());
+      } else {
+         fprintf(stderr,
+                 "[PANVK_DEBUG_HEAP] gagal membuka PANVK_HEAP_LOG=%s: %s,"
+                 " jatuh ke stderr\n",
+                 path, strerror(errno));
+      }
+   }
+}
+
 static FILE *
 panvk_debug_log_file(void)
 {
-   static FILE *log_file = NULL;
-   static bool tried = false;
-
-   if (!tried) {
-      tried = true;
-      const char *path = getenv("PANVK_HEAP_LOG");
-
-      if (path && path[0]) {
-         log_file = fopen(path, "ae");
-         if (log_file) {
-            setvbuf(log_file, NULL, _IOLBF, 0);
-            fprintf(log_file, "[PANVK_DEBUG_HEAP] --- log dibuka, pid=%d ---\n",
-                    (int)getpid());
-         } else {
-            fprintf(stderr,
-                    "[PANVK_DEBUG_HEAP] gagal membuka PANVK_HEAP_LOG=%s: %s,"
-                    " jatuh ke stderr\n",
-                    path, strerror(errno));
-         }
-      }
-   }
-
-   return log_file ? log_file : stderr;
+   call_once(&panvk_debug_log_once, panvk_debug_log_init);
+   return panvk_debug_log_stream ? panvk_debug_log_stream : stderr;
 }
 
 static void
@@ -1580,9 +1584,12 @@ panvk_kbase_sync_export_cb(
 static bool
 reissue_no_va_reset(void)
 {
-   static int v = -1;
-   if (v < 0)
+   static int cached_v = -1;
+   int v = p_atomic_read_relaxed(&cached_v);
+   if (v < 0) {
       v = pan_env_flag("PANVK_V9_NO_REISSUE_VA_RESET") != NULL;
+      p_atomic_set(&cached_v, v);
+   }
    return v;
 }
 #endif

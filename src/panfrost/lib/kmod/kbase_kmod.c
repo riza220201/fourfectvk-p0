@@ -34,6 +34,7 @@
  *    memory management.
  */
 
+#include "c11/threads.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <fcntl.h>
@@ -1636,19 +1637,29 @@ static struct list_head kbase_quar_list = {&kbase_quar_list, &kbase_quar_list};
 static int kbase_diag_mode = -1;
 static uint64_t kbase_free_delay_ns;
 
+static once_flag kbase_diag_once = ONCE_FLAG_INIT;
+
+static void
+kbase_diag_init(void)
+{
+   const char *d = getenv("PANVK_DBG_FREE_DELAY_MS");
+   const char *r = getenv("PANVK_FAULT_REPORT");
+   if (!r || !*r || !strcmp(r, "0"))
+      r = getenv("PANVK_FAULT_AUDIT_ALL");
+   kbase_free_delay_ns = d ? strtoull(d, NULL, 10) * 1000000ull : 0;
+   p_atomic_set(&kbase_diag_mode,
+                (kbase_free_delay_ns || (r && *r && strcmp(r, "0"))) ? 1 : 0);
+}
+
 static bool
 kbase_diag_tracking(void)
 {
-   if (kbase_diag_mode < 0) {
-      const char *d = getenv("PANVK_DBG_FREE_DELAY_MS");
-      const char *r = getenv("PANVK_FAULT_REPORT");
-      if (!r || !*r || !strcmp(r, "0"))
-         r = getenv("PANVK_FAULT_AUDIT_ALL");
-      kbase_free_delay_ns = d ? strtoull(d, NULL, 10) * 1000000ull : 0;
-      kbase_diag_mode =
-         (kbase_free_delay_ns || (r && *r && strcmp(r, "0"))) ? 1 : 0;
+   int mode = p_atomic_read(&kbase_diag_mode);
+   if (mode < 0) {
+      call_once(&kbase_diag_once, kbase_diag_init);
+      mode = p_atomic_read(&kbase_diag_mode);
    }
-   return kbase_diag_mode == 1;
+   return mode == 1;
 }
 
 static void

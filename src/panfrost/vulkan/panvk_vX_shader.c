@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "genxml/gen_macros.h"
 
 #include "panvk_cmd_buffer.h"
@@ -75,9 +76,12 @@
 static bool
 panvk_v9_ms_storage_2d(void)
 {
-   static int ms_2d = -1;
-   if (ms_2d < 0)
+   static int cached_ms_2d = -1;
+   int ms_2d = p_atomic_read_relaxed(&cached_ms_2d);
+   if (ms_2d < 0) {
       ms_2d = getenv("PANVK_V9_MS_STORAGE_2D") != NULL;
+      p_atomic_set(&cached_ms_2d, ms_2d);
+   }
    return ms_2d;
 }
 
@@ -2120,8 +2124,8 @@ panvk_lower_nir_io(nir_shader *nir)
 static unsigned
 panvk_ubo_push_budget(void)
 {
-   static int budget = -1;
-
+   static int cached_budget = -1;
+   int budget = p_atomic_read_relaxed(&cached_budget);
    if (budget < 0) {
       const char *raw = getenv("PANVK_UBO_PUSH");
       int v;
@@ -2135,6 +2139,7 @@ panvk_ubo_push_budget(void)
             v = 32;
       }
       budget = CLAMP(v, 0, PANVK_MAX_UBO_PUSH_WORDS);
+      p_atomic_set(&cached_budget, budget);
    }
    return budget;
 }
@@ -3688,9 +3693,12 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     * process. Fail the pipeline instead; DXVK logs it and skips the draw.
     * PANVK_V9_ALLOW_TESS_GS=1 restores the old behaviour (negative control).
     */
-   static int allow_tess_gs = -1;
-   if (allow_tess_gs < 0)
+   static int cached_allow_tess_gs = -1;
+   int allow_tess_gs = p_atomic_read_relaxed(&cached_allow_tess_gs);
+   if (allow_tess_gs < 0) {
       allow_tess_gs = pan_env_flag("PANVK_V9_ALLOW_TESS_GS") != NULL;
+      p_atomic_set(&cached_allow_tess_gs, allow_tess_gs);
+   }
    for (i = 0; !allow_tess_gs && i < shader_count; i++) {
       mesa_shader_stage s = infos[i].stage;
       /* PATCH v9: tessellation runs through libpoly now (launch_tess_v9);

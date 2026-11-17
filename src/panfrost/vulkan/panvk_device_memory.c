@@ -28,12 +28,13 @@
 static uint64_t
 panvk_devmem_lazy_min_size(void)
 {
-   static int64_t min = -1;
-
+   static int64_t cached_min = -1;
+   int64_t min = p_atomic_read_relaxed(&cached_min);
    if (min < 0) {
       const char *e = getenv("PANVK_KBASE_DEVMEM_LAZY_MIN_KB");
       min = e && *e ? (int64_t)strtoull(e, NULL, 10) * 1024
                     : (int64_t)PANVK_DEVMEM_LAZY_MIN_SIZE;
+      p_atomic_set(&cached_min, min);
    }
 
    return min;

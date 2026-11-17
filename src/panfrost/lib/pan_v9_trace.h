@@ -6,6 +6,7 @@
 #ifndef PAN_V9_TRACE_H
 #define PAN_V9_TRACE_H
 
+#include "util/u_atomic.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include "util/u_debug.h"
@@ -13,9 +14,12 @@
 static inline bool
 pan_v9_trace_enabled(void)
 {
-   static int on = -1;
-   if (on < 0)
+   static int cached_on = -1;
+   int on = p_atomic_read_relaxed(&cached_on);
+   if (on < 0) {
       on = debug_get_bool_option("PANVK_V9_TRACE", false);
+      p_atomic_set(&cached_on, on);
+   }
    return on;
 }
 

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "util/os_time.h"
 
 #include "libpan_dgc.h"
@@ -138,9 +139,12 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
 
 #if PAN_ARCH == 9
    if (panvk_v9_timestamps(cmd->vk.base.device)) {
-      static int split_batch = -1;
-      if (split_batch < 0)
+      static int cached_split_batch = -1;
+      int split_batch = p_atomic_read_relaxed(&cached_split_batch);
+      if (split_batch < 0) {
          split_batch = pan_env_flag("PANVK_V9_TIMESTAMP_SPLIT_BATCH") != NULL;
+         p_atomic_set(&cached_split_batch, split_batch);
+      }
 
       const uint32_t count =
          MAX2(util_bitcount(cmd->state.gfx.render.view_mask), 1);

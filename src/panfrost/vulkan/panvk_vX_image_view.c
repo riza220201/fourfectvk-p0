@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_ycbcr_conversion.h"
@@ -82,9 +83,12 @@ panvk_storage_pview(const struct panvk_image_view *view,
 static bool
 panvk_v9_ms_storage_2d(void)
 {
-   static int ms_2d = -1;
-   if (ms_2d < 0)
+   static int cached_ms_2d = -1;
+   int ms_2d = p_atomic_read_relaxed(&cached_ms_2d);
+   if (ms_2d < 0) {
       ms_2d = getenv("PANVK_V9_MS_STORAGE_2D") != NULL;
+      p_atomic_set(&cached_ms_2d, ms_2d);
+   }
    return ms_2d;
 }
 

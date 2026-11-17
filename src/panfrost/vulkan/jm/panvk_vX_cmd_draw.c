@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "genxml/gen_macros.h"
 #include "pan_v9_trace.h"
 
@@ -2483,9 +2484,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
        * depthClamp / depthClipEnable were ignored. Same fields as CSF
        * prepare_ds(). PANVK_V9_ZSD_OLD=1 restores the old descriptor
        * (negative control). */
-      static int zsd_old = -1;
-      if (zsd_old < 0)
+      static int cached_zsd_old = -1;
+      int zsd_old = p_atomic_read_relaxed(&cached_zsd_old);
+      if (zsd_old < 0) {
          zsd_old = pan_env_flag("PANVK_V9_ZSD_OLD") != NULL;
+         p_atomic_set(&cached_zsd_old, zsd_old);
+      }
       if (!zsd_old) {
          cfg.stencil_from_shader = fs ? fs->info.fs.writes_stencil : 0;
          cfg.depth_cull_enable = vk_rasterization_state_depth_clip_enable(rs);
@@ -2579,9 +2583,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
        * PANVK_V9_DCD_NO_EARLYZS=1 restores the old flags
        * (negative control). */
       if (fs) {
-         static int no_earlyzs = -1;
-         if (no_earlyzs < 0)
+         static int cached_no_earlyzs = -1;
+         int no_earlyzs = p_atomic_read_relaxed(&cached_no_earlyzs);
+         if (no_earlyzs < 0) {
             no_earlyzs = pan_env_flag("PANVK_V9_DCD_NO_EARLYZS") != NULL;
+            p_atomic_set(&cached_no_earlyzs, no_earlyzs);
+         }
 
          const struct vk_dynamic_graphics_state *dyns =
             &cmdbuf->vk.dynamic_graphics_state;
@@ -2629,9 +2636,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
           * destination (blending), no alpha-to-coverage, no rasterization
           * order access. PANVK_V9_NO_FPK=1 keeps both bits off (the old,
           * conservative behaviour; A/B control). */
-         static int no_fpk = -1;
-         if (no_fpk < 0)
+         static int cached_no_fpk = -1;
+         int no_fpk = p_atomic_read_relaxed(&cached_no_fpk);
+         if (no_fpk < 0) {
             no_fpk = getenv("PANVK_V9_NO_FPK") != NULL;
+            p_atomic_set(&cached_no_fpk, no_fpk);
+         }
          if (!no_earlyzs && !no_fpk) {
             uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
                               MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
@@ -2669,9 +2679,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
           * Same rule as CSF build_dcd_flags(): also when a blend shader runs
           * with MSAA (it writes one sample at a time).
           * PANVK_V9_NO_PER_SAMPLE=1 restores the old behaviour (control). */
-         static int no_per_sample = -1;
-         if (no_per_sample < 0)
+         static int cached_no_per_sample = -1;
+         int no_per_sample = p_atomic_read_relaxed(&cached_no_per_sample);
+         if (no_per_sample < 0) {
             no_per_sample = pan_env_flag("PANVK_V9_NO_PER_SAMPLE") != NULL;
+            p_atomic_set(&cached_no_per_sample, no_per_sample);
+         }
          if (!no_per_sample)
             cfg.flags_0.evaluate_per_sample =
                (fs->info.fs.sample_shading ||
@@ -3070,9 +3083,12 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
     * PANVK_V9_SPLIT_AT=<n> lowers the limit (test knob: forces batch splits
     * inside a render pass, so the spill/reload path can be checked with
     * small tests). */
-   static int split_at = -1;
-   if (split_at < 0)
+   static int cached_split_at = -1;
+   int split_at = p_atomic_read_relaxed(&cached_split_at);
+   if (split_at < 0) {
       split_at = getenv("PANVK_V9_SPLIT_AT") ? atoi(getenv("PANVK_V9_SPLIT_AT")) : UINT16_MAX;
+      p_atomic_set(&cached_split_at, split_at);
+   }
    if (batch->vtc_jc.job_index + cmdbuf->state.gfx.render.layer_count >=
        (unsigned)split_at) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
@@ -3252,9 +3268,12 @@ launch_xfb_v9(struct panvk_cmd_buffer *cmdbuf,
       panvk_shader_xfb_variant(gfx->vs.shader);
 
    /* PANVK_V9_XFB_SKIP=1: no capture (negative control). */
-   static int xfb_skip = -1;
-   if (xfb_skip < 0)
+   static int cached_xfb_skip = -1;
+   int xfb_skip = p_atomic_read_relaxed(&cached_xfb_skip);
+   if (xfb_skip < 0) {
       xfb_skip = pan_env_flag("PANVK_V9_XFB_SKIP") != NULL;
+      p_atomic_set(&cached_xfb_skip, xfb_skip);
+   }
 
    if (xfb_skip || !gfx->xfb.enabled || !xfb || !gfx->xfb.offsets.gpu)
       return VK_SUCCESS;
@@ -4745,9 +4764,12 @@ panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
     * render pass). The Bifrost path reads cur_batch after prepare_draw() for
     * the same reason. PANVK_V9_STALE_BATCH=1 restores the old behaviour
     * (negative control). */
-   static int stale_batch = -1;
-   if (stale_batch < 0)
+   static int cached_stale_batch = -1;
+   int stale_batch = p_atomic_read_relaxed(&cached_stale_batch);
+   if (stale_batch < 0) {
       stale_batch = pan_env_flag("PANVK_V9_STALE_BATCH") != NULL;
+      p_atomic_set(&cached_stale_batch, stale_batch);
+   }
    if (!stale_batch)
       batch = cmdbuf->cur_batch;
 
@@ -4922,9 +4944,12 @@ panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
     * pan_jc_add_job() tracks MALLOC_VERTEX: wait on the previous tiler job
     * (dependency 1, dependency 2 is the helper) and become the new tail.
     * PANVK_V9_INDIRECT_UNTRACKED=1 restores the old behaviour (control). */
-   static int indirect_untracked = -1;
-   if (indirect_untracked < 0)
+   static int cached_indirect_untracked = -1;
+   int indirect_untracked = p_atomic_read_relaxed(&cached_indirect_untracked);
+   if (indirect_untracked < 0) {
       indirect_untracked = pan_env_flag("PANVK_V9_INDIRECT_UNTRACKED") != NULL;
+      p_atomic_set(&cached_indirect_untracked, indirect_untracked);
+   }
    const bool track_parked = is_indirect && !indirect_untracked;
    const unsigned prev_tiler_dep = batch->vtc_jc.tiler_dep;
 

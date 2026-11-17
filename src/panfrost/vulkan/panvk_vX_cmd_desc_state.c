@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "genxml/gen_macros.h"
 
 #include <stdio.h>
@@ -276,9 +277,12 @@ panvk_per_arch(cmd_prepare_shader_res_table)(
    /* PHASE4-RESTAB: observation only, gated on PANVK_DEBUG_RESTAB.
     * Emits nothing and changes no descriptor when the variable is unset, so
     * the validated baseline is bit-identical without it. */
-   static int restab_dbg = -1;
-   if (restab_dbg < 0)
+   static int cached_restab_dbg = -1;
+   int restab_dbg = p_atomic_read_relaxed(&cached_restab_dbg);
+   if (restab_dbg < 0) {
       restab_dbg = pan_env_flag("PANVK_DEBUG_RESTAB") ? 1 : 0;
+      p_atomic_set(&cached_restab_dbg, restab_dbg);
+   }
    if (restab_dbg)
       PAN_V9_TRACE(
               "[PANVK_DEBUG_RESTAB] used_set_mask=0x%x first_unused_set=%u "

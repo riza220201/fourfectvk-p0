@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
 #include "genxml/gen_macros.h"
 
 #include "panvk_buffer.h"
@@ -100,9 +101,12 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
 static bool
 tls_per_batch(void)
 {
-   static int v = -1;
-   if (v < 0)
+   static int cached_v = -1;
+   int v = p_atomic_read_relaxed(&cached_v);
+   if (v < 0) {
       v = pan_env_flag("PANVK_TLS_PER_BATCH") != NULL;
+      p_atomic_set(&cached_v, v);
+   }
    return v;
 }
 
@@ -644,10 +648,12 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
        * (0xff); the system driver uses 0xaa (32/128/512/2048) in Tomb
        * Raider. Off by default (A/B knob). The top bit is always kept so
        * one level still covers the whole framebuffer. */
-      static int hmask_override = -1;
+      static int cached_hmask_override = -1;
+      int hmask_override = p_atomic_read_relaxed(&cached_hmask_override);
       if (hmask_override < 0) {
          const char *v = pan_env_flag("PANVK_TILER_HMASK");
          hmask_override = v ? (int)(strtoul(v, NULL, 0) & 0xff) : 0;
+         p_atomic_set(&cached_hmask_override, hmask_override);
       }
       if (hmask_override)
          cfg.hierarchy_mask = hmask_override | 0x80;
@@ -727,9 +733,12 @@ panvk_alloc_batch(struct panvk_cmd_buffer *cmdbuf)
 #endif
 #if PAN_ARCH >= 9
    /* See pan_jc::no_tiler_chain. */
-   static int no_tiler_chain = -1;
-   if (no_tiler_chain < 0)
+   static int cached_no_tiler_chain = -1;
+   int no_tiler_chain = p_atomic_read_relaxed(&cached_no_tiler_chain);
+   if (no_tiler_chain < 0) {
       no_tiler_chain = pan_env_flag("PANVK_V9_NO_TILER_CHAIN") != NULL;
+      p_atomic_set(&cached_no_tiler_chain, no_tiler_chain);
+   }
    batch->vtc_jc.no_tiler_chain = no_tiler_chain;
 #endif
    return batch;

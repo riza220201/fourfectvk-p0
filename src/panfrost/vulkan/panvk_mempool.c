@@ -241,11 +241,12 @@ panvk_pool_init(struct panvk_pool *pool, struct panvk_device *dev,
 static uint64_t
 panvk_pool_cache_cap(void)
 {
-   static int64_t cap = -1;
-
+   static int64_t cached_cap = -1;
+   int64_t cap = p_atomic_read_relaxed(&cached_cap);
    if (cap < 0) {
       const char *e = getenv("PANVK_POOL_CACHE_MAX_MB");
       cap = (e && *e) ? (int64_t)(strtoull(e, NULL, 10) << 20) : 48ll << 20;
+      p_atomic_set(&cached_cap, cap);
    }
    return cap;
 }
