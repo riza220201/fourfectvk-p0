@@ -96,6 +96,7 @@ struct kbase_kmod_dev {
 
    /* Android dma-heap used for BOs which need to be shared with WSI. */
    int dma_heap_fd;
+   int dma_heap_cached_fd;
 
    /* Set when the CSF notification stream reports a queue-group error.
     * Vulkan queue status queries use this latch instead of invalidating and
@@ -124,6 +125,8 @@ struct kbase_kmod_vm {
 
 struct kbase_kmod_bo {
    struct pan_kmod_bo base;
+
+   uint64_t initial_commit;
 
    /* Counted in kbase_mem_stats (native allocations only). */
    bool stats_counted;
@@ -170,7 +173,7 @@ kbase_kmod_supports_dmabuf(const struct pan_kmod_dev *dev)
    const struct kbase_kmod_dev *kbase_dev =
       container_of(dev, const struct kbase_kmod_dev, base);
 
-   return kbase_dev->dma_heap_fd >= 0;
+   return kbase_dev->dma_heap_fd >= 0 || kbase_dev->dma_heap_cached_fd >= 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -399,6 +402,9 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
                                 PAN_KMOD_BO_FLAG_GPU_UNCACHED |
                                 PAN_KMOD_BO_FLAG_CSF_EVENT |
                                 PAN_KMOD_BO_FLAG_LAZY_COMMIT;
+
+   if (!kbase_dev->is_csf && pan_arch(props->gpu_id) == 9)
+      props->supported_bo_flags |= PAN_KMOD_BO_FLAG_TILER_HEAP;
 }
 
 /* -------------------------------------------------------------------------
@@ -1266,6 +1272,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
    kbase_dev->dma_heap_fd = -1;
+   kbase_dev->dma_heap_cached_fd = -1;
    kbase_dev->kcpu.fence_fd = -1;
    simple_mtx_init(&kbase_dev->kcpu.lock, mtx_plain);
 
@@ -1298,18 +1305,27 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    free(props_buf);
 
    const char *dma_heap = getenv("PANVK_KBASE_DMA_HEAP");
-   if (!dma_heap || !dma_heap[0])
-      dma_heap = "/dev/dma_heap/system";
+   const char *cached_heap = dma_heap;
+   const bool jm_v9 = !is_csf && pan_arch(kbase_dev->base.props.gpu_id) == 9;
+   if (!dma_heap || !dma_heap[0]) {
+      dma_heap = jm_v9 ? "/dev/dma_heap/system-uncached"
+                       : "/dev/dma_heap/system";
+      cached_heap = "/dev/dma_heap/system";
+   }
 
-   kbase_dev->dma_heap_fd = open(dma_heap, O_RDWR | O_CLOEXEC);
+   const int heap_open_flags = (jm_v9 ? O_RDONLY : O_RDWR) | O_CLOEXEC;
+   kbase_dev->dma_heap_fd = open(dma_heap, heap_open_flags);
    if (kbase_dev->dma_heap_fd < 0)
       mesa_logd("kbase: dma-heap unavailable at %s: %s", dma_heap,
                 strerror(errno));
+   kbase_dev->dma_heap_cached_fd = open(cached_heap, heap_open_flags);
 
    if (!kbase_dev->base.props.gpu_id) {
       mesa_loge("kbase: failed to determine GPU ID from properties");
       if (kbase_dev->dma_heap_fd >= 0)
          close(kbase_dev->dma_heap_fd);
+      if (kbase_dev->dma_heap_cached_fd >= 0)
+         close(kbase_dev->dma_heap_cached_fd);
       munmap(tracking_page, 4096);
       /* On failure the caller keeps ownership of the fd (it closes it on
        * NULL return), so don't let pan_kmod_dev_cleanup() close it too. */
@@ -1374,6 +1390,8 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 
    if (kbase_dev->dma_heap_fd >= 0)
       close(kbase_dev->dma_heap_fd);
+   if (kbase_dev->dma_heap_cached_fd >= 0)
+      close(kbase_dev->dma_heap_cached_fd);
 
    pan_kmod_dev_cleanup(dev);
    pan_kmod_free(dev->allocator, kbase_dev);
@@ -1450,6 +1468,35 @@ to_kbase_mem_flags(uint32_t kmod_flags)
    return flags;
 }
 
+static uint32_t
+kbase_dmabuf_mapping_flags(struct pan_kmod_dev *dev, int fd,
+                          uint64_t import_flags)
+{
+   char path[64], line[256], exporter[64];
+   snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+   FILE *info = fopen(path, "re");
+   if (!info)
+      return PAN_KMOD_BO_FLAG_NO_MMAP;
+
+   uint32_t flags = PAN_KMOD_BO_FLAG_NO_MMAP;
+   while (fgets(line, sizeof(line), info)) {
+      if (sscanf(line, "exp_name: %63s", exporter) != 1)
+         continue;
+
+      if (!strcmp(exporter, "system-uncached")) {
+         flags = 0;
+      } else if (!strcmp(exporter, "system") &&
+                 pan_kmod_can_sync_bo_map_from_userland(dev)) {
+         flags = PAN_KMOD_BO_FLAG_WB_MMAP;
+         if (import_flags & BASE_MEM_COHERENT_SYSTEM)
+            flags |= PAN_KMOD_BO_FLAG_IO_COHERENT;
+      }
+      break;
+   }
+   fclose(info);
+   return flags;
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
                          struct pan_kmod_vm *exclusive_vm, int fd,
@@ -1495,6 +1542,11 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
    }
 
    const uint64_t bo_size = req.out.va_pages * page_size;
+   if (!kbase_dev->is_csf && pan_arch(dev->props.gpu_id) == 9) {
+      kmod_flags &= ~(PAN_KMOD_BO_FLAG_WB_MMAP | PAN_KMOD_BO_FLAG_IO_COHERENT);
+      kmod_flags |= kbase_dmabuf_mapping_flags(dev, kbase_bo->dmabuf_fd,
+                                             req.out.flags);
+   }
    kbase_bo->same_va =
       (req.out.flags & (BASE_MEM_SAME_VA | BASE_MEM_NEED_MMAP)) != 0;
 
@@ -1832,12 +1884,19 @@ kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
    const uint64_t page_size = 4096;
+   int heap_fd = kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP
+                    ? kbase_dev->dma_heap_cached_fd
+                    : kbase_dev->dma_heap_fd;
+   if (heap_fd < 0) {
+      errno = ENOTSUP;
+      return NULL;
+   }
    struct dma_heap_allocation_data alloc = {
       .len = ALIGN_POT(size, page_size),
       .fd_flags = O_RDWR | O_CLOEXEC,
    };
 
-   if (ioctl(kbase_dev->dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc)) {
+   if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc)) {
       mesa_loge("kbase: DMA_HEAP_IOCTL_ALLOC failed: %s", strerror(errno));
       return NULL;
    }
@@ -1856,7 +1915,9 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
 
-   if (!exclusive_vm && kbase_dev->dma_heap_fd >= 0 &&
+   if (!exclusive_vm &&
+       (kbase_dev->dma_heap_fd >= 0 ||
+        (!kbase_dev->is_csf && pan_arch(dev->props.gpu_id) == 9)) &&
        !(kmod_flags & (PAN_KMOD_BO_FLAG_EXECUTABLE |
                        PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
                        PAN_KMOD_BO_FLAG_CSF_EVENT)))
@@ -1889,6 +1950,19 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
        * increments on GPU page fault (matches panfork's heap setup). */
       commit_pages = 0;
       extension = MIN2((2 * 1024 * 1024) / page_size, va_pages);
+   }
+
+   const uint64_t tiler_align_top = UINT64_C(1) << 20;
+   if (kmod_flags & PAN_KMOD_BO_FLAG_TILER_HEAP) {
+      if (kbase_dev->is_csf || pan_arch(dev->props.gpu_id) != 9 ||
+          !(kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT) ||
+          size < PAN_KMOD_TILER_HEAP_CHUNK_SIZE) {
+         errno = EINVAL;
+         goto err_free_bo;
+      }
+      extension = PAN_KMOD_TILER_HEAP_CHUNK_SIZE / page_size;
+      commit_pages = extension;
+      alloc_flags |= tiler_align_top;
    }
 
    if (kbase_dev->is_csf &&
@@ -1925,7 +1999,23 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
       if (pan_v9_trace_enabled())
          mesa_logi("kbase: MEM_ALLOC req: va_pages=%llu commit_pages=%llu extension=%llu flags=0x%llx kmod_flags=0x%x", (unsigned long long)va_pages, (unsigned long long)commit_pages, (unsigned long long)extension, (unsigned long long)alloc_flags, kmod_flags);
-      if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
+      int ret = ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req);
+      if (ret && errno == EINVAL &&
+          (kmod_flags & PAN_KMOD_BO_FLAG_TILER_HEAP)) {
+         kmod_flags &= ~PAN_KMOD_BO_FLAG_TILER_HEAP;
+         alloc_flags &= ~tiler_align_top;
+         commit_pages = 0;
+         req = (union kbase_ioctl_mem_alloc){
+            .in = {
+               .va_pages = va_pages,
+               .commit_pages = commit_pages,
+               .extension = extension,
+               .flags = alloc_flags,
+            },
+         };
+         ret = ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req);
+      }
+      if (ret) {
          mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s (%llu pages, "
                    "flags 0x%llx%s)", strerror(errno),
                    (unsigned long long)va_pages,
@@ -1936,6 +2026,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
       alloc_flags = req.out.flags;
       alloc_gpu_va = req.out.gpu_va;
+      if (!(alloc_flags & tiler_align_top))
+         kmod_flags &= ~PAN_KMOD_BO_FLAG_TILER_HEAP;
    }
 
    kbase_bo->same_va = (alloc_flags & BASE_MEM_SAME_VA) != 0;
@@ -1971,10 +2063,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    pan_kmod_bo_init(&kbase_bo->base, dev, exclusive_vm,
                     va_pages * page_size, kmod_flags, handle);
    kbase_bo->stats_counted = true;
-   kbase_mem_stats_add(va_pages * page_size, commit_pages * page_size,
-                       commit_pages == 0, 1);
-   if (commit_pages == 0) {
-      kbase_bo->growable = true;
+   kbase_bo->initial_commit = commit_pages * page_size;
+   kbase_bo->growable = extension != 0;
+   kbase_mem_stats_add(va_pages * page_size, kbase_bo->initial_commit,
+                       kbase_bo->growable, 1);
+   if (kbase_bo->growable) {
       simple_mtx_lock(&kbase_grow_lock);
       list_addtail(&kbase_bo->grow_link, &kbase_grow_list);
       simple_mtx_unlock(&kbase_grow_lock);
@@ -2002,7 +2095,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    }
 
    if (kbase_bo->stats_counted)
-      kbase_mem_stats_add(bo->size, kbase_bo->growable ? 0 : bo->size,
+      kbase_mem_stats_add(bo->size, kbase_bo->initial_commit,
                           kbase_bo->growable, -1);
 
    if (kbase_bo->diag_tracked) {

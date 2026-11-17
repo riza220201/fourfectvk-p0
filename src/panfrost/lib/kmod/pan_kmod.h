@@ -143,7 +143,11 @@ enum pan_kmod_bo_flags {
     * mapping request (pan_kmod_bo_mmap) backs the whole buffer, since a
     * CPU access to a page without backing is fatal. */
    PAN_KMOD_BO_FLAG_LAZY_COMMIT = BITFIELD_BIT(9),
+
+   PAN_KMOD_BO_FLAG_TILER_HEAP = BITFIELD_BIT(10),
 };
+
+#define PAN_KMOD_TILER_HEAP_CHUNK_SIZE (2 * 1024 * 1024)
 
 /* Allowed group priority flags. */
 enum pan_kmod_group_allow_priority_flags {

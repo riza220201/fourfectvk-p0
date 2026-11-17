@@ -448,6 +448,10 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.base = dev->tiler_heap->addr.dev;
       cfg.bottom = dev->tiler_heap->addr.dev;
       cfg.top = cfg.base + cfg.size;
+#if PAN_ARCH == 9
+      if (dev->tiler_heap->bo->flags & PAN_KMOD_BO_FLAG_TILER_HEAP)
+         cfg.top = cfg.base + MIN2(cfg.size, PAN_KMOD_TILER_HEAP_CHUNK_SIZE);
+#endif
    }
 
    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {

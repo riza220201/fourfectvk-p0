@@ -40,6 +40,7 @@
 
 #include "kmod/pan_kmod.h"
 #include "util/os_file.h"
+#include "util/u_debug.h"
 #include "util/u_printf.h"
 #include "pan_props.h"
 #include "pan_samples.h"
@@ -616,12 +617,19 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 #endif
 
 #if PAN_ARCH <= 9
+   uint32_t tiler_heap_flags = PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT;
+#if PAN_ARCH == 9
+   if ((device->kmod.dev->props.supported_bo_flags &
+        PAN_KMOD_BO_FLAG_TILER_HEAP) &&
+       debug_get_bool_option("PANVK_TILER_HEAP_INCREMENTAL", false))
+      tiler_heap_flags |= PAN_KMOD_BO_FLAG_TILER_HEAP;
+#endif
    /* PATCH DEBUG v9 (SEMENTARA -- revert setelah investigasi tiler_heap
     * selesai): buang NO_MMAP biar CPU bisa baca isi tiler_heap langsung
     * buat diff sebelum/sesudah submit. */
    result = panvk_priv_bo_create(
       device, 128 * 1024 * 1024,
-      PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+      tiler_heap_flags,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
