@@ -377,7 +377,17 @@ pan_afbc_header_align(unsigned arch, uint64_t modifier)
 static inline uint32_t
 pan_afbc_body_align(unsigned arch, uint64_t modifier)
 {
-   /* Body and header alignments are actually the same. */
+   /* The GPU itself only needs the header alignment, but AFBC buffers shared
+    * with a display must follow the allocator's layout. Arm's gralloc and the
+    * komeda display driver start the body of a non-tiled AFBC buffer at a
+    * 1024-byte boundary (AFBC_BODY_START_ALIGNMENT). MediaTek's display
+    * controller (MT6789) shows a buffer whose body starts at the 128-byte
+    * header alignment as grey; the vendor driver writes the same superblocks
+    * with the body at 1024 bytes. The cost is under 1 KiB per surface. Tiled
+    * headers already use 4096. */
+   if (!(modifier & AFBC_FORMAT_MOD_TILED) && arch >= 6)
+      return 1024;
+
    return pan_afbc_header_align(arch, modifier);
 }
 
