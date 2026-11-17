@@ -46,6 +46,12 @@
 
 #define DEFAULT_MAX_AFBC_PACKING_RATIO 90
 
+#if DETECT_OS_ANDROID
+/* PAN_ANDROID_BCN=1 (debug.mesa.pan.android.bcn=1) re-enables the desktop
+ * block-compressed formats on Android; see panfrost_is_format_supported(). */
+DEBUG_GET_ONCE_BOOL_OPTION(pan_android_bcn, "PAN_ANDROID_BCN", false)
+#endif
+
 /* clang-format off */
 static const struct debug_named_value panfrost_debug_options[] = {
    {"perf",       PAN_DBG_PERF,       "Enable performance warnings"},
@@ -212,6 +218,25 @@ panfrost_is_format_supported(struct pipe_screen *screen,
 
    if (!supported)
       return false;
+
+#if DETECT_OS_ANDROID
+   /* Mali's vendor driver on Android exposes no desktop block compression
+    * (S3TC/DXTn, RGTC, BPTC) although the hardware samples it. Games choose
+    * asset sets and render paths from these extensions, and a phone that
+    * advertises them looks like a PC or an emulator: Mobile Legends then
+    * renders its 3D scene with corrupted textures (2D UI unaffected; hiding
+    * the extensions removes the corruption). Match the vendor driver. */
+   if (util_format_is_compressed(format) && !debug_get_option_pan_android_bcn()) {
+      switch (util_format_description(format)->layout) {
+      case UTIL_FORMAT_LAYOUT_S3TC:
+      case UTIL_FORMAT_LAYOUT_RGTC:
+      case UTIL_FORMAT_LAYOUT_BPTC:
+         return false;
+      default:
+         break;
+      }
+   }
+#endif
 
    if (bind & PIPE_BIND_DEPTH_STENCIL) {
       /* On panfrost, S8_UINT is actually stored as X8S8_UINT, which
