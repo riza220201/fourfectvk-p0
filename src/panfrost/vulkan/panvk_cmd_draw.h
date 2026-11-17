@@ -281,6 +281,9 @@ struct panvk_cmd_graphics_state {
       uint32_t base_instance;
       uint32_t bd_count;
       struct pan_ptr blend;
+      bool dcd_valid;
+      uint8_t dcd_prim;
+      alignas(8) uint8_t dcd[256];
    } v9_reuse;
 #endif
 

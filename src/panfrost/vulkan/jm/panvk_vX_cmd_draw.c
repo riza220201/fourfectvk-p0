@@ -2255,8 +2255,6 @@ prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
  * emit_vs_attrib() folds the base instance into the descriptor offset and the
  * driver set is rebuilt per draw instead of repeated.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(v9_desc_reuse, "PANVK_V9_DESC_REUSE", true)
-
 static VkResult
 prepare_gfx_desc(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -2456,6 +2454,8 @@ translate_stencil_op_v9(VkStencilOp in)
    }
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(v9_desc_reuse, "PANVK_V9_DESC_REUSE", true)
+
 static VkResult
 panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
                       const struct panvk_draw_data *draw,
@@ -2479,6 +2479,36 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    bool test_s = has_stencil_att_v9(cmdbuf) && ds->stencil.test_enable;
    bool test_z = has_depth_att_v9(cmdbuf) && ds->depth.test_enable;
    bool writes_z = writes_depth_v9(cmdbuf);
+
+   struct panvk_cmd_graphics_state *rgfx = &cmdbuf->state.gfx;
+   static_assert(sizeof(struct MALI_DRAW) <= sizeof(rgfx->v9_reuse.dcd),
+                 "DCD template storage too small");
+   const bool dcd_reusable =
+      debug_get_option_v9_desc_reuse() && !draw->info.indirect.buffer_dev_addr &&
+      !rgfx->tess.tes && !rgfx->gs.shader && !pan_v9_trace_enabled();
+   bool gfx_clean = true;
+   for (unsigned b = 0; b < PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT; b++) {
+      if (b != PANVK_CMD_GRAPHICS_DIRTY_VS_PUSH_UNIFORMS &&
+          b != PANVK_CMD_GRAPHICS_DIRTY_FS_PUSH_UNIFORMS &&
+          BITSET_TEST(rgfx->dirty, b))
+         gfx_clean = false;
+   }
+   if (dcd_reusable && rgfx->v9_reuse.dcd_valid && gfx_clean &&
+       rgfx->v9_reuse.dcd_prim == (uint8_t)reduced_prim &&
+       BITSET_IS_EMPTY(cmdbuf->vk.dynamic_graphics_state.dirty)) {
+      struct MALI_DRAW cfg;
+      memcpy(&cfg, rgfx->v9_reuse.dcd, sizeof(cfg));
+      if (fs) {
+         cfg.blend_count = bd_count;
+         cfg.blend = blend_ptr.gpu;
+         cfg.shader.resources = fs_desc_state->res_table;
+         cfg.shader.thread_storage = draw->tls;
+         cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
+      }
+      MALI_DRAW_pack(dcd, &cfg);
+      return VK_SUCCESS;
+   }
+   rgfx->v9_reuse.dcd_valid = false;
 
    struct pan_ptr ds_ptr = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
    if (!ds_ptr.gpu)
@@ -2784,6 +2814,12 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
          cfg.blend_count = 0;
          cfg.blend = 0;
          cfg.flags_1.render_target_mask = 0;
+      }
+
+      if (dcd_reusable) {
+         memcpy(rgfx->v9_reuse.dcd, &cfg, sizeof(cfg));
+         rgfx->v9_reuse.dcd_prim = (uint8_t)reduced_prim;
+         rgfx->v9_reuse.dcd_valid = true;
       }
    }
 
