@@ -31,6 +31,7 @@
 
 #include "main/context.h"
 #include "main/macros.h"
+#include "util/detect_os.h"
 #include "main/spirv_extensions.h"
 #include "main/version.h"
 #include "nir/nir_to_tgsi.h"
@@ -1211,11 +1212,20 @@ void st_init_extensions(struct pipe_screen *screen,
    init_format_extensions(screen, extensions, texture_mapping,
                           ARRAY_SIZE(texture_mapping), PIPE_TEXTURE_2D,
                           PIPE_BIND_SAMPLER_VIEW);
-   if (options->allow_compressed_fallback)
+   if (options->allow_compressed_fallback) {
+      /* On Android the vendor GLES drivers expose no desktop block
+       * compression (S3TC, RGTC, LATC, BPTC, 3DC), and apps pick asset sets
+       * and render paths from these extensions: a phone advertising them
+       * looks like a PC or an emulator. Keep only the ASTC fallback, which
+       * is entry 0 of the table, there. A driver that samples these formats
+       * natively still advertises them through texture_mapping. */
+      const unsigned nr_fallbacks =
+         DETECT_OS_ANDROID ? 1 : ARRAY_SIZE(texture_mapping_compressed_fallback);
       init_format_extensions(screen, extensions,
                              texture_mapping_compressed_fallback,
-                             ARRAY_SIZE(texture_mapping_compressed_fallback),
-                             PIPE_TEXTURE_2D, PIPE_BIND_SAMPLER_VIEW);
+                             nr_fallbacks, PIPE_TEXTURE_2D,
+                             PIPE_BIND_SAMPLER_VIEW);
+   }
    init_format_extensions(screen, extensions, vertex_mapping,
                           ARRAY_SIZE(vertex_mapping), PIPE_BUFFER,
                           PIPE_BIND_VERTEX_BUFFER);
