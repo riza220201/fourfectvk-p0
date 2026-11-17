@@ -660,6 +660,7 @@ struct pan_kmod_dev {
    /* Pending BO syncs. */
    struct {
       bool user_cache_ops_pending;
+      int error;
       struct util_dynarray array;
       simple_mtx_t lock;
    } pending_bo_syncs;
@@ -865,7 +866,13 @@ void pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t bo_offset,
                                 void *cpu_ptr, uint64_t range,
                                 enum pan_kmod_bo_sync_type type);
 
-void pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev);
+int pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev);
+
+static inline int
+pan_kmod_bo_map_sync_error(struct pan_kmod_dev *dev)
+{
+   return p_atomic_read(&dev->pending_bo_syncs.error);
+}
 
 static inline void
 pan_kmod_set_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label)

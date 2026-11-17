@@ -97,6 +97,9 @@ to_panvk_physical_device(struct vk_physical_device *phys_dev)
 float panvk_get_gpu_system_timestamp_period(
    const struct panvk_physical_device *device);
 
+bool panvk_v9_timestamp_queries_enabled(
+   const struct panvk_physical_device *device);
+
 VkResult panvk_physical_device_init(struct panvk_physical_device *device,
                                     struct panvk_instance *instance,
                                     drmDevicePtr drm_device);

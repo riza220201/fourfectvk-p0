@@ -1205,6 +1205,19 @@ panvk_get_gpu_system_timestamp_period(const struct panvk_physical_device *device
    return device->kmod.dev->props.timestamp_cycles_to_ns_factor;
 }
 
+bool
+panvk_v9_timestamp_queries_enabled(const struct panvk_physical_device *device)
+{
+   const struct pan_kmod_dev_props *props = &device->kmod.dev->props;
+   const struct panvk_instance *instance =
+      to_panvk_instance(device->vk.instance);
+
+   return pan_arch(props->gpu_id) == 9 && props->gpu_can_query_timestamp &&
+          props->timestamp_frequency &&
+          (pan_env_flag("PANVK_V9_TIMESTAMP") != NULL ||
+           instance->drirc.misc.v9_timestamps);
+}
+
 void
 panvk_physical_device_finish(struct panvk_physical_device *device)
 {
@@ -1592,7 +1605,7 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
             some CTS tests */
          .queueCount = arch >= 10 ? 2 : 1,
          .timestampValidBits =
-            arch >= 10 &&
+            (arch >= 10 || panvk_v9_timestamp_queries_enabled(physical_device)) &&
                   physical_device->kmod.dev->props.gpu_can_query_timestamp
                ? 64
                : 0,

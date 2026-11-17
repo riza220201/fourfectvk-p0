@@ -41,6 +41,7 @@
 #include "util/timespec.h"
 #include "pan_v9_trace.h"
 #include "pan_props.h"
+#include "pan_desc.h"
 #include "panfrost/lib/pan_env.h"
 #include "panvk_mem_prof.h"
 #include <errno.h>
@@ -348,6 +349,7 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
 #define BASE_JD_REQ_SOFT_FENCE_WAIT (BASE_JD_REQ_SOFT_JOB | 0x3)
 #define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE (1U << 12)
 #define BASE_JD_EVENT_DONE 0x1
+#define BASE_JD_EVENT_JOB_CANCELLED 0x4002
 
 /* struct base_fence, mali_base_kernel.h */
 struct panvk_kbase_base_fence {
@@ -358,6 +360,7 @@ struct panvk_kbase_base_fence {
 struct panvk_kbase_job {
    uint64_t jc;
    uint32_t core_req;
+   bool overlap_second;
    /* PANVK_FAULT_REPORT: what the atom carries (0076). */
    struct panvk_cmd_buffer *cmdbuf;
    struct panvk_batch *batch;
@@ -418,6 +421,10 @@ struct panvk_kbase_jm {
    bool ctrl_no_fence_wait_dep, ctrl_export_early;
    /* Read once at creation (were read on every submit). */
    bool chain_enabled, no_signal;
+   bool overlap_enabled;
+   struct {
+      struct panvk_priv_bo *heap, *tls, *wls;
+   } overlap_banks[2];
    /* Counted always, printed at destroy with PANVK_KBASE_FENCE_TRACE=1:
     * waits by payload, FENCE_WAIT atoms, exports by outcome. */
    bool trace;
@@ -986,9 +993,13 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
    const uint8_t atom = ev->atom_number;
 
    if (k->atom_use[atom] == PANVK_KBASE_ATOM_AUX) {
-      if (ev->event_code != BASE_JD_EVENT_DONE)
+      if (ev->event_code != BASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase out-fence atom %u: event 0x%x", atom,
                    ev->event_code);
+         k->lost = true;
+         vk_device_set_lost(&k->dev->vk, "kbase out-fence failed: 0x%x",
+                            ev->event_code);
+      }
       panvk_kbase_free_atoms(k, 1, &atom);
       return;
    }
@@ -1000,8 +1011,14 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
       return;
    }
 
-   if (ev->event_code != BASE_JD_EVENT_DONE)
+   if (ev->event_code != BASE_JD_EVENT_DONE &&
+       !(k->atom_info[atom].core_req == BASE_JD_REQ_SOFT_FENCE_WAIT &&
+         ev->event_code == BASE_JD_EVENT_JOB_CANCELLED)) {
       panvk_kbase_report_failure(k, atom, sub->seqno, ev->event_code);
+      k->lost = true;
+      vk_device_set_lost(&k->dev->vk, "kbase atom %u failed: 0x%x", atom,
+                         ev->event_code);
+   }
    if (atom == sub->last)
       sub->done = true;
 
@@ -1092,6 +1109,9 @@ panvk_kbase_alloc_atoms(struct panvk_kbase_jm *k, unsigned n, uint8_t *nums,
       panvk_kbase_progress_locked(k, OS_TIMEOUT_INFINITE);
    }
 
+   if (k->lost)
+      return VK_ERROR_DEVICE_LOST;
+
    for (unsigned i = 0; i < n; i++) {
       while (k->atom_use[k->cursor] != PANVK_KBASE_ATOM_FREE)
          k->cursor = k->cursor % 255 + 1;
@@ -1111,6 +1131,9 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
                           const struct panvk_kbase_job *jobs, unsigned n,
                           int wait_fd, uint64_t *seqno)
 {
+   if (k->lost)
+      return VK_ERROR_DEVICE_LOST;
+
    if (!n && wait_fd < 0) {
       *seqno = k->last_seqno;
       return VK_SUCCESS;
@@ -1136,7 +1159,9 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
    if (wait_fd >= 0) {
       k->stats.fence_wait_atoms++;
       wait_atom = nums[a];
-      k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){0};
+      k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){
+         .core_req = BASE_JD_REQ_SOFT_FENCE_WAIT,
+      };
       panvk_kbase_atom(atoms[a], nums[a], (uintptr_t)&wait_fence,
                        BASE_JD_REQ_SOFT_FENCE_WAIT |
                           BASE_JD_REQ_EVENT_ONLY_ON_FAILURE,
@@ -1159,7 +1184,18 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
                           BASE_JD_DEP_TYPE_ORDER,
                           k->ctrl_no_fence_wait_dep ? 0 : wait_atom,
                           BASE_JD_DEP_TYPE_ORDER);
-      else
+      else if (jobs[i].overlap_second) {
+         assert(i >= 2 && jobs[i].core_req == 0x16 &&
+                jobs[i - 1].core_req == 0x01 &&
+                jobs[i - 2].core_req == 0x16);
+         panvk_kbase_atom(atoms[a], nums[a], jobs[i].jc, core_req, nums[a - 2],
+                          BASE_JD_DEP_TYPE_DATA, 0, 0);
+      } else if (jobs[i - 1].overlap_second) {
+         assert(i >= 3 && jobs[i].core_req == 0x01);
+         panvk_kbase_atom(atoms[a], nums[a], jobs[i].jc, core_req, nums[a - 1],
+                          BASE_JD_DEP_TYPE_DATA, nums[a - 2],
+                          BASE_JD_DEP_TYPE_DATA);
+      } else
          panvk_kbase_atom(atoms[a], nums[a], jobs[i].jc, core_req, nums[a - 1],
                           BASE_JD_DEP_TYPE_DATA, 0, 0);
    }
@@ -1225,11 +1261,173 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
          break;
       }
    }
+   if (k->lost)
+      result = VK_ERROR_DEVICE_LOST;
    mtx_unlock(&k->mtx);
    if (t0 && waited)
       p_atomic_add(&k->dev->frame_prof.wait_ns, os_time_get_nano() - t0);
    return result;
 }
+
+#if PAN_ARCH == 9
+#define PANVK_OVERLAP_SCRATCH_LIMIT (16u * 1024u * 1024u)
+
+static bool
+panvk_kbase_overlap_eligible(const struct panvk_cmd_buffer *cmdbuf,
+                              const struct panvk_batch *batch)
+{
+   if (cmdbuf->state.uses_poly_heap || !batch->vtc_jc.first_tiler ||
+       !batch->vtc_jc.first_job || !batch->frag_jc.first_job ||
+       !batch->tiler.heap_desc.cpu || batch->fb.layer_count != 1 ||
+       batch->tls_total_size > PANVK_OVERLAP_SCRATCH_LIMIT ||
+       batch->wls_total_size > PANVK_OVERLAP_SCRATCH_LIMIT ||
+       util_dynarray_num_elements(&batch->event_ops,
+                                  struct panvk_cmd_event_op))
+      return false;
+
+   util_dynarray_foreach(&batch->jobs, void *, job) {
+      unsigned type = (fa_rd32((const uint8_t *)*job + 16) >> 1) & 0x7f;
+      if (type != MALI_JOB_TYPE_MALLOC_VERTEX && type != MALI_JOB_TYPE_FRAGMENT)
+         return false;
+   }
+
+   return true;
+}
+
+static VkResult
+panvk_kbase_reserve_overlap_bo(struct panvk_kbase_jm *k,
+                                struct panvk_priv_bo **bo, unsigned size)
+{
+   if (!size || (*bo && pan_kmod_bo_size((*bo)->bo) >= size))
+      return VK_SUCCESS;
+
+   struct panvk_priv_bo *new_bo = NULL;
+   VkResult result = panvk_priv_bo_create(
+      k->dev, ALIGN_POT(size, 4096), PAN_KMOD_BO_FLAG_NO_MMAP,
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &new_bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   panvk_priv_bo_unref(*bo);
+   *bo = new_bo;
+   return VK_SUCCESS;
+}
+
+static VkResult
+panvk_kbase_prepare_overlap(struct panvk_kbase_jm *k,
+                             const struct vk_queue_submit *submit)
+{
+   unsigned tls_size = 0, wls_size = 0;
+   bool any = false;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      struct panvk_batch *previous = NULL;
+      list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
+         batch->overlap_bank = 0;
+         if (!panvk_kbase_overlap_eligible(cmdbuf, batch)) {
+            previous = NULL;
+            continue;
+         }
+         if (previous && previous->sync_epoch == batch->sync_epoch) {
+            previous->overlap_bank = 1;
+            batch->overlap_bank = 2;
+            tls_size = MAX3(tls_size, previous->tls_total_size,
+                            batch->tls_total_size);
+            wls_size = MAX3(wls_size, previous->wls_total_size,
+                            batch->wls_total_size);
+            previous = NULL;
+            any = true;
+         } else {
+            previous = batch;
+         }
+      }
+   }
+   if (!any)
+      return VK_SUCCESS;
+
+   bool grow = false;
+   for (unsigned i = 0; i < 2; i++) {
+      grow |= !k->overlap_banks[i].heap;
+      grow |= tls_size && (!k->overlap_banks[i].tls ||
+         pan_kmod_bo_size(k->overlap_banks[i].tls->bo) < tls_size);
+      grow |= wls_size && (!k->overlap_banks[i].wls ||
+         pan_kmod_bo_size(k->overlap_banks[i].wls->bo) < wls_size);
+   }
+   if (!grow)
+      return VK_SUCCESS;
+
+   mtx_lock(&k->mtx);
+   uint64_t seqno = k->last_seqno;
+   mtx_unlock(&k->mtx);
+   VkResult result = panvk_kbase_wait_seqno(k, seqno, OS_TIMEOUT_INFINITE);
+   if (result != VK_SUCCESS)
+      return result;
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (!k->overlap_banks[i].heap) {
+         if (!i) {
+            k->overlap_banks[i].heap = panvk_priv_bo_ref(k->dev->tiler_heap);
+         } else {
+            result = panvk_priv_bo_create(
+               k->dev, pan_kmod_bo_size(k->dev->tiler_heap->bo),
+               k->dev->tiler_heap->bo->flags | PAN_KMOD_BO_FLAG_NO_MMAP,
+               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &k->overlap_banks[i].heap);
+            if (result != VK_SUCCESS)
+               goto serialized;
+         }
+      }
+      result = panvk_kbase_reserve_overlap_bo(
+         k, &k->overlap_banks[i].tls, tls_size);
+      if (result != VK_SUCCESS)
+         goto serialized;
+      result = panvk_kbase_reserve_overlap_bo(
+         k, &k->overlap_banks[i].wls, wls_size);
+      if (result != VK_SUCCESS)
+         goto serialized;
+   }
+   return VK_SUCCESS;
+
+serialized:
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node)
+         batch->overlap_bank = 0;
+   }
+   return VK_SUCCESS;
+}
+
+static void
+panvk_kbase_bind_overlap_bank(struct panvk_kbase_jm *k,
+                               struct panvk_cmd_buffer *cmdbuf,
+                               struct panvk_batch *batch)
+{
+   struct pan_tls_info tls = batch->tlsinfo;
+   struct mali_tiler_heap_packed heap = batch->tiler.heap_templ;
+   if (batch->overlap_bank) {
+      unsigned i = batch->overlap_bank - 1;
+      struct panvk_priv_bo *bo = k->overlap_banks[i].heap;
+      if (tls.tls.size)
+         tls.tls.ptr = k->overlap_banks[i].tls->addr.dev;
+      if (tls.wls.size)
+         tls.wls.ptr = k->overlap_banks[i].wls->addr.dev;
+      pan_pack(&heap, TILER_HEAP, cfg) {
+         cfg.size = pan_kmod_bo_size(bo->bo);
+         cfg.base = bo->addr.dev;
+         cfg.bottom = cfg.base;
+         cfg.top = cfg.base + cfg.size;
+         if (bo->bo->flags & PAN_KMOD_BO_FLAG_TILER_HEAP)
+            cfg.top = cfg.base + MIN2(cfg.size, PAN_KMOD_TILER_HEAP_CHUNK_SIZE);
+      }
+   }
+   if (batch->tls.cpu)
+      GENX(pan_emit_tls)(&tls, batch->tls.cpu);
+   if (batch->tiler.heap_desc.cpu)
+      memcpy(batch->tiler.heap_desc.cpu, &heap, sizeof(heap));
+   panvk_pool_flush_maps(&cmdbuf->desc_pool);
+}
+#endif
 
 /* Submit what the chain holds, plus its pending wait, as one submission. */
 static VkResult
@@ -1307,6 +1505,10 @@ panvk_kbase_sync_export_cb(
       return VK_SUCCESS;
 
    mtx_lock(&k->mtx);
+   if (k->lost) {
+      mtx_unlock(&k->mtx);
+      return VK_ERROR_DEVICE_LOST;
+   }
    while (!cpu_wait && k->completed_seqno < seqno) {
       struct panvk_kbase_sub *sub =
          &k->subs[(k->head + (seqno - k->subs[k->head].seqno)) %
@@ -1408,7 +1610,7 @@ panvk_kbase_prof_pass(struct panvk_device *dev, const struct panvk_batch *batch,
    panvk_frame_prof_pass(dev, &batch->prof, jobs, vtc_ns, frag_ns);
 }
 
-static void
+static VkResult
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
                          struct panvk_batch *batch, uint32_t *bos,
@@ -1433,12 +1635,12 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (chain && panvk_kbase_chain_has_batch(chain, batch)) {
          result = panvk_kbase_flush(k, chain, false, NULL);
          if (result != VK_SUCCESS)
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            return result;
       }
       result = panvk_kbase_wait_seqno(k, batch->kbase_seqno,
                                       OS_TIMEOUT_INFINITE);
       if (result != VK_SUCCESS)
-         mesa_loge("panvk: wait for a re-issued batch failed: %d", result);
+         return result;
 
       util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
@@ -1480,9 +1682,15 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       panvk_pool_flush_maps(&cmdbuf->desc_pool);
    }
 
+#if PAN_ARCH == 9
+   if (k->overlap_enabled)
+      panvk_kbase_bind_overlap_bank(k, cmdbuf, batch);
+#endif
+
    /* Flush pending synchronization requests before submitting the job, to
     * make sure things are GPU-visible. */
-   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+   if (pan_kmod_flush_bo_map_syncs(dev->kmod.dev))
+      return vk_device_set_lost(&dev->vk, "cache synchronization before submit failed");
 
    /* PATCH 0077: PANVK_FAULT_AUDIT_ALL=1 checks every batch before it goes
     * to the GPU (validation of the audit, very slow). */
@@ -1511,11 +1719,19 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
           chain->nr_batches + 1 > PANVK_KBASE_MAX_CHAIN) {
          result = panvk_kbase_flush(k, chain, false, NULL);
          if (result != VK_SUCCESS)
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            return result;
+      }
+      bool overlap_second = batch->overlap_bank == 2 && chain->nr_jobs >= 2;
+      if (overlap_second) {
+         const struct panvk_kbase_job *last = &chain->jobs[chain->nr_jobs - 1];
+         overlap_second = last->cmdbuf == cmdbuf &&
+            last->batch->overlap_bank == 1 && last->core_req == 0x01 &&
+            last->batch->sync_epoch == batch->sync_epoch;
       }
       if (batch->vtc_jc.first_job)
          chain->jobs[chain->nr_jobs++] = (struct panvk_kbase_job){
             .jc = batch->vtc_jc.first_job, .core_req = 0x16,
+            .overlap_second = overlap_second,
             .cmdbuf = cmdbuf, .batch = batch, .batch_idx = batch_idx};
       if (batch->frag_jc.first_job)
          chain->jobs[chain->nr_jobs++] = (struct panvk_kbase_job){
@@ -1525,7 +1741,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       batch->issued = true;
       if (dev->frame_prof.passes)
          panvk_kbase_prof_pass(dev, batch, 0, 0);
-      return;
+      return VK_SUCCESS;
    }
 
    uint64_t prof_vtc_ns = 0, prof_frag_ns = 0;
@@ -1540,9 +1756,11 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
          p_atomic_add(&dev->frame_prof.vtc_ns, prof_vtc_ns);
       }
       ret = result == VK_SUCCESS ? 0 : -1;
-      if (ret)
+      if (ret) {
          mesa_loge("panvk: v9 vtc_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
+         return result;
+      }
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] vtc_jc ret=%d\n", ret);
@@ -1574,9 +1792,11 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
          p_atomic_add(&dev->frame_prof.frag_ns, prof_frag_ns);
       }
       ret = result == VK_SUCCESS ? 0 : -1;
-      if (ret)
+      if (ret) {
          mesa_loge("panvk: v9 frag_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
+         return result;
+      }
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] frag_jc ret=%d\n", ret);
@@ -1587,7 +1807,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
          /* If we want to read the descriptors back, we need to invalidate the
           * whole desc pool, otherwise we might end up with stale data. */
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+         if (pan_kmod_flush_bo_map_syncs(dev->kmod.dev))
+            return vk_device_set_lost(&dev->vk, "descriptor cache synchronization failed");
       }
 
       if (PANVK_DEBUG(TRACE))
@@ -1606,6 +1827,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       panvk_kbase_prof_pass(dev, batch, prof_vtc_ns, prof_frag_ns);
 
    batch->issued = true;
+   return VK_SUCCESS;
 }
 
 static void
@@ -1713,6 +1935,17 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    const uint64_t prof_t0 = dev->frame_prof.enabled ? os_time_get_nano() : 0;
 
    panvk_mem_prof_tick(dev);
+
+   if (pan_kmod_flush_bo_map_syncs(dev->kmod.dev))
+      return vk_device_set_lost(&dev->vk, "cache synchronization before submit failed");
+
+#if PAN_ARCH == 9
+   if (k->overlap_enabled) {
+      result = panvk_kbase_prepare_overlap(k, submit);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+#endif
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
@@ -1831,14 +2064,17 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          const bool has_event_ops = max_wait_event_syncobjs > 0;
          if (chain && has_event_ops &&
              (result = panvk_kbase_flush(k, chain, false, NULL)))
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            goto err_submit;
 
-         panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
-                                  nr_in_fences, chain, batch_idx++);
+         result = panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos,
+                                           in_fences, nr_in_fences, chain,
+                                           batch_idx++);
+         if (result != VK_SUCCESS)
+            goto err_submit;
 
          if (chain && has_event_ops &&
              (result = panvk_kbase_flush(k, chain, true, NULL)))
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            goto err_submit;
 
          panvk_signal_event_syncobjs(queue, batch);
       }
@@ -1849,8 +2085,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    if (chain) {
       result = panvk_kbase_flush(k, chain, wait_submit, &seqno);
       if (result != VK_SUCCESS)
-         return vk_device_set_lost(&dev->vk, "kbase submission failed: %d",
-                                   result);
+         goto err_submit;
    } else {
       mtx_lock(&k->mtx);
       seqno = k->last_seqno;
@@ -1887,6 +2122,20 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       panvk_frame_prof_tick(dev, t1);
    }
    return VK_SUCCESS;
+
+err_submit:
+   if (chain) {
+      if (chain->wait_fd >= 0)
+         close(chain->wait_fd);
+      chain->wait_fd = -1;
+      chain->nr_jobs = 0;
+      chain->nr_batches = 0;
+   }
+   mtx_lock(&k->mtx);
+   k->lost = true;
+   u_cnd_monotonic_broadcast(&k->cnd);
+   mtx_unlock(&k->mtx);
+   return vk_device_set_lost(&dev->vk, "kbase submission failed: %d", result);
 }
 
 static void
@@ -1930,6 +2179,10 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    k->ctrl_export_early = pan_env_flag("PANVK_KBASE_CTRL_EXPORT_EARLY") != NULL;
    k->dev = device;
    k->chain_enabled = panvk_kbase_chain_enabled();
+#if PAN_ARCH == 9
+   k->overlap_enabled = k->chain_enabled &&
+      debug_get_bool_option("PANVK_JM_OVERLAP", false);
+#endif
    k->no_signal = pan_env_flag("PANVK_KBASE_NO_SIGNAL") != NULL;
    k->t0_ns = os_time_get_nano();
    k->fault_report = pan_env_flag("PANVK_FAULT_REPORT") != NULL;
@@ -1976,6 +2229,11 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
    }
    if (k->chain.wait_fd >= 0)
       close(k->chain.wait_fd);
+   for (unsigned i = 0; i < 2; i++) {
+      panvk_priv_bo_unref(k->overlap_banks[i].heap);
+      panvk_priv_bo_unref(k->overlap_banks[i].tls);
+      panvk_priv_bo_unref(k->overlap_banks[i].wls);
+   }
    u_cnd_monotonic_destroy(&k->cnd);
    mtx_destroy(&k->mtx);
    vk_free(&device->vk.alloc, k);

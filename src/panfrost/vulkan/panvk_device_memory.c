@@ -473,8 +473,8 @@ panvk_FlushMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
    VkResult result =
       sync_memory_ranges(device, memoryRangeCount, pMemoryRanges,
                          PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH);
-   if (result == VK_SUCCESS)
-      pan_kmod_flush_bo_map_syncs(device->kmod.dev);
+   if (result == VK_SUCCESS && pan_kmod_flush_bo_map_syncs(device->kmod.dev))
+      return panvk_error(device, VK_ERROR_UNKNOWN);
    return result;
 }
 
@@ -487,8 +487,8 @@ panvk_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
       sync_memory_ranges(device, memoryRangeCount, pMemoryRanges,
                          PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE);
 
-   if (result == VK_SUCCESS)
-      pan_kmod_flush_bo_map_syncs(device->kmod.dev);
+   if (result == VK_SUCCESS && pan_kmod_flush_bo_map_syncs(device->kmod.dev))
+      return panvk_error(device, VK_ERROR_UNKNOWN);
 
    return result;
 }

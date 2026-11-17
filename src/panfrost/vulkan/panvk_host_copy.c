@@ -303,9 +303,13 @@ image_sync_subres(struct panvk_image *img, void *plane_cpu_ptr,
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_CopyMemoryToImage(VkDevice device, const VkCopyMemoryToImageInfo *info)
 {
+   VK_FROM_HANDLE(panvk_device, dev, device);
    VK_FROM_HANDLE(panvk_image, dst, info->dstImage);
    void *dst_cpu[PANVK_MAX_PLANES] = {NULL};
    VkResult result = VK_SUCCESS;
+
+   if (pan_kmod_bo_map_sync_error(dev->kmod.dev))
+      return panvk_error(dev, VK_ERROR_UNKNOWN);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
       uint8_t p =
@@ -322,6 +326,8 @@ panvk_CopyMemoryToImage(VkDevice device, const VkCopyMemoryToImageInfo *info)
    }
 
 out_unmap:
+   if (result == VK_SUCCESS && pan_kmod_bo_map_sync_error(dev->kmod.dev))
+      result = panvk_error(dev, VK_ERROR_UNKNOWN);
    munmap_planes(dst, dst_cpu);
    return result;
 }
@@ -369,7 +375,10 @@ panvk_CopyImageToMemory(VkDevice device, const VkCopyImageToMemoryInfo *info)
                         PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE);
    }
 
-   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+   if (pan_kmod_flush_bo_map_syncs(dev->kmod.dev)) {
+      result = panvk_error(dev, VK_ERROR_UNKNOWN);
+      goto out_unmap;
+   }
 
    for (unsigned i = 0; i < info->regionCount; i++) {
       uint8_t p =
@@ -572,7 +581,10 @@ panvk_CopyImageToImage(VkDevice device, const VkCopyImageToImageInfo *info)
    }
 
    /* Flush invalidates before reading the source. */
-   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+   if (pan_kmod_flush_bo_map_syncs(dev->kmod.dev)) {
+      result = panvk_error(dev, VK_ERROR_UNKNOWN);
+      goto out_unmap;
+   }
 
    for (unsigned i = 0; i < info->regionCount; i++) {
       bool depth_and_stencil =
@@ -627,6 +639,8 @@ panvk_CopyImageToImage(VkDevice device, const VkCopyImageToImageInfo *info)
 out_unmap:
    munmap_planes(src, src_cpu);
    munmap_planes(dst, dst_cpu);
+   if (result == VK_SUCCESS && pan_kmod_bo_map_sync_error(dev->kmod.dev))
+      result = panvk_error(dev, VK_ERROR_UNKNOWN);
    return result;
 }
 

@@ -61,6 +61,7 @@ panvk_per_arch(DestroyEvent)(VkDevice _device, VkEvent _event,
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
 {
+   VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
    panvk_priv_mem_readback_array(event->syncobjs, 0, struct panvk_cs_sync32,
@@ -70,6 +71,9 @@ panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
             return VK_EVENT_RESET;
       }
    }
+
+   if (pan_kmod_bo_map_sync_error(device->kmod.dev))
+      return vk_device_set_lost(&device->vk, "event cache synchronization failed");
 
    return VK_EVENT_SET;
 }

@@ -206,6 +206,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
       unsigned size = pan_get_total_stack_size(batch->tlsinfo.tls.size,
                                                thread_tls_alloc, core_id_range);
+      batch->tls_total_size = size;
       /* PATCH: reuse the command buffer's scratch when it is big enough
        * (see panvk_cmd_buffer.h). A smaller per-thread size in the TLS
        * descriptor only uses the start of a larger buffer.
@@ -539,6 +540,7 @@ panvk_alloc_batch(struct panvk_cmd_buffer *cmdbuf)
    }
    batch->jobs = UTIL_DYNARRAY_INIT;
    batch->event_ops = UTIL_DYNARRAY_INIT;
+   batch->sync_epoch = cmdbuf->state.sync_epoch;
 #if PAN_ARCH == 9
    batch->ubo_gather.words = UTIL_DYNARRAY_INIT;
 #endif
@@ -581,11 +583,43 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmdbuf->vk);
 }
 
+static bool
+panvk_barrier_blocks_overlap(VkPipelineStageFlags2 src,
+                              VkPipelineStageFlags2 dst)
+{
+   const VkPipelineStageFlags2 fragment =
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+   return (src & ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) && (dst & ~fragment);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                     const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   bool blocks_overlap = false;
+   for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
+      const VkMemoryBarrier2 *barrier = &pDependencyInfo->pMemoryBarriers[i];
+      blocks_overlap |= panvk_barrier_blocks_overlap(barrier->srcStageMask,
+                                                      barrier->dstStageMask);
+   }
+   for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++) {
+      const VkBufferMemoryBarrier2 *barrier =
+         &pDependencyInfo->pBufferMemoryBarriers[i];
+      blocks_overlap |= panvk_barrier_blocks_overlap(barrier->srcStageMask,
+                                                      barrier->dstStageMask);
+   }
+   for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *barrier =
+         &pDependencyInfo->pImageMemoryBarriers[i];
+      blocks_overlap |= panvk_barrier_blocks_overlap(barrier->srcStageMask,
+                                                      barrier->dstStageMask);
+   }
+   if (blocks_overlap)
+      cmdbuf->state.sync_epoch++;
 
    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
     * for memory barriers assuming we implement barriers with the creation of a

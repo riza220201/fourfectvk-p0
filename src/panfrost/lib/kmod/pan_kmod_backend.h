@@ -96,7 +96,7 @@ pan_kmod_bo_init(struct pan_kmod_bo *bo, struct pan_kmod_dev *dev,
    p_atomic_set(&bo->refcnt, 1);
 }
 
-void pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev);
+int pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev);
 
 static inline void
 pan_kmod_bo_cleanup(struct pan_kmod_bo *bo)

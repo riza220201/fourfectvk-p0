@@ -216,8 +216,12 @@ panvk_priv_mem_readback_start(struct panvk_priv_mem mem, uint64_t offset,
    if (bo->bo->flags & PAN_KMOD_BO_FLAG_WB_MMAP) {
       /* We need to invalidate before we can read back. */
       panvk_priv_mem_invalidate(mem, offset, size);
-      pan_kmod_flush_bo_map_syncs(bo->bo->dev);
+      if (pan_kmod_flush_bo_map_syncs(bo->bo->dev))
+         return NULL;
    }
+
+   if (pan_kmod_bo_map_sync_error(bo->bo->dev))
+      return NULL;
 
    return (uint8_t *)panvk_priv_mem_host_addr(mem) + offset;
 }

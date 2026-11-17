@@ -59,7 +59,10 @@ struct panvk_batch {
       struct mali_tiler_context_packed ctx_templ;
    } tiler;
    struct pan_tls_info tlsinfo;
+   unsigned tls_total_size;
    unsigned wls_total_size;
+   uint64_t sync_epoch;
+   uint8_t overlap_bank;
    bool issued;
    /* kbase submission that last ran this batch: a re-issue waits for it. */
    uint64_t kbase_seqno;
@@ -103,6 +106,7 @@ struct panvk_cmd_buffer {
       struct panvk_cmd_compute_state compute;
       /* PATCH v9: the poly heap was reset by this command buffer. */
       bool uses_poly_heap;
+      uint64_t sync_epoch;
       /* PATCH v9: active pipeline statistics query (addr 0: none). The
        * counters are 64-bit, one per enabled statistic in bit order. */
       struct {

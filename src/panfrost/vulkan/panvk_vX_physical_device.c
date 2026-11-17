@@ -1071,9 +1071,10 @@ panvk_per_arch(get_physical_device_properties)(
             : VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics =
-         PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
+         (PAN_ARCH >= 10 || panvk_v9_timestamp_queries_enabled(device)) &&
+         device->kmod.dev->props.gpu_can_query_timestamp,
       .timestampPeriod =
-         PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
+         PAN_ARCH >= 9 ? panvk_get_gpu_system_timestamp_period(device) : 0,
       .maxClipDistances = PAN_ARCH == 9 ? 8 : 0,
       .maxCullDistances = PAN_ARCH == 9 ? 8 : 0,
       .maxCombinedClipAndCullDistances = PAN_ARCH == 9 ? 8 : 0,

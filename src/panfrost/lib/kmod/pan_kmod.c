@@ -264,24 +264,29 @@ err_unlock:
    return NULL;
 }
 
-void
+int
 pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev)
 {
-   ASSERTED int ret = dev->ops->flush_bo_map_syncs(dev);
-   assert(!ret);
+   int ret = pan_kmod_bo_map_sync_error(dev);
+   if (!ret) {
+      ret = dev->ops->flush_bo_map_syncs(dev);
+      if (ret)
+         p_atomic_set(&dev->pending_bo_syncs.error, ret);
+   }
 
    util_dynarray_foreach(&dev->pending_bo_syncs.array,
                          struct pan_kmod_deferred_bo_sync, sync)
       sync->bo->has_pending_deferred_syncs = false;
 
    util_dynarray_clear(&dev->pending_bo_syncs.array);
+   return ret;
 }
 
-void
+int
 pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 {
    if (dev->props.is_io_coherent)
-      return;
+      return pan_kmod_bo_map_sync_error(dev);
 
    /* Barrier to make sure all flush/invalidate requests are effective. */
    if (p_atomic_xchg(&dev->pending_bo_syncs.user_cache_ops_pending, false))
@@ -293,11 +298,12 @@ pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
     */
    if (!util_dynarray_num_elements(&dev->pending_bo_syncs.array,
                                    struct pan_kmod_deferred_bo_sync))
-      return;
+      return pan_kmod_bo_map_sync_error(dev);
 
    simple_mtx_lock(&dev->pending_bo_syncs.lock);
-   pan_kmod_flush_bo_map_syncs_locked(dev);
+   int ret = pan_kmod_flush_bo_map_syncs_locked(dev);
    simple_mtx_unlock(&dev->pending_bo_syncs.lock);
+   return ret;
 }
 
 /* Arbitrary limit for now. Pick something bigger or make it configurable if it
@@ -350,6 +356,11 @@ pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t bo_offset,
                                   struct pan_kmod_deferred_bo_sync) >=
        MAX_PENDING_SYNC_OPS)
       pan_kmod_flush_bo_map_syncs_locked(dev);
+
+   if (pan_kmod_bo_map_sync_error(dev)) {
+      simple_mtx_unlock(&dev->pending_bo_syncs.lock);
+      return;
+   }
 
    /* Architectures that use cache_ops_null.c will always return 0 for
     * util_cache_granularity(). But using that result would make

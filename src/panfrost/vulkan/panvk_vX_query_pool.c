@@ -190,6 +190,9 @@ panvk_query_wait_for_available(struct panvk_device *dev,
       if (panvk_query_is_available(pool, query))
          return VK_SUCCESS;
 
+      if (pan_kmod_bo_map_sync_error(dev->kmod.dev))
+         return vk_device_set_lost(&dev->vk, "query cache synchronization failed");
+
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
@@ -277,6 +280,9 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
 
       bool available = panvk_query_is_available(pool, query);
 
+      if (pan_kmod_bo_map_sync_error(device->kmod.dev))
+         return vk_device_set_lost(&device->vk, "query cache synchronization failed");
+
       if (!available && (flags & VK_QUERY_RESULT_WAIT_BIT)) {
          status = panvk_query_wait_for_available(device, pool, query);
          if (status != VK_SUCCESS)
@@ -333,6 +339,9 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
             UNREACHABLE("Unsupported query type");
          }
       }
+
+      if (pan_kmod_bo_map_sync_error(device->kmod.dev))
+         return vk_device_set_lost(&device->vk, "query cache synchronization failed");
 
       if (!write_results)
          status = VK_NOT_READY;
