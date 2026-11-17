@@ -40,6 +40,10 @@ void bifrost_init_debug_options(void);
 bool bifrost_will_dump_shaders(void);
 bool bifrost_want_debug_info(void);
 
+/* PAN_LATE_VECTORIZE=1: run the UBO load vectoriser a second time after the
+ * late optimisation loop. Off by default. */
+bool bifrost_late_vectorize(void);
+
 #ifdef __cplusplus
 } /* extern C */
 #endif

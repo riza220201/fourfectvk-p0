@@ -34,6 +34,14 @@ struct pan_jc {
 
    /* The job index of the WRITE_VALUE job (before it has been created) */
    unsigned write_value_index;
+
+   /* Valhall+ only: don't make each tiler/IDVS job wait on the previous one
+    * through dependency 2. The Mali system driver leaves consecutive draws
+    * of a pass independent (both dependencies 0) on G57, so the hardware
+    * keeps the primitive order itself; the chaining only serialises the
+    * draws. Explicit dependencies passed by the caller are kept. Set by
+    * panvk behind PANVK_V9_NO_TILER_CHAIN (off by default). */
+   bool no_tiler_chain;
 };
 
 #if defined(PAN_ARCH) && PAN_ARCH <= 9
@@ -149,7 +157,7 @@ pan_jc_add_job(struct pan_jc *jc, enum mali_job_type type, bool barrier,
       if (PAN_ARCH <= 5 && !jc->write_value_index)
          jc->write_value_index = ++jc->job_index;
 
-      if (jc->tiler_dep && !inject)
+      if (jc->tiler_dep && !inject && !(PAN_ARCH >= 9 && jc->no_tiler_chain))
          global_dep = jc->tiler_dep;
       else if (PAN_ARCH <= 5)
          global_dep = jc->write_value_index;

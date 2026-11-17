@@ -21,6 +21,28 @@
 struct panvk_device;
 
 #define PANVK_FRAME_PROF_MAX_FRAMES 4096
+#define PANVK_FRAME_PROF_GROUPS 32
+#define PANVK_FRAME_PROF_JOB_TYPES 16
+
+/* What one render pass (JM batch) renders. Filled when the batch is closed,
+ * only while PANVK_FRAME_PROF_PASSES=1. Passes with the same key are added
+ * up in one group. */
+struct panvk_frame_prof_pass {
+   uint16_t width, height;  /* framebuffer, 0x0 for compute-only batches */
+   uint16_t tile_px;        /* pixels per tile */
+   uint8_t samples, rts, zs;
+   uint8_t loads;           /* attachments read back from memory first */
+   uint8_t stores;          /* attachments written out at the end */
+   uint8_t afbc;            /* stored colour targets that are AFBC */
+   uint8_t cont;            /* continues a render pass split into batches */
+};
+
+struct panvk_frame_prof_group {
+   struct panvk_frame_prof_pass key;
+   uint32_t count;
+   uint32_t jobs[PANVK_FRAME_PROF_JOB_TYPES];
+   uint64_t vtc_ns, frag_ns;
+};
 
 struct panvk_frame_prof {
    bool enabled;
@@ -39,7 +61,21 @@ struct panvk_frame_prof {
    /* PANVK_KBASE_SYNC_SUBMIT=1 only (one chain at a time, each waited
     * for): wall time of the vertex/tiler/compute and fragment chains. */
    uint64_t vtc_ns, frag_ns;
+
+   /* PANVK_FRAME_PROF_PASSES=1: per-pass groups and job counts by type.
+    * Times per group need PANVK_KBASE_SYNC_SUBMIT=1. Under mtx. */
+   bool passes;
+   struct panvk_frame_prof_group groups[PANVK_FRAME_PROF_GROUPS];
+   unsigned ngroups, groups_dropped;
+   uint64_t jobs[PANVK_FRAME_PROF_JOB_TYPES];
 };
+
+/* One submitted batch: its key, job counts by job header type, and the wall
+ * time of its two chains (0 when not measured). */
+void panvk_frame_prof_pass(struct panvk_device *dev,
+                           const struct panvk_frame_prof_pass *pass,
+                           const uint32_t *jobs, uint64_t vtc_ns,
+                           uint64_t frag_ns);
 
 void panvk_frame_prof_init(struct panvk_device *dev);
 void panvk_frame_prof_finish(struct panvk_device *dev);

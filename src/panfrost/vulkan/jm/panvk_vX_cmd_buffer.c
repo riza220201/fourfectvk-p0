@@ -31,6 +31,7 @@
 #include "pan_props.h"
 #include "pan_samples.h"
 
+#include "drm-uapi/drm_fourcc.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 #include "pan_v9_trace.h"
@@ -216,6 +217,36 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       if (result != VK_SUCCESS)
          return;
 
+      if (dev->frame_prof.passes) {
+         const struct pan_fb_layout *l = &render->fb.layout;
+         const struct pan_fb_load *ld = fbd_info.load;
+         const struct pan_fb_store *st = fbd_info.store;
+         struct panvk_frame_prof_pass *pp = &batch->prof;
+
+         pp->width = MIN2(l->width_px, UINT16_MAX);
+         pp->height = MIN2(l->height_px, UINT16_MAX);
+         pp->tile_px = MIN2(l->tile_size_px, UINT16_MAX);
+         pp->samples = l->sample_count;
+         pp->rts = l->rt_count;
+         pp->zs = l->z_format != PIPE_FORMAT_NONE ||
+                  l->s_format != PIPE_FORMAT_NONE;
+         pp->cont = !render->fb.needs_load;
+         for (unsigned i = 0; i < l->rt_count && i < PAN_MAX_RTS; i++) {
+            pp->loads += ld->rts[i].in_bounds_load == PAN_FB_LOAD_IMAGE;
+            if (st->rts[i].store) {
+               pp->stores++;
+               const struct pan_image *img =
+                  st->rts[i].iview
+                     ? pan_image_view_get_plane(st->rts[i].iview, 0).image
+                     : NULL;
+               pp->afbc += img && drm_is_afbc(img->props.modifier);
+            }
+         }
+         pp->loads += (ld->z.in_bounds_load == PAN_FB_LOAD_IMAGE) +
+                      (ld->s.in_bounds_load == PAN_FB_LOAD_IMAGE);
+         pp->stores += st->zs.store + st->s.store;
+      }
+
       uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
       assert(view_mask == 0 || util_bitcount(view_mask) <= batch->fb.layer_count);
       uint32_t enabled_layer_count = view_mask ?
@@ -361,6 +392,19 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {
       cfg.hierarchy_mask = panvk_select_tiler_hierarchy_mask(
          phys_dev, &cmdbuf->state.gfx, pan_kmod_bo_size(dev->tiler_heap->bo));
+
+      /* PANVK_TILER_HMASK=<mask>: replace the hierarchy mask (bit n = bins
+       * of 16 << n pixels). G57 reports 8 levels, so we enable all of them
+       * (0xff); the system driver uses 0xaa (32/128/512/2048) in Tomb
+       * Raider. Off by default (A/B knob). The top bit is always kept so
+       * one level still covers the whole framebuffer. */
+      static int hmask_override = -1;
+      if (hmask_override < 0) {
+         const char *v = pan_env_flag("PANVK_TILER_HMASK");
+         hmask_override = v ? (int)(strtoul(v, NULL, 0) & 0xff) : 0;
+      }
+      if (hmask_override)
+         cfg.hierarchy_mask = hmask_override | 0x80;
       cfg.fb_width = fb->width_px;
       cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
@@ -428,6 +472,13 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
    assert(cmdbuf->cur_batch);
+#if PAN_ARCH >= 9
+   /* See pan_jc::no_tiler_chain. */
+   static int no_tiler_chain = -1;
+   if (no_tiler_chain < 0)
+      no_tiler_chain = pan_env_flag("PANVK_V9_NO_TILER_CHAIN") != NULL;
+   cmdbuf->cur_batch->vtc_jc.no_tiler_chain = no_tiler_chain;
+#endif
    return cmdbuf->cur_batch;
 }
 

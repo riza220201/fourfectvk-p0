@@ -9,6 +9,7 @@
 #include "panfrost/compiler/pan_compiler.h"
 #include "util/u_hexdump.h"
 #include "util/u_qsort.h"
+#include "util/simple_mtx.h"
 
 #include "bifrost/bi_debug.h"
 #include "bifrost/disassemble.h"
@@ -4362,6 +4363,43 @@ bi_compile_variant_nir(nir_shader *nir,
          ralloc_free(nir_shader_gather_debug_info(nir, "", 1));
 
       nir_print_shader(nir, stderr);
+   }
+
+   /* PAN_NIR_DUMP_UBO=<file>: debug aid, off by default. Appends the final
+    * NIR of the first 24 shaders that have at least 16 load_ubo with a
+    * non-constant offset (to study UBO load vectorisation in games). */
+   const char *ubo_dump = pan_env_flag("PAN_NIR_DUMP_UBO");
+   if (ubo_dump) {
+      static simple_mtx_t dump_lock = SIMPLE_MTX_INITIALIZER;
+      static unsigned dumped;
+      unsigned n_ind = 0;
+
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_ubo &&
+                   !nir_src_is_const(intr->src[1]))
+                  n_ind++;
+            }
+         }
+      }
+
+      if (n_ind >= 16) {
+         simple_mtx_lock(&dump_lock);
+         if (dumped < 24) {
+            FILE *f = fopen(ubo_dump, "a");
+            if (f) {
+               fprintf(f, "### indirect load_ubo: %u\n", n_ind);
+               nir_print_shader(nir, f);
+               fclose(f);
+               dumped++;
+            }
+         }
+         simple_mtx_unlock(&dump_lock);
+      }
    }
 
    ctx->allocated_vec = _mesa_hash_table_u64_create(ctx);

@@ -62,6 +62,8 @@ struct panvk_batch {
    bool issued;
    /* kbase submission that last ran this batch: a re-issue waits for it. */
    uint64_t kbase_seqno;
+   /* PANVK_FRAME_PROF_PASSES: what this batch renders (set at close). */
+   struct panvk_frame_prof_pass prof;
 };
 
 enum panvk_cmd_event_op_type {

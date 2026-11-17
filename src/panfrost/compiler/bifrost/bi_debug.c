@@ -38,6 +38,14 @@ DEBUG_GET_ONCE_FLAGS_OPTION(bifrost_debug, "BIFROST_MESA_DEBUG",
 
 unsigned bifrost_debug = 0;
 
+DEBUG_GET_ONCE_BOOL_OPTION(bifrost_late_vectorize, "PAN_LATE_VECTORIZE", false)
+
+bool
+bifrost_late_vectorize(void)
+{
+   return debug_get_option_bifrost_late_vectorize();
+}
+
 void
 bifrost_init_debug_options() {
    bifrost_debug = debug_get_option_bifrost_debug();

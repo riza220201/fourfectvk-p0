@@ -311,12 +311,45 @@ bi_optimize_loop(nir_shader *nir, uint64_t gpu_id, bool allow_copies)
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
 }
 
+static nir_mem_access_size_align
+mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
+                         uint8_t bit_size, uint32_t align_mul,
+                         uint32_t align_offset, bool offset_is_const,
+                         enum gl_access_qualifier access, const void *cb_data);
+
 static void
 bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
-                const struct pan_shader_info *info)
+                const struct pan_shader_info *info,
+                nir_variable_mode robust_modes)
 {
    NIR_PASS(_, nir, nir_opt_shrink_stores, false /* shrink_image_store */);
    bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+
+   /* PAN_LATE_VECTORIZE: the only vectoriser run is in postprocess, before
+    * the offsets are CSE'd, so scalar UBO loads with the same indexed base
+    * (e.g. per-instance matrices, imul(instance_id, 192) + 4*k) stay scalar:
+    * one LD_PKA.i32 plus one IADD_IMM per word. Run it again for UBOs only
+    * (read-only, no aliasing), with the same robustness and size rules, then
+    * re-split anything the hardware can't load. */
+   if (bifrost_late_vectorize()) {
+      bool vec_progress = false;
+      nir_load_store_vectorize_options vec_opts = {
+         .modes = nir_var_mem_ubo,
+         .callback = mem_vectorize_cb,
+         .cb_data = (void *)&gpu_id,
+         .robust_modes = robust_modes,
+      };
+      NIR_PASS(vec_progress, nir, nir_opt_load_store_vectorize, &vec_opts);
+      if (vec_progress) {
+         nir_lower_mem_access_bit_sizes_options size_opts = {
+            .modes = nir_var_mem_ubo,
+            .callback = mem_access_size_align_cb,
+            .cb_data = (void *)&gpu_id,
+         };
+         NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &size_opts);
+         bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+      }
+   }
 
    NIR_PASS(_, nir, nir_opt_shrink_vectors, false);
 
@@ -1617,7 +1650,7 @@ bifrost_compile_shader_nir(nir_shader *nir,
       bifrost_handle_unified_idvs_shader(nir);
    }
 
-   bi_optimize_late(nir, inputs->gpu_id, info);
+   bi_optimize_late(nir, inputs->gpu_id, info, inputs->robust_modes);
 
    /* Lower constants to scalar but then immediately fold so we get minimum-
     * width vectors instead of scalars

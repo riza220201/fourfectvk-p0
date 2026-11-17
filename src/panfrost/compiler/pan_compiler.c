@@ -105,7 +105,10 @@ pan_get_compiler_flags(unsigned arch)
       assert(use_kraid <= (1ull << 4));
       assert(kraid_flags <= (1ull << 10));
 
-      return bi_flags | (use_kraid << 18) | (kraid_flags << 22);
+      /* PAN_LATE_VECTORIZE changes the code too. Bit 29 is only shared with
+       * the Kraid flag bits, which this build (no Rust) never sets. */
+      return bi_flags | (use_kraid << 18) | (kraid_flags << 22) |
+             (bifrost_late_vectorize() ? (1u << 29) : 0);
    } else {
       return midgard_get_compiler_flags();
    }

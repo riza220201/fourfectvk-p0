@@ -1393,6 +1393,21 @@ panvk_kbase_chain_has_batch(const struct panvk_kbase_chain *c,
    return false;
 }
 
+/* PANVK_FRAME_PROF_PASSES: job counts by header type, plus the batch key. */
+static void
+panvk_kbase_prof_pass(struct panvk_device *dev, const struct panvk_batch *batch,
+                      uint64_t vtc_ns, uint64_t frag_ns)
+{
+   uint32_t jobs[PANVK_FRAME_PROF_JOB_TYPES] = {0};
+
+   util_dynarray_foreach(&batch->jobs, void *, job) {
+      const uint8_t *j = *job;
+      unsigned type = (fa_rd32(j + 16) >> 1) & BITFIELD_MASK(7);
+      jobs[type < PANVK_FRAME_PROF_JOB_TYPES ? type : 0]++;
+   }
+   panvk_frame_prof_pass(dev, &batch->prof, jobs, vtc_ns, frag_ns);
+}
+
 static void
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
@@ -1508,17 +1523,22 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
             .cmdbuf = cmdbuf, .batch = batch, .batch_idx = batch_idx};
       chain->batches[chain->nr_batches++] = batch;
       batch->issued = true;
+      if (dev->frame_prof.passes)
+         panvk_kbase_prof_pass(dev, batch, 0, 0);
       return;
    }
 
+   uint64_t prof_vtc_ns = 0, prof_frag_ns = 0;
    /* SKIP: dump sebelum submit dipastikan SIGSEGV karena ALLOC_ON_FAULT (commit_pages=0), nggak informatif */
    if (batch->vtc_jc.first_job) {
       const uint64_t pt0 = dev->frame_prof.enabled ? os_time_get_nano() : 0;
       result = panvk_kbase_submit_one(k, batch->vtc_jc.first_job, 0x16,
                                       cmdbuf, batch, batch_idx,
                                       &batch->kbase_seqno); /* PATCH eksperimen: dulu 0x16 (CS|T|V) */
-      if (pt0)
-         p_atomic_add(&dev->frame_prof.vtc_ns, os_time_get_nano() - pt0);
+      if (pt0) {
+         prof_vtc_ns = os_time_get_nano() - pt0;
+         p_atomic_add(&dev->frame_prof.vtc_ns, prof_vtc_ns);
+      }
       ret = result == VK_SUCCESS ? 0 : -1;
       if (ret)
          mesa_loge("panvk: v9 vtc_jc job chain failed: %d "
@@ -1549,8 +1569,10 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       result = panvk_kbase_submit_one(k, batch->frag_jc.first_job, 0x01,
                                       cmdbuf, batch, batch_idx,
                                       &batch->kbase_seqno);
-      if (pt0)
-         p_atomic_add(&dev->frame_prof.frag_ns, os_time_get_nano() - pt0);
+      if (pt0) {
+         prof_frag_ns = os_time_get_nano() - pt0;
+         p_atomic_add(&dev->frame_prof.frag_ns, prof_frag_ns);
+      }
       ret = result == VK_SUCCESS ? 0 : -1;
       if (ret)
          mesa_loge("panvk: v9 frag_jc job chain failed: %d "
@@ -1579,6 +1601,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    if (PANVK_DEBUG(TRACE))
       pandecode_next_frame(dev->debug.decode_ctx);
+
+   if (dev->frame_prof.passes)
+      panvk_kbase_prof_pass(dev, batch, prof_vtc_ns, prof_frag_ns);
 
    batch->issued = true;
 }
