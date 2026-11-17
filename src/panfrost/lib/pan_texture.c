@@ -476,7 +476,10 @@ emit_astc_plane(const struct pan_image_view *iview, int plane_idx,
     * Non-sRGB formats decode to RGBA16F which is wide except if decode
     * precision is set to GL_RGBA8 for that texture.
     */
-   bool wide = !srgb && !iview->astc.narrow;
+   /* Narrow (RGBA8) ASTC decode returns wrong texels on v9 (Mali-G57, see
+    * pan_sampled_texture_emit()), so decode wide there: the values are a
+    * superset in precision, at some extra texture bandwidth. */
+   bool wide = !srgb && !(iview->astc.narrow && PAN_ARCH != 9);
 
    assert(desc->layout == UTIL_FORMAT_LAYOUT_ASTC && desc->block.depth == 1);
    assert(props->modifier == DRM_FORMAT_MOD_LINEAR ||
@@ -1281,8 +1284,14 @@ GENX(pan_sampled_texture_emit)(const struct pan_image_view *iview,
    const struct pan_image_props *props = &first_plane.image->props;
    uint32_t mali_format = GENX(pan_format_from_pipe_format)(iview->format)->hw;
 
-   if (desc->layout == UTIL_FORMAT_LAYOUT_ASTC && iview->astc.narrow &&
-       desc->colorspace != UTIL_FORMAT_COLORSPACE_SRGB) {
+   /* On v9 (measured on a Mali-G57, kbase r54p1) no narrow encoding samples
+    * correctly: RGBA8_UNORM with decode_wide=0 (the v10 scheme below), the
+    * ASTC format with decode_wide=0, RGBA8_UNORM with decode_wide=1, and the
+    * v9 ASTC_2D_NARROW format with either decode_wide all return garbage for
+    * UNORM ASTC, while the ASTC format with decode_wide=1 is exact. v9 does
+    * not advertise ASTC decode modes and decodes wide (emit_astc_plane()). */
+   if (PAN_ARCH != 9 && desc->layout == UTIL_FORMAT_LAYOUT_ASTC &&
+       iview->astc.narrow && desc->colorspace != UTIL_FORMAT_COLORSPACE_SRGB) {
 #if PAN_ARCH == 7
       /* Bifrost (v7) has no ASTC plane descriptor with a decode-width field.
        * Narrow (8-bit) decode is instead selected through the texture

@@ -954,7 +954,9 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->context_priority_mask = from_kmod_group_allow_priority_flags(
       dev->kmod.dev->props.allowed_group_priorities_mask);
 
-   caps->astc_decode_mode = dev->arch >= 7 && (dev->compressed_formats & (1 << 30));
+   /* Narrow ASTC decode does not sample correctly on v9; see pan_texture.c. */
+   caps->astc_decode_mode = dev->arch >= 7 && dev->arch != 9 &&
+                            (dev->compressed_formats & (1 << 30));
 
    caps->min_line_width =
    caps->min_line_width_aa =

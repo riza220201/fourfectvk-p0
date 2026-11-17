@@ -234,7 +234,8 @@ panvk_per_arch(get_physical_device_extensions)(
 #endif
       .EXT_texel_buffer_alignment = true,
       .EXT_transform_feedback = PAN_ARCH >= 9, /* PATCH v9: JM XFB */
-      .EXT_astc_decode_mode = PAN_ARCH >= 7,
+      /* Narrow ASTC decode does not sample correctly on v9 (pan_texture.c). */
+      .EXT_astc_decode_mode = PAN_ARCH >= 7 && PAN_ARCH != 9,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
       .EXT_vertex_attribute_divisor = true,
