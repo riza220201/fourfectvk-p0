@@ -274,6 +274,16 @@ struct panvk_cmd_graphics_state {
    uint64_t tsd;
 #endif
 
+#if PAN_ARCH == 9
+   struct {
+      bool desc_valid;
+      bool blend_valid;
+      uint32_t base_instance;
+      uint32_t bd_count;
+      struct pan_ptr blend;
+   } v9_reuse;
+#endif
+
    BITSET_DECLARE(dirty, PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT);
 };
 
