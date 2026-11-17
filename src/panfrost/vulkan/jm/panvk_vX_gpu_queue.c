@@ -2254,8 +2254,9 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* XXX: Panfrost kernel module doesn't support priorities so far */
-   assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
+   /* JM has no queue priorities: LOW is accepted and runs at MEDIUM
+    * (check_global_priority). */
+   assert(priority <= VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
 
    struct panvk_gpu_queue *queue = vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
                                          VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);

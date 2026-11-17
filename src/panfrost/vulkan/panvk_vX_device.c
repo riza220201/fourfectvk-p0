@@ -215,7 +215,8 @@ global_priority_to_group_allow_priority_flag(
 }
 
 static VkResult
-check_global_priority(const struct panvk_physical_device *phys_dev,
+check_global_priority(const struct panvk_device *dev,
+                      const struct panvk_physical_device *phys_dev,
                       const VkDeviceQueueCreateInfo *create_info)
 {
    const unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
@@ -242,6 +243,15 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
 
       if (requested_prio & allowed_prio_mask)
          return VK_SUCCESS;
+
+      /* A lower priority than we can schedule is a hint: run the queue at
+       * MEDIUM. Only with globalPriorityQuery enabled does the app promise
+       * to request an advertised priority, so reject it there. Higher
+       * priorities are a privilege we don't have. */
+      if (priority < VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR)
+         return dev->vk.enabled_features.globalPriorityQuery
+                   ? VK_ERROR_INITIALIZATION_FAILED
+                   : VK_SUCCESS;
 
       return VK_ERROR_NOT_PERMITTED_KHR;
    }
@@ -797,7 +807,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       const VkDeviceQueueCreateInfo *queue_create =
          &pCreateInfo->pQueueCreateInfos[i];
 
-      result = check_global_priority(physical_device, queue_create);
+      result = check_global_priority(device, physical_device, queue_create);
       if (result != VK_SUCCESS)
          goto err_finish_queues;
 
