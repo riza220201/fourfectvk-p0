@@ -3095,7 +3095,7 @@ panvk_debug_dump_malloc_vertex_job(const struct pan_ptr *job, const char *label)
    }
 }
 
-DEBUG_GET_ONCE_BOOL_OPTION(tiler_batch_budget, "PANVK_TILER_BATCH_BUDGET", false)
+DEBUG_GET_ONCE_BOOL_OPTION(tiler_batch_budget, "PANVK_TILER_BATCH_BUDGET", true)
 
 static VkResult
 panvk_limit_tiler_batch(struct panvk_cmd_buffer *cmdbuf,
