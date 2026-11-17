@@ -85,18 +85,15 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
    case VK_QUERY_TYPE_TIMESTAMP: {
       /* PATCH v9: one GPU system timestamp per query, written by
        * CmdWriteTimestamp2. */
-      if (panvk_v9_timestamps(&device->vk)) {
-         reports_per_query = 1;
-         break;
-      }
       static bool warned;
-      if (!warned) {
+      if (!panvk_v9_timestamps_advertised(&device->vk) && !warned) {
          warned = true;
-         mesa_logw("panvk: timestamp query pool created but timestamps are "
-                   "not supported (PANVK_V9_TIMESTAMP=1 or pan_v9_timestamps=true "
-                   "enables them)");
+         mesa_logi("panvk: timestamp query pool created while timestamps "
+                   "are not advertised (timestampValidBits = 0); queries "
+                   "are still written (PANVK_V9_TIMESTAMP=1 advertises them)");
       }
-      FALLTHROUGH;
+      reports_per_query = 1;
+      break;
    }
 #endif
    default:
