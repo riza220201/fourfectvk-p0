@@ -1009,7 +1009,8 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
          vk_device_set_lost(&k->dev->vk, "kbase out-fence failed: 0x%x",
                             ev->event_code);
       }
-      panvk_kbase_free_atoms(k, 1, &atom);
+      if (!k->lost)
+         panvk_kbase_free_atoms(k, 1, &atom);
       return;
    }
 
@@ -1028,6 +1029,9 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
       vk_device_set_lost(&k->dev->vk, "kbase atom %u failed: 0x%x", atom,
                          ev->event_code);
    }
+   if (k->lost)
+      return;
+
    if (atom == sub->last)
       sub->done = true;
 
