@@ -3092,7 +3092,11 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    if (batch->vtc_jc.job_index + cmdbuf->state.gfx.render.layer_count >=
        (unsigned)split_at) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
+      if (vk_command_buffer_has_error(&cmdbuf->vk))
+         return vk_command_buffer_get_record_result(&cmdbuf->vk);
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+      if (!batch || vk_command_buffer_has_error(&cmdbuf->vk))
+         return vk_command_buffer_get_record_result(&cmdbuf->vk);
    }
 
    /* PATCH v9: variableMultisampleRate. Without attachments the sample
@@ -3105,7 +3109,11 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
        cmdbuf->vk.dynamic_graphics_state.ms.rasterization_samples !=
           cmdbuf->state.gfx.render.fb.nr_samples) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
+      if (vk_command_buffer_has_error(&cmdbuf->vk))
+         return vk_command_buffer_get_record_result(&cmdbuf->vk);
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+      if (!batch || vk_command_buffer_has_error(&cmdbuf->vk))
+         return vk_command_buffer_get_record_result(&cmdbuf->vk);
       /* The tile size depends on the sample count: pick it again
        * (cmd_select_tile_size). */
       cmdbuf->state.gfx.render.fb.layout.sample_count = 0;
@@ -4806,6 +4814,9 @@ static void
 panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
                         struct panvk_draw_data *draw)
 {
+   if (vk_command_buffer_has_error(&cmdbuf->vk))
+      return;
+
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    struct panvk_batch *batch = cmdbuf->cur_batch;
@@ -5074,8 +5085,12 @@ static void
 panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
                   struct panvk_draw_data *draw)
 {
+   if (vk_command_buffer_has_error(&cmdbuf->vk))
+      return;
+
    panvk_per_arch(cmd_cond_render_begin)(cmdbuf);
-   panvk_cmd_draw_v9_impl(cmdbuf, draw);
+   if (!vk_command_buffer_has_error(&cmdbuf->vk))
+      panvk_cmd_draw_v9_impl(cmdbuf, draw);
    panvk_per_arch(cmd_cond_render_end)(cmdbuf);
 }
 
@@ -5287,6 +5302,9 @@ VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   if (vk_command_buffer_has_error(&cmdbuf->vk))
+      return;
 
    if (!(cmdbuf->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)) {
       const struct pan_fb_load *fb_load = &cmdbuf->state.gfx.render.fb.load;
