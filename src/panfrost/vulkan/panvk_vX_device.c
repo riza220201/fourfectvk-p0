@@ -628,8 +628,23 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    /* PATCH DEBUG v9 (SEMENTARA -- revert setelah investigasi tiler_heap
     * selesai): buang NO_MMAP biar CPU bisa baca isi tiler_heap langsung
     * buat diff sebelum/sesudah submit. */
+   /* Tiler heap VA size. Backing is committed in 2 MiB steps on GPU fault,
+    * so this caps the binning memory of one batch (one draw cannot be split)
+    * rather than reserving RAM. PANVK_JM_TILER_HEAP_MB overrides it
+    * (64..1024, rounded to 2 MiB). */
+   /* 256 MiB: the heaviest measured single draw (1.57M triangles) needs
+    * 150 MiB of binning memory; 128 MiB faulted. */
+   uint64_t tiler_heap_size = 256ull * 1024 * 1024;
+   {
+      const char *mb = os_get_option("PANVK_JM_TILER_HEAP_MB");
+      if (mb) {
+         uint64_t v = strtoull(mb, NULL, 10);
+         if (v >= 64 && v <= 1024)
+            tiler_heap_size = ALIGN_POT(v, 2) * 1024 * 1024;
+      }
+   }
    result = panvk_priv_bo_create(
-      device, 128 * 1024 * 1024,
+      device, tiler_heap_size,
       tiler_heap_flags,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
    if (result != VK_SUCCESS)

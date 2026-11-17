@@ -3152,7 +3152,8 @@ panvk_limit_tiler_batch(struct panvk_cmd_buffer *cmdbuf,
       return VK_SUCCESS;
 
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   const uint64_t budget = pan_kmod_bo_size(dev->tiler_heap->bo) / 8;
+   const uint64_t budget =
+      panvk_tiler_heap_plan_size(pan_kmod_bo_size(dev->tiler_heap->bo)) / 8;
    struct panvk_batch *batch = cmdbuf->cur_batch;
 
    if (cmdbuf->state.gfx.tess.tes || cmdbuf->state.gfx.gs.shader ||

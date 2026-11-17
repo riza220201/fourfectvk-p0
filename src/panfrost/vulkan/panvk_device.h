@@ -71,6 +71,17 @@ struct panvk_va_heap {
 /* Virtual size of the v9 null index buffer region: 16M 32-bit indices. */
 #define PANVK_V9_NULL_INDEX_BUFFER_SIZE (64ull * 1024 * 1024)
 
+/* Tiler heap size the batch budget and the tiler hierarchy are planned for.
+ * The heap VA may be larger: the extra space only absorbs a single draw that
+ * no batch split can shrink, so normal batches keep the same footprint. */
+#define PANVK_JM_TILER_HEAP_PLAN_SIZE (128ull * 1024 * 1024)
+static inline uint64_t
+panvk_tiler_heap_plan_size(uint64_t heap_size)
+{
+   return heap_size < PANVK_JM_TILER_HEAP_PLAN_SIZE ? heap_size
+                                                   : PANVK_JM_TILER_HEAP_PLAN_SIZE;
+}
+
 struct panvk_device {
    struct vk_device vk;
 
