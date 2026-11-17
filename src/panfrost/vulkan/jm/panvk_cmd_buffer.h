@@ -64,6 +64,7 @@ struct panvk_batch {
    uint64_t sync_epoch;
    uint8_t overlap_bank;
    bool issued;
+   bool has_timestamp;
    /* kbase submission that last ran this batch: a re-issue waits for it. */
    uint64_t kbase_seqno;
    /* PANVK_FRAME_PROF_PASSES: what this batch renders (set at close). */

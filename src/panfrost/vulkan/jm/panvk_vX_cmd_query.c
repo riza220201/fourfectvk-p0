@@ -142,27 +142,33 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
       if (split_batch < 0)
          split_batch = pan_env_flag("PANVK_V9_TIMESTAMP_SPLIT_BATCH") != NULL;
 
-      /* PATCH v9: close the current batch only when it has fragment/tiler work
-       * (whose fragment job runs at batch close). When cur_batch only has
-       * vtc_jc work, the WRITE_VALUE job's barrier bit orders it after prior
-       * vtc_jc jobs without splitting the batch.
-       * PANVK_V9_TIMESTAMP_SPLIT_BATCH=1 restores unconditional split. */
+      const uint32_t count =
+         MAX2(util_bitcount(cmd->state.gfx.render.view_mask), 1);
+      assert(query <= pool->vk.query_count &&
+             count <= pool->vk.query_count - query);
+
       bool end_sync =
          cmd->cur_batch != NULL &&
          (split_batch || cmd->cur_batch->fb.desc.gpu ||
-          cmd->cur_batch->vtc_jc.first_tiler);
+          cmd->cur_batch->vtc_jc.first_tiler ||
+          cmd->cur_batch->vtc_jc.job_index >= UINT16_MAX - 2 * count - 2);
 
       if (end_sync)
          panvk_per_arch(cmd_close_batch)(cmd);
 
       bool had_batch;
       struct panvk_batch *batch = open_batch(cmd, &had_batch);
+      if (!batch)
+         return;
       had_batch |= end_sync;
+      batch->has_timestamp = true;
 
-      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
-                           panvk_query_report_dev_addr(pool, query), 0);
-      panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
-                           panvk_query_available_dev_addr(pool, query), 1);
+      for (uint32_t q = query; q < query + count; q++) {
+         panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
+                              panvk_query_report_dev_addr(pool, q), 0);
+         panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                              panvk_query_available_dev_addr(pool, q), 1);
+      }
 
       close_batch(cmd, had_batch);
       return;

@@ -5175,6 +5175,7 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
       panvk_per_arch(cmd_close_batch)(cmdbuf);
       cmdbuf->cur_batch = NULL;
       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
+      cmdbuf->state.gfx.render.view_mask = 0;
    }
 }
 

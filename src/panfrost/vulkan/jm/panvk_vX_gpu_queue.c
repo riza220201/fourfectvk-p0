@@ -344,6 +344,7 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
 #define BASE_JD_DEP_TYPE_DATA (1U << 0)
 #define BASE_JD_DEP_TYPE_ORDER (1U << 1)
 #define BASE_JD_REQ_DEP 0U
+#define BASE_JD_REQ_PERMON (1U << 7)
 #define BASE_JD_REQ_SOFT_JOB (1U << 9)
 #define BASE_JD_REQ_SOFT_FENCE_TRIGGER (BASE_JD_REQ_SOFT_JOB | 0x2)
 #define BASE_JD_REQ_SOFT_FENCE_WAIT (BASE_JD_REQ_SOFT_JOB | 0x3)
@@ -1174,6 +1175,8 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
     * one before 8.15, too). */
    for (unsigned i = 0; i < n; i++, a++) {
       uint32_t core_req = jobs[i].core_req;
+      if (core_req == 0x16 && jobs[i].batch && jobs[i].batch->has_timestamp)
+         core_req |= BASE_JD_REQ_PERMON;
       k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){
          .cmdbuf = jobs[i].cmdbuf, .batch = jobs[i].batch,
          .core_req = jobs[i].core_req, .batch_idx = jobs[i].batch_idx};
