@@ -209,6 +209,19 @@ if with_platform_android
   libpanvk_files += files('panvk_android.c')
 endif
 
+# The Android package is loaded both as a HAL (HMI) and directly as an ICD by
+# loader-less harnesses, so on Android export both sets and nothing else.
+panvk_icd_link_args = vulkan_icd_link_args
+panvk_icd_link_depends = vulkan_icd_link_depends
+panvk_icd_symbols = vulkan_icd_symbols
+if with_platform_android
+  panvk_icd_symbols = files('panvk-android-symbols.txt')
+  if with_ld_version_script
+    panvk_icd_link_args = ['-Wl,--version-script', join_paths(meson.current_source_dir(), 'panvk-android.sym')]
+    panvk_icd_link_depends = files('panvk-android.sym')
+  endif
+endif
+
 libvulkan_panfrost = shared_library(
   'vulkan_panfrost',
   [libpanvk_files, panvk_entrypoints, panvk_tracepoints, panvk_drirc],
@@ -242,8 +255,8 @@ libvulkan_panfrost = shared_library(
     idep_mesautil,
   ],
   c_args : [no_override_init_args, panvk_flags, soong_compat_c_args],
-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
-  link_depends: vulkan_icd_link_depends,
+  link_args : [panvk_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
+  link_depends: panvk_icd_link_depends,
   gnu_symbol_visibility : 'hidden',
   install : true,
 )
@@ -255,7 +268,7 @@ if with_symbols_check
     symbols_check,
     args : [
       '--lib', libvulkan_panfrost,
-      '--symbols-file', vulkan_icd_symbols,
+      '--symbols-file', panvk_icd_symbols,
       symbols_check_args,
     ],
     suite : ['panfrost'],

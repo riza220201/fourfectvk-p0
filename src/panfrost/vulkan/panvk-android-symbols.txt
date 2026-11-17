@@ -1,0 +1,6 @@
+# Exports of the PanVK Android package: the HAL module, plus the ICD entry
+# points that loader-less harnesses resolve with dlsym.
+HMI
+vk_icdGetInstanceProcAddr
+vk_icdNegotiateLoaderICDInterfaceVersion
+(optional) vk_icdGetPhysicalDeviceProcAddr
