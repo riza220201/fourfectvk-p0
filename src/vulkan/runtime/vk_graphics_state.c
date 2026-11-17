@@ -1611,6 +1611,10 @@ vk_graphics_pipeline_state_fill(const struct vk_device *device,
 
    enum mesa_vk_graphics_state_groups needs = 0;
    if (lib & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) {
+      struct vk_pipeline_robustness_state robustness;
+      vk_pipeline_robustness_state_fill(&device->robustness_state, &robustness,
+                                        info->pNext, NULL);
+      state->vertex_input_robustness = robustness.vertex_inputs;
       needs |= MESA_VK_GRAPHICS_STATE_VERTEX_INPUT_BIT;
       needs |= MESA_VK_GRAPHICS_STATE_INPUT_ASSEMBLY_BIT;
    }
@@ -1922,6 +1926,9 @@ vk_graphics_pipeline_state_merge(struct vk_graphics_pipeline_state *dst,
    dst->shader_stages |= src->shader_stages;
 
    dst->pipeline_flags |= src->pipeline_flags;
+   if (dst->vertex_input_robustness ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+      dst->vertex_input_robustness = src->vertex_input_robustness;
    dst->feedback_loop_not_input_only |= src->feedback_loop_not_input_only;
    dst->rasterization_order_access |= src->rasterization_order_access;
 
@@ -2017,6 +2024,7 @@ vk_graphics_pipeline_state_copy(const struct vk_device *device,
 #undef COPY_STATE_IF_NEEDED
 
    state->pipeline_flags = old_state->pipeline_flags;
+   state->vertex_input_robustness = old_state->vertex_input_robustness;
    state->feedback_loop_not_input_only =
       old_state->feedback_loop_not_input_only;
    state->rasterization_order_access = old_state->rasterization_order_access;

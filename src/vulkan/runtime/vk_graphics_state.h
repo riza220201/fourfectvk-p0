@@ -1023,6 +1023,8 @@ struct vk_graphics_pipeline_state {
     */
    VkPipelineCreateFlags2KHR pipeline_flags;
 
+   VkPipelineRobustnessBufferBehaviorEXT vertex_input_robustness;
+
    /* True if there are feedback loops that do not involve input attachments
     * managed by the driver. This is set to true by the runtime if there
     * are loops indicated by a pipeline flag (which may involve any image
