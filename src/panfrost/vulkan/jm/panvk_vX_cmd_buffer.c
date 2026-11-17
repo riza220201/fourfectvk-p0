@@ -14,6 +14,9 @@
 #include "panvk_buffer.h"
 #include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
+#if PAN_ARCH == 9
+#include "libpan_copy.h"
+#endif
 #include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_draw.h"
 #include "panvk_cmd_frame_shaders.h"
@@ -101,6 +104,32 @@ tls_per_batch(void)
    return v;
 }
 
+#if PAN_ARCH == 9
+/* PANVK_UBO_PUSH: hand the entries recorded for this batch to its
+ * panlib_ubo_gather job (see panvk_vX_cmd_push_constant.c). */
+static void
+panvk_ubo_gather_close(struct panvk_cmd_buffer *cmdbuf,
+                       struct panvk_batch *batch)
+{
+   struct panlib_ubo_gather *hdr = batch->ubo_gather.hdr;
+   const unsigned n = util_dynarray_num_elements(&batch->ubo_gather.words,
+                                                 struct panlib_ubo_word);
+
+   if (hdr && n) {
+      struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, n * sizeof(struct panlib_ubo_word), 16);
+
+      if (mem.gpu) {
+         memcpy(mem.cpu, batch->ubo_gather.words.data,
+                n * sizeof(struct panlib_ubo_word));
+         hdr->words = mem.gpu;
+         hdr->count = n;
+      }
+   }
+   util_dynarray_fini(&batch->ubo_gather.words);
+}
+#endif
+
 void
 panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -110,6 +139,10 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       return;
 
    assert(batch);
+
+#if PAN_ARCH == 9
+   panvk_ubo_gather_close(cmdbuf, batch);
+#endif
 
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
@@ -472,6 +505,9 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
    assert(cmdbuf->cur_batch);
+#if PAN_ARCH == 9
+   cmdbuf->cur_batch->ubo_gather.words = UTIL_DYNARRAY_INIT;
+#endif
 #if PAN_ARCH >= 9
    /* See pan_jc::no_tiler_chain. */
    static int no_tiler_chain = -1;
@@ -525,6 +561,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
       util_dynarray_fini(&batch->event_ops);
+#if PAN_ARCH == 9
+      util_dynarray_fini(&batch->ubo_gather.words);
+#endif
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
    }
@@ -548,6 +587,9 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
       util_dynarray_fini(&batch->event_ops);
+#if PAN_ARCH == 9
+      util_dynarray_fini(&batch->ubo_gather.words);
+#endif
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
    }

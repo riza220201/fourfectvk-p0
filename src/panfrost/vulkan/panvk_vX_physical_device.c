@@ -383,8 +383,8 @@ panvk_per_arch(get_physical_device_features)(
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       /* PATCH v9: emulated in the fragment shader (panvk_v9_lower_fs_clip_cull). */
-      .shaderClipDistance = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_CLIP_CULL"),
-      .shaderCullDistance = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_CLIP_CULL"),
+      .shaderClipDistance = PAN_ARCH == 9 && !panvk_clip_cull_disabled(instance),
+      .shaderCullDistance = PAN_ARCH == 9 && !panvk_clip_cull_disabled(instance),
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,

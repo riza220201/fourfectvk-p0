@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "compiler/libcl/libcl.h"
+#include "genxml/gen_macros.h"
 #include "libpan_copy.h"
 
 #if PAN_ARCH >= 6
@@ -83,6 +84,42 @@ panlib_copy_mem_indirect(global const uint32_t *cmd)
    uint64_t size = upsample(cmd[5], cmd[4]);
 
    panlib_copy_mem_body(dst, src, size);
+}
+#endif
+
+#if PAN_ARCH == 9
+/* PANVK_UBO_PUSH: each thread strides over the entries of the batch. A
+ * descriptor entry reads the BUFFER descriptor now, so descriptor updates
+ * made before the submit are seen; out-of-range and null reads give 0. */
+KERNEL(PANLIB_UBO_GATHER_WG_SIZE)
+panlib_ubo_gather(constant struct panlib_ubo_gather *g)
+{
+   const uint32_t n = g->count;
+   global const struct panlib_ubo_word *w =
+      (global const struct panlib_ubo_word *)g->words;
+   const uint32_t nthreads = cl_num_groups.x * PANLIB_UBO_GATHER_WG_SIZE;
+
+   for (uint32_t i = cl_global_id.x; i < n; i += nthreads) {
+      uint64_t src = w[i].src;
+      uint32_t value = 0;
+
+      if (src && (w[i].flags & PANLIB_UBO_WORD_FROM_DESC)) {
+         global const uint32_t *d = (global const uint32_t *)src;
+         const uint32_t type = d[0] & 0xf;
+         const uint32_t size = d[1];
+         const uint64_t addr = upsample(d[3], d[2]);
+
+         src = (type == MALI_DESCRIPTOR_TYPE_BUFFER && addr &&
+                (uint64_t)w[i].offset + 4 <= size)
+                  ? addr + w[i].offset
+                  : 0;
+      }
+
+      if (src)
+         value = *(global const uint32_t *)src;
+
+      *(global uint32_t *)w[i].dst = value;
+   }
 }
 #endif
 #endif

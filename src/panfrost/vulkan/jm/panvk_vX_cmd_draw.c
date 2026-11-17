@@ -4824,7 +4824,8 @@ panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
    if (chain_reverse) {
       const unsigned predicted_helper_index = batch->vtc_jc.job_index + 2;
 
-      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_NOT_STARTED, false, false, 0,
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_NOT_STARTED,
+                     batch->ubo_gather.hdr != NULL, false, 0,
                      predicted_helper_index, &draw->jobs.idvs, false);
 
       struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
@@ -4912,10 +4913,17 @@ panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
    const bool track_parked = is_indirect && !indirect_untracked;
    const unsigned prev_tiler_dep = batch->vtc_jc.tiler_dep;
 
+   /* PANVK_UBO_PUSH: the draw reads FAU words that the batch's gather job
+    * writes. Dependency 1 is free on direct draws; otherwise use a barrier. */
+   const unsigned ubo_dep = batch->ubo_gather.hdr ? batch->ubo_gather.job_index
+                                                  : 0;
+   const unsigned local_dep = track_parked ? prev_tiler_dep : ubo_dep;
+   const bool ubo_barrier = ubo_dep && local_dep != ubo_dep;
+
    pan_jc_add_job(&batch->vtc_jc,
                   is_indirect ? MALI_JOB_TYPE_NOT_STARTED
                               : MALI_JOB_TYPE_MALLOC_VERTEX,
-                  false, false, track_parked ? prev_tiler_dep : 0,
+                  ubo_barrier, false, local_dep,
                   indirect_dep, &draw->jobs.idvs, false);
 
    if (track_parked) {

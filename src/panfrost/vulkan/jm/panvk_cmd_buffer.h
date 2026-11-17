@@ -64,6 +64,16 @@ struct panvk_batch {
    uint64_t kbase_seqno;
    /* PANVK_FRAME_PROF_PASSES: what this batch renders (set at close). */
    struct panvk_frame_prof_pass prof;
+#if PAN_ARCH == 9
+   /* PANVK_UBO_PUSH: the panlib_ubo_gather job of this batch (queued before
+    * the first draw that pushes UBO words) and its entries
+    * (struct panlib_ubo_word), uploaded when the batch is closed. */
+   struct {
+      struct util_dynarray words;
+      void *hdr;
+      unsigned job_index;
+   } ubo_gather;
+#endif
 };
 
 enum panvk_cmd_event_op_type {

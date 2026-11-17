@@ -36,6 +36,12 @@ def declare_options():
           "Enable fragmentStoresAndAtomics and vertexPipelineStoresAndAtomics on any "
           "architecture. (This may not work reliably and is for debug purposes only!)",
           c_name="force_enable_shader_atomics"),
+        B("pan_disable_clip_cull_distance", False,
+          "v9: don't report shaderClipDistance/shaderCullDistance, so the "
+          "fragment-shader emulation of clip and cull distances doesn't run. "
+          "Faster where the application writes clip distances; clipping "
+          "planes are then ignored (the Winlator wrapper drops the writes).",
+          c_name="disable_clip_cull_distance"),
     ]
 
     debug_options = []

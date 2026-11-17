@@ -1197,8 +1197,28 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    /* PATCH: EXEC_INIT dipindah SEBELUM JIT_INIT -- di device ini EXEC_INIT
     * gagal EPERM kalau ada operasi memori (termasuk JIT_INIT) yang jalan
     * duluan. */
-   struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 1024 };
+   /* The EXEC_VA zone holds all shader code. 1024 pages (4 MiB) ran out with
+    * DXVK 2.x and graphics pipeline libraries (Tomb Raider menu: hundreds of
+    * failed MEM_ALLOC calls, pipelines missing). It only reserves GPU virtual
+    * addresses, taken from the top of the SAME_VA zone; the kernel allows up
+    * to 4 GiB (KBASE_REG_ZONE_EXEC_VA_MAX_PAGES). Ask for 256 MiB, and fall
+    * back to the old size if the kernel refuses.
+    * PANVK_KBASE_EXEC_VA_MB=<n> overrides the size (A/B control). */
+   uint64_t exec_mb = 256;
+   const char *exec_env = getenv("PANVK_KBASE_EXEC_VA_MB");
+   if (exec_env && atoi(exec_env) > 0)
+      exec_mb = MIN2((uint64_t)atoi(exec_env), 4096);
+   struct kbase_ioctl_mem_exec_init exec_init = {
+      .va_pages = (exec_mb << 20) / 4096,
+   };
+   bool exec_retry = false;
    if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
+      mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT (%" PRIu64 " MiB) failed: "
+                "%s, retrying with 4 MiB", exec_mb, strerror(errno));
+      exec_init.va_pages = 1024;
+      exec_retry = true;
+   }
+   if (exec_retry && ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
       mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
                 "(executable BO allocation will not work)", strerror(errno));
    }
@@ -1906,7 +1926,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       if (pan_v9_trace_enabled())
          mesa_logi("kbase: MEM_ALLOC req: va_pages=%llu commit_pages=%llu extension=%llu flags=0x%llx kmod_flags=0x%x", (unsigned long long)va_pages, (unsigned long long)commit_pages, (unsigned long long)extension, (unsigned long long)alloc_flags, kmod_flags);
       if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
-         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s", strerror(errno));
+         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s (%llu pages, "
+                   "flags 0x%llx%s)", strerror(errno),
+                   (unsigned long long)va_pages,
+                   (unsigned long long)alloc_flags,
+                   (alloc_flags & BASE_MEM_PROT_GPU_EX) ? ", executable" : "");
          goto err_free_bo;
       }
 

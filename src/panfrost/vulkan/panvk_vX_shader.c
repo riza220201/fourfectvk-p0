@@ -937,6 +937,10 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    pan_preprocess_nir(nir, pdev->kmod.dev->props.gpu_id);
 }
 
+#if PAN_ARCH == 9
+static unsigned panvk_ubo_push_budget(void);
+#endif
+
 static void
 panvk_hash_state(struct vk_physical_device *device,
                  const struct vk_graphics_pipeline_state *state,
@@ -974,6 +978,19 @@ panvk_hash_state(struct vk_physical_device *device,
       const bool emu = panvk_v9_sampler_emulation_active(vkdev);
       _mesa_blake3_update(&blake3_ctx, &emu, sizeof(emu));
    }
+
+   /* PANVK_UBO_PUSH changes the compiled code. Hashed only when it is on,
+    * so the keys of the default configuration stay the same. */
+   const unsigned ubo_push = panvk_ubo_push_budget();
+   if (ubo_push)
+      _mesa_blake3_update(&blake3_ctx, &ubo_push, sizeof(ubo_push));
+
+   /* Clip/cull distances off changes the fragment shaders too. Hashed only
+    * when off, like above. */
+   const bool clip_cull_off =
+      panvk_clip_cull_disabled(to_panvk_instance(device->instance));
+   if (clip_cull_off)
+      _mesa_blake3_update(&blake3_ctx, &clip_cull_off, sizeof(clip_cull_off));
 #endif
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
@@ -1519,11 +1536,18 @@ panvk_v9_lower_cull_write(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool
+panvk_dev_clip_cull_off(const struct panvk_device *dev)
+{
+   return panvk_clip_cull_disabled(
+      to_panvk_instance(dev->vk.physical->instance));
+}
+
 static void
 panvk_v9_lower_cull_mask(nir_shader *nir, unsigned clip_size,
-                         unsigned cull_size)
+                         unsigned cull_size, bool clip_cull_off)
 {
-   if (!cull_size || pan_env_flag("PANVK_V9_NO_CLIP_CULL"))
+   if (!cull_size || clip_cull_off)
       return;
 
    struct panvk_v9_cull_ctx ctx = {
@@ -1560,12 +1584,14 @@ panvk_v9_lower_cull_mask(nir_shader *nir, unsigned clip_size,
  * separately compiled fragment shaders work too. When the vertex layout is
  * known (linked pipeline), only the slots it writes are read and nothing
  * is added if it has none. Runs on variables, before IO lowering. Returns
- * whether code was added. PANVK_V9_NO_CLIP_CULL=1 disables (control). */
+ * whether code was added. Off with panvk_clip_cull_disabled()
+ * (PANVK_V9_NO_CLIP_CULL=1 or driconf pan_disable_clip_cull_distance). */
 static bool
 panvk_v9_lower_fs_clip_cull(nir_shader *nir,
-                            const struct pan_varying_layout *vs_layout)
+                            const struct pan_varying_layout *vs_layout,
+                            bool clip_cull_off)
 {
-   if (pan_env_flag("PANVK_V9_NO_CLIP_CULL"))
+   if (clip_cull_off)
       return false;
 
    unsigned clip_slots = 2, cull_slots = 2;
@@ -2056,6 +2082,152 @@ panvk_lower_nir_io(nir_shader *nir)
    pan_nir_lower_mediump_io(nir);
 }
 
+#if PAN_ARCH == 9
+/* PANVK_UBO_PUSH=<words> (v9 experiment, off by default; 1 means 32 words):
+ * constant-offset 32-bit UBO loads read from the FAU instead of the UBO.
+ * The words are copied on the CPU when the draw is recorded
+ * (panvk_vX_cmd_push_constant.c), which is only right when the UBO contents
+ * are final at record time. This measures what pushing UBO data would gain;
+ * it is not a conformant implementation. */
+static unsigned
+panvk_ubo_push_budget(void)
+{
+   static int budget = -1;
+
+   if (budget < 0) {
+      const char *e = pan_env_flag("PANVK_UBO_PUSH");
+      int v = e ? atoi(e) : 0;
+
+      if (v == 1)
+         v = 32;
+      budget = CLAMP(v, 0, PANVK_MAX_UBO_PUSH_WORDS);
+   }
+   return budget;
+}
+
+struct push_ubo_ctx {
+   const struct panvk_shader_desc_info *desc_info;
+   struct panvk_shader_variant *shader;
+   unsigned budget;
+};
+
+static bool
+push_ubo_word_src(const struct push_ubo_ctx *ctx, uint32_t handle,
+                  uint32_t offset, struct panvk_ubo_push_word *w)
+{
+   const unsigned table = pan_res_handle_get_table(handle);
+   const unsigned idx = pan_res_handle_get_index(handle);
+
+   memset(w, 0, sizeof(*w));
+   if (table == 0) {
+      /* Driver set: only the dynamic buffers can be UBOs. */
+      const struct panvk_shader_desc_info *di = ctx->desc_info;
+
+      if (idx < di->dyn_bufs_start ||
+          idx - di->dyn_bufs_start >= di->dyn_bufs.count)
+         return false;
+
+      uint32_t src = di->dyn_bufs.map[idx - di->dyn_bufs_start];
+
+      w->dyn = 1;
+      w->set = COPY_DESC_HANDLE_EXTRACT_TABLE(src);
+      w->idx = COPY_DESC_HANDLE_EXTRACT_INDEX(src);
+   } else {
+      if (table - 1 >= MAX_SETS || idx > UINT16_MAX)
+         return false;
+
+      w->set = table - 1;
+      w->idx = idx;
+   }
+   w->offset = offset;
+   return true;
+}
+
+static bool
+push_ubo_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct push_ubo_ctx *ctx = data;
+   struct panvk_shader_fau_info *fau = &ctx->shader->fau;
+
+   if (intr->intrinsic != nir_intrinsic_load_ubo ||
+       !nir_src_is_const(intr->src[0]) || !nir_src_is_const(intr->src[1]) ||
+       intr->def.bit_size != 32 || intr->def.num_components > 4)
+      return false;
+
+   const uint32_t handle = nir_src_as_uint(intr->src[0]);
+   const uint32_t offset = nir_src_as_uint(intr->src[1]);
+   const unsigned n = intr->def.num_components;
+   struct panvk_ubo_push_word w[4];
+
+   if (offset % 4)
+      return false;
+
+   for (unsigned c = 0; c < n; c++) {
+      if (!push_ubo_word_src(ctx, handle, offset + 4 * c, &w[c]))
+         return false;
+   }
+
+   /* Reuse a run of words that is already pushed. */
+   int slot = -1;
+   for (unsigned s = 0; s + n <= fau->ubo_push_count && slot < 0; s++) {
+      if (!memcmp(&fau->ubo_push[s], w, n * sizeof(w[0])))
+         slot = s;
+   }
+
+   if (slot < 0) {
+      if (fau->ubo_push_count + n > ctx->budget)
+         return false;
+
+      slot = fau->ubo_push_count;
+      memcpy(&fau->ubo_push[slot], w, n * sizeof(w[0]));
+      fau->ubo_push_count += n;
+   }
+
+   /* Same form as move_push_constant() leaves: final byte offset, base and
+    * range zero. */
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *v = nir_load_push_constant(
+      b, n, 32,
+      nir_imm_int(b, fau->ubo_push_start * FAU_WORD_SIZE + slot * 4));
+   nir_def_replace(&intr->def, v);
+   return true;
+}
+
+/* Runs after lower_load_push_consts(): the pushed words go after the sysvals
+ * and the push constants. */
+static void
+panvk_v9_push_ubo(nir_shader *nir,
+                  const struct panvk_shader_desc_info *desc_info,
+                  struct panvk_shader_variant *shader)
+{
+   shader->fau.ubo_push_start = shader->fau.total_count;
+   shader->fau.ubo_push_count = 0;
+
+   unsigned budget = panvk_ubo_push_budget();
+   if (!budget || !desc_info ||
+       (nir->info.stage != MESA_SHADER_VERTEX &&
+        nir->info.stage != MESA_SHADER_FRAGMENT))
+      return;
+
+   budget = MIN2(budget, 2 * (FAU_WORD_COUNT - shader->fau.total_count));
+   if (!budget)
+      return;
+
+   struct push_ubo_ctx ctx = {
+      .desc_info = desc_info,
+      .shader = shader,
+      .budget = budget,
+   };
+
+   if (!nir_shader_intrinsics_pass(nir, push_ubo_instr,
+                                   nir_metadata_control_flow, &ctx))
+      return;
+
+   shader->fau.total_count += DIV_ROUND_UP(shader->fau.ubo_push_count, 2);
+   assert(shader->fau.total_count <= FAU_WORD_COUNT);
+}
+#endif
+
 static VkResult
 panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
                   VkShaderCreateFlagsEXT shader_flags,
@@ -2097,6 +2269,9 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
             nir_metadata_control_flow, &lower_sysvals_ctx);
 
    lower_load_push_consts(nir, shader);
+#if PAN_ARCH == 9
+   panvk_v9_push_ubo(nir, desc_info, shader);
+#endif
 
    /* Reserve sysvals/push-const, the compiler may fill the remaining space with
     * promoted constants. */
@@ -2698,7 +2873,8 @@ panvk_compile_shader(struct panvk_device *dev,
 #if PAN_ARCH == 9
          if (v == PANVK_VS_VARIANT_HW)
             panvk_v9_lower_cull_mask(nir, shader->clip_size,
-                                     shader->cull_size);
+                                     shader->cull_size,
+                                     panvk_dev_clip_cull_off(dev));
 #endif
 
          struct pan_varying_layout varying_layout;
@@ -2890,7 +3066,8 @@ panvk_compile_shader(struct panvk_device *dev,
       panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
                       info->robustness, state, &shader->desc_info, false);
 #if PAN_ARCH == 9
-      panvk_v9_lower_cull_mask(nir, shader->clip_size, shader->cull_size);
+      panvk_v9_lower_cull_mask(nir, shader->clip_size, shader->cull_size,
+                               panvk_dev_clip_cull_off(dev));
 #endif
 
       struct pan_varying_layout varying_layout;
@@ -3004,7 +3181,8 @@ panvk_compile_shader(struct panvk_device *dev,
                panvk_v9_fix_rast_output_bases(pnir);
 #if PAN_ARCH == 9
             panvk_v9_lower_cull_mask(pnir, shader->clip_size,
-                                     shader->cull_size);
+                                     shader->cull_size,
+                                     panvk_dev_clip_cull_off(dev));
 #endif
          }
 
@@ -3066,7 +3244,8 @@ panvk_compile_shader(struct panvk_device *dev,
 #if PAN_ARCH == 9
       const bool api_discard = nir->info.fs.uses_discard;
       variant->fs.clip_cull =
-         panvk_v9_lower_fs_clip_cull(nir, vs_varying_layout);
+         panvk_v9_lower_fs_clip_cull(nir, vs_varying_layout,
+                                     panvk_dev_clip_cull_off(dev));
 #endif
 
       /* Lower input intrinsics for fragment shaders early to get the max

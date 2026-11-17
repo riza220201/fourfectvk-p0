@@ -7,11 +7,77 @@
 #include "panvk_cmd_buffer.h"
 #include "panvk_entrypoints.h"
 
+#if PAN_ARCH == 9
+#include "libpan.h"
+#include "libpan_copy.h"
+#include "panvk_cmd_precomp.h"
+#include "panvk_descriptor_set.h"
+
+/* PANVK_UBO_PUSH: where the GPU finds one pushed word. Dynamic buffers are
+ * resolved now (their offsets are fixed when the draw is recorded); other
+ * UBOs through their descriptor in the set, read by the gather kernel when
+ * the batch runs. Unbound or out-of-range words give 0. */
+static void
+panvk_ubo_push_src(const struct panvk_descriptor_state *desc_state,
+                   const struct panvk_ubo_push_word *w,
+                   struct panlib_ubo_word *e)
+{
+   const struct panvk_descriptor_set *set =
+      w->set < MAX_SETS ? desc_state->sets[w->set] : NULL;
+
+   e->src = 0;
+   e->offset = w->offset;
+   e->flags = 0;
+
+   if (!set)
+      return;
+
+   if (w->dyn) {
+      if (w->idx >= MAX_DYNAMIC_BUFFERS || !set->dyn_bufs[w->idx].dev_addr ||
+          (uint64_t)w->offset + 4 > set->dyn_bufs[w->idx].size)
+         return;
+      e->src = set->dyn_bufs[w->idx].dev_addr +
+               desc_state->dyn_buf_offsets[w->set][w->idx] + w->offset;
+   } else if (w->idx < set->desc_count && set->descs.dev) {
+      e->src = set->descs.dev + (uint64_t)w->idx * PANVK_DESCRIPTOR_SIZE;
+      e->flags = PANLIB_UBO_WORD_FROM_DESC;
+   }
+}
+
+/* The batch's gather job, queued the first time a draw of the batch pushes
+ * UBO words. Its entry list is uploaded in cmd_close_batch(). Returns false
+ * on allocation failure. */
+static bool
+panvk_ubo_gather_job(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   if (!batch)
+      return false;
+   if (batch->ubo_gather.hdr)
+      return true;
+
+   struct pan_ptr hdr = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct panlib_ubo_gather), 16);
+   if (!hdr.gpu)
+      return false;
+   memset(hdr.cpu, 0, sizeof(struct panlib_ubo_gather));
+
+   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   panlib_ubo_gather(&ctx, panlib_1d(PANLIB_UBO_GATHER_WG_COUNT),
+                     PANLIB_BARRIER_NONE, hdr.gpu);
+   batch->ubo_gather.hdr = hdr.cpu;
+   batch->ubo_gather.job_index = batch->vtc_jc.job_index;
+   return true;
+}
+#endif
+
 static VkResult
 prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
                       const struct panvk_shader_variant *shader,
                       struct pan_ptr *push_uniforms, uint32_t repeat_count,
-                      uint64_t *sysvals)
+                      uint64_t *sysvals,
+                      const struct panvk_descriptor_state *desc_state)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
 
@@ -73,6 +139,33 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
             (repeat_faus[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
             ((uint64_t)fau->words[i].constant << (32 * hi));
       }
+
+#if PAN_ARCH == 9
+      if (shader->fau.ubo_push_count && desc_state) {
+         struct panvk_batch *batch = cmdbuf->cur_batch;
+         uint32_t *words =
+            (uint32_t *)&repeat_faus[shader->fau.ubo_push_start];
+         const uint64_t words_gpu =
+            common_inner.push_uniforms +
+            shader->fau.ubo_push_start * sizeof(uint64_t);
+
+         assert(shader->fau.ubo_push_start +
+                   DIV_ROUND_UP(shader->fau.ubo_push_count, 2) <=
+                shader->fau.total_count);
+
+         if (!panvk_ubo_gather_job(cmdbuf))
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+         for (uint32_t i = 0; i < shader->fau.ubo_push_count; i++) {
+            struct panlib_ubo_word e;
+
+            panvk_ubo_push_src(desc_state, &shader->fau.ubo_push[i], &e);
+            e.dst = words_gpu + i * sizeof(uint32_t);
+            words[i] = 0;
+            util_dynarray_append(&batch->ubo_gather.words, e);
+         }
+      }
+#endif
    }
 
    return VK_SUCCESS;
@@ -84,7 +177,8 @@ panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
    struct pan_ptr *push_uniforms, uint32_t repeat_count)
 {
    return prepare_push_uniforms(cmdbuf, shader, push_uniforms, repeat_count,
-                                (uint64_t *)&cmdbuf->state.gfx.sysvals);
+                                (uint64_t *)&cmdbuf->state.gfx.sysvals,
+                                &cmdbuf->state.gfx.desc_state);
 }
 
 VkResult
@@ -93,7 +187,8 @@ panvk_per_arch(cmd_prepare_compute_push_uniforms)(
    struct pan_ptr *push_uniforms)
 {
    return prepare_push_uniforms(cmdbuf, shader, push_uniforms, 1,
-                                (uint64_t *)&cmdbuf->state.compute.sysvals);
+                                (uint64_t *)&cmdbuf->state.compute.sysvals,
+                                &cmdbuf->state.compute.desc_state);
 }
 
 VKAPI_ATTR void VKAPI_CALL

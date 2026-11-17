@@ -10,6 +10,7 @@
 
 #include "vk_instance.h"
 #include "panvk_drirc.h"
+#include "panfrost/lib/pan_env.h"
 
 #include "lib/kmod/pan_kmod.h"
 
@@ -68,6 +69,17 @@ static inline struct panvk_instance *
 to_panvk_instance(struct vk_instance *instance)
 {
    return container_of(instance, struct panvk_instance, vk);
+}
+
+/* PATCH v9: clip/cull distances off (feature not reported, no emulation in
+ * the shaders): PANVK_V9_NO_CLIP_CULL=1, or the driconf option
+ * pan_disable_clip_cull_distance (on for some games, 00-panvk-defaults.conf;
+ * pan_disable_clip_cull_distance=false in the environment keeps them). */
+static inline bool
+panvk_clip_cull_disabled(const struct panvk_instance *instance)
+{
+   return pan_env_flag("PANVK_V9_NO_CLIP_CULL") != NULL ||
+          (instance && instance->drirc.misc.disable_clip_cull_distance);
 }
 
 #endif

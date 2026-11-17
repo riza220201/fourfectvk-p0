@@ -390,11 +390,30 @@ enum panvk_bifrost_desc_table_type {
 #define MAX_SYSVAL_FAUS     MAX2(MAX_COMPUTE_SYSVAL_FAUS, MAX_GFX_SYSVAL_FAUS)
 #define MAX_PUSH_CONST_FAUS (MAX_PUSH_CONSTANTS_SIZE / FAU_WORD_SIZE)
 
+/* PANVK_UBO_PUSH (v9, experiment, off by default): one 32-bit UBO word
+ * that the shader reads from the FAU instead of the UBO. */
+struct panvk_ubo_push_word {
+   /* 1: dynamic buffer `idx` of set `set`; 0: descriptor `idx` of set
+    * `set` (a BUFFER descriptor). */
+   uint8_t dyn;
+   uint8_t set;
+   uint16_t idx;
+   /* Byte offset in the buffer. */
+   uint32_t offset;
+};
+
+#define PANVK_MAX_UBO_PUSH_WORDS 64
+
 struct panvk_shader_fau_info {
    BITSET_DECLARE(used_sysvals, MAX_SYSVAL_FAUS);
    BITSET_DECLARE(used_push_consts, MAX_PUSH_CONST_FAUS);
    uint32_t sysval_count;
    uint32_t total_count;
+   /* PANVK_UBO_PUSH: the pushed UBO words start at FAU index
+    * ubo_push_start (64-bit units), two words per FAU. */
+   uint32_t ubo_push_start;
+   uint32_t ubo_push_count;
+   struct panvk_ubo_push_word ubo_push[PANVK_MAX_UBO_PUSH_WORDS];
 };
 
 struct panvk_shader_desc_info {
@@ -418,6 +437,8 @@ struct panvk_shader_desc_info {
       uint32_t map[MAX_DYNAMIC_BUFFERS];
       uint32_t count;
    } dyn_bufs;
+   /* Index of the first dynamic buffer in the driver set (table 0). */
+   uint32_t dyn_bufs_start;
    uint32_t fs_varying_attr_desc_count;
 #endif
 };
