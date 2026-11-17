@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(__cplusplus)
@@ -71,6 +73,29 @@ int kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
 /* Report whether this kbase context has seen a queue-group error.  The error
  * state is latched while completion waits consume the notification stream. */
 bool kbase_kmod_csf_has_error(const struct pan_kmod_dev *dev);
+
+/* Process-wide counters of the BOs this backend allocated (PANVK_MEM_PROF). */
+struct kbase_kmod_mem_stats {
+   uint64_t live_bos;
+   uint64_t live_bytes;    /* GPU VA size of live BOs */
+   uint64_t commit_bytes;  /* pages committed at allocation */
+   uint64_t growable_bos;  /* grow-on-fault regions (committed on demand) */
+   uint64_t allocs, frees; /* totals since start */
+   uint64_t growable_commit_bytes; /* committed now, all growable BOs */
+   uint64_t lazy_bos, lazy_va_bytes, lazy_commit_bytes; /* LAZY_COMMIT */
+};
+
+void kbase_kmod_mem_stats(struct kbase_kmod_mem_stats *out);
+
+struct pan_kmod_bo;
+/* Committed (physically backed) bytes of a BO, 0 if unknown. */
+uint64_t kbase_kmod_bo_commit_bytes(struct pan_kmod_bo *bo);
+
+/* PATCH: names what a GPU address belongs to (live BO, quarantined freed
+ * BO, nothing) when PANVK_FAULT_REPORT or PANVK_DBG_FREE_DELAY_MS is set. */
+void kbase_kmod_describe_va(uint64_t va, char *buf, size_t size);
+int kbase_kmod_va_check(uint64_t va, uint64_t len, void *out, bool *growable,
+                        uint64_t *bo_va, uint64_t *bo_size);
 
 int kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                      uint32_t chunk_size,

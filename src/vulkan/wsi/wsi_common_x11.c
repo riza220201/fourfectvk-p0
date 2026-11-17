@@ -2543,8 +2543,9 @@ x11_manage_present_queue(void *state)
 
       /* Not necessary to block when we have explicit sync */
       bool need_fence_wait =
-            x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
-            !chain->base.image_info.explicit_sync;
+            chain->base.present_thread_waits_fence ||
+            (x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
+             !chain->base.image_info.explicit_sync);
 
       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
             chain, wsi_conn, &chain->images[image_index].timing_request);
@@ -3312,6 +3313,9 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.poll_early_refresh = x11_poll_early_refresh;
    chain->base.present_mode = present_mode;
    chain->base.image_count = num_images;
+   chain->base.present_thread_waits_fence =
+      wsi_device->x11_wait_fence_in_present_thread &&
+      (wsi_device->sw || wsi_device->wait_present_before_queue);
 
    /* This is what Xserver is using. We cannot really query it, but we rely on it working. */
    chain->base.present_timing.time_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;

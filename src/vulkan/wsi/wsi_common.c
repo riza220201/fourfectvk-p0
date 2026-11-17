@@ -2890,7 +2890,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (wsi->sw || wsi->wait_present_before_queue) {
+      if ((wsi->sw || wsi->wait_present_before_queue) &&
+          !swapchain->present_thread_waits_fence) {
          results[i] = wsi->WaitForFences(
             vk_device_to_handle(dev), 1, &swapchain->fences[image_index],
             true, ~0ull);

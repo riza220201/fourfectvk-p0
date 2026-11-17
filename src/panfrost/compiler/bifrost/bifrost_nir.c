@@ -5,11 +5,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir_builder.h"
 #include "panfrost/compiler/pan_compiler.h"
 #include "panfrost/compiler/pan_nir.h"
 #include "util/perf/cpu_trace.h"
+#include "util/u_dynarray.h"
 
 #include "panfrost/model/pan_model.h"
 #include "valhall/valhall.h"
@@ -18,6 +20,7 @@
 #include "bifrost_nir.h"
 #include "compiler.h"
 #include "../kraid/kraid.h"
+#include "panfrost/lib/pan_env.h"
 
 static bool
 bi_use_kraid(nir_shader *nir, uint64_t gpu_id)
@@ -803,8 +806,10 @@ nir_shader_has_local_variables(const nir_shader *nir)
 }
 
 static bool pan_nir_lower_buf_image_access(nir_shader *nir, unsigned arch);
+static bool pan_nir_lower_texel_buf_oob(nir_shader *nir);
 static bool bi_should_idvs(nir_shader *nir, const struct pan_compile_inputs *inputs);
 static bool bifrost_nir_lower_vs_atomics(nir_shader *nir);
+static bool bifrost_nir_lower_vs_stores(nir_shader *nir);
 
 void
 bifrost_postprocess_nir(nir_shader *nir,
@@ -824,6 +829,10 @@ bifrost_postprocess_nir(nir_shader *nir,
    /* on Bifrost, lower MSAA load/stores to 3D load/stores */
    if (gpu_arch < 9)
       NIR_PASS(_, nir, pan_nir_lower_image_ms);
+
+   /* PATCH v9: before the texel buffer accesses become LEA_BUF + LD_CVT. */
+   if (gpu_arch >= 9 && gpu_arch < 11 && inputs->robust_texel_buffers)
+      NIR_PASS(_, nir, pan_nir_lower_texel_buf_oob);
 
    NIR_PASS(_, nir, pan_nir_lower_buf_image_access, gpu_arch);
 
@@ -882,6 +891,16 @@ bifrost_postprocess_nir(nir_shader *nir,
 
       if (info->vs.idvs && nir->info.writes_memory)
          NIR_PASS(_, nir, bifrost_nir_lower_vs_atomics);
+
+      /* PATCH v9: IDVS runs the whole shader twice per vertex, once as the
+       * position shader and once as the varying shader. The atomics are made
+       * exclusive to one stage above, but plain stores (and the stores of an
+       * atomic result) still ran in both, the varying copy with an undefined
+       * atomic result. Run them in the position shader only.
+       * PAN_V9_IDVS_STORES_BOTH=1 keeps the old behaviour (control). */
+      if (info->vs.idvs && nir->info.writes_memory && gpu_arch < 13 &&
+          !pan_env_flag("PAN_V9_IDVS_STORES_BOTH"))
+         NIR_PASS(_, nir, bifrost_nir_lower_vs_stores);
 
       /* Needs to run after lower_vs_atomics as it inserts operations between
        * ssbo_atomic and store_output */
@@ -1134,6 +1153,87 @@ pan_nir_lower_buf_image_access(nir_shader *shader, unsigned arch)
                                      nir_metadata_control_flow, &arch);
 }
 
+/* PATCH v9: robustBufferAccess2 wants a texel buffer read outside the view
+ * to return 0 for the components of the format and (0, 0, 1) for a missing
+ * G, B, A. LEA_BUF + LD_CVT on v9 bounds-check (stores and atomics are
+ * dropped, the components read are 0) but return alpha 0 for formats
+ * without alpha (R32_UINT, R32G32_SFLOAT) and 1 for formats with alpha
+ * (R8G8B8A8_UNORM). pan_buffer_texture_emit stores the element count in
+ * dword 5 and "format has no alpha" in dword 6; select the spec value when
+ * the index is not below the element count. */
+static nir_def *
+texel_buf_oob_select(nir_builder *b, nir_def *val, nir_def *handle,
+                     nir_def *index, nir_alu_type type)
+{
+   nir_def *count = pan_nir_load_va_desc(b, 1, 32, handle, 5 * 4);
+   nir_def *no_alpha = pan_nir_load_va_desc(b, 1, 32, handle, 6 * 4);
+   nir_def *in_range = nir_ult(b, index, count);
+   unsigned bits = val->bit_size;
+   nir_def *zero = nir_imm_intN_t(b, 0, bits);
+   nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float
+                     ? nir_imm_floatN_t(b, 1.0, bits)
+                     : nir_imm_intN_t(b, 1, bits);
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+
+   for (unsigned c = 0; c < val->num_components; c++) {
+      nir_def *oob =
+         c == 3 ? nir_bcsel(b, nir_ine_imm(b, no_alpha, 0), one, zero) : zero;
+      comps[c] = nir_bcsel(b, in_range, nir_channel(b, val, c), oob);
+   }
+
+   return nir_vec(b, comps, val->num_components);
+}
+
+static bool
+lower_texel_buf_oob_instr(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   nir_def *def, *handle, *index;
+   nir_alu_type type;
+
+   b->cursor = nir_before_instr(instr);
+
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_image_load ||
+          nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_BUF)
+         return false;
+      def = &intr->def;
+      handle = intr->src[0].ssa;
+      index = nir_channel(b, intr->src[1].ssa, 0);
+      type = nir_intrinsic_dest_type(intr);
+   } else if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_BUF)
+         return false;
+      int h = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+      if (h < 0)
+         h = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+      int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      if (c < 0)
+         return false;
+      def = &tex->def;
+      /* Same handle as steal_tex_srcs() + combine_index() build. */
+      handle = h >= 0 ? nir_iadd_imm(b, tex->src[h].src.ssa, tex->texture_index)
+                      : nir_imm_int(b, tex->texture_index);
+      index = nir_channel(b, tex->src[c].src.ssa, 0);
+      type = tex->dest_type;
+   } else {
+      return false;
+   }
+
+   b->cursor = nir_after_instr(instr);
+   nir_def *res = texel_buf_oob_select(b, def, handle, index, type);
+   nir_def_rewrite_uses_after(def, res);
+   return true;
+}
+
+static bool
+pan_nir_lower_texel_buf_oob(nir_shader *shader)
+{
+   return nir_shader_instructions_pass(shader, lower_texel_buf_oob_instr,
+                                       nir_metadata_control_flow, NULL);
+}
+
 /* Decide if Index-Driven Vertex Shading should be used for a given shader */
 static bool
 bi_should_idvs(nir_shader *nir, const struct pan_compile_inputs *inputs)
@@ -1222,6 +1322,54 @@ bifrost_nir_lower_vs_atomics_impl(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def_replace(&intr->def, res);
 
    return true;
+}
+
+static bool
+bifrost_is_vs_store(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_store_global_cvt_pan:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+bifrost_nir_lower_vs_stores(nir_shader *shader)
+{
+   assert(shader->info.stage == MESA_SHADER_VERTEX);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   struct util_dynarray stores;
+   util_dynarray_init(&stores, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             bifrost_is_vs_store(nir_instr_as_intrinsic(instr)))
+            util_dynarray_append(&stores, instr);
+      }
+   }
+
+   util_dynarray_foreach(&stores, nir_instr *, pinstr) {
+      nir_instr *instr = *pinstr;
+      nir_builder b = nir_builder_at(nir_before_instr(instr));
+      nir_def *shader_output = nir_load_shader_output_pan(&b);
+      nir_push_if(&b, nir_i2b(&b, nir_iand_imm(&b, shader_output,
+                                               VA_SHADER_OUTPUT_POSITION_BIT)));
+      nir_builder_instr_insert(&b, nir_instr_clone(shader, instr));
+      nir_pop_if(&b, NULL);
+      nir_instr_remove(instr);
+   }
+
+   bool progress = util_dynarray_num_elements(&stores, nir_instr *) > 0;
+   util_dynarray_fini(&stores);
+   return nir_progress(progress, impl, nir_metadata_none);
 }
 
 static bool

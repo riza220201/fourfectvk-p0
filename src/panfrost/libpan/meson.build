@@ -8,6 +8,8 @@ libpan_shader_files = files(
   'draw_helper.cl',
   'indirect_dispatch.cl',
   'tessellation.cl',
+  'xfb_helper.cl',  # PATCH v9: JM transform feedback offsets
+  'geometry.cl',  # PATCH v9: JM geometry shader prefix sum
 )
 
 idep_libpan_per_arch = {}

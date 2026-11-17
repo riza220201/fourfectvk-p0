@@ -58,6 +58,8 @@ libpanvk_files = files(
   'panvk_host_copy.c',
   'panvk_image.c',
   'panvk_instance.c',
+  'panvk_mem_prof.c',
+  'panvk_frame_prof.c',
   'panvk_mempool.c',
   'panvk_nir_lower_cooperative_matrix.c',
   'panvk_nir_lower_tile_image.c',
@@ -95,6 +97,7 @@ jm_files = [
   'jm/panvk_vX_cmd_event.c',
   'jm/panvk_vX_cmd_query.c',
   'jm/panvk_vX_cmd_precomp.c',
+  'jm/panvk_vX_cmd_xfb.c',  # PATCH v9: transform feedback
   'jm/panvk_vX_event.c',
   'jm/panvk_vX_gpu_queue.c',
 ]

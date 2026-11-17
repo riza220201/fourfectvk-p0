@@ -144,7 +144,34 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    uint64_t report_addr = panvk_query_report_dev_addr(pool, query);
 
    switch (pool->vk.query_type) {
+#if PAN_ARCH == 9
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+      /* PATCH v9: counters start at zero; draws and dispatches add to them
+       * (panlib_stats_add), fragment shader invocations use the occlusion
+       * counter while no occlusion query needs it. */
+      for (unsigned i = 0; i < pool->reports_per_query; i++) {
+         panvk_emit_write_job(
+            cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
+            report_addr + i * sizeof(struct panvk_query_report), 0);
+      }
+      cmd->state.stats.addr = report_addr;
+      cmd->state.stats.mask = pool->vk.pipeline_statistics;
+      cmd->state.stats.owns_oq = false;
+      const uint64_t fs = panvk_v9_stats_counter(cmd, 7);
+      if (fs && cmd->state.gfx.occlusion_query.mode ==
+                   MALI_OCCLUSION_MODE_DISABLED) {
+         cmd->state.gfx.occlusion_query.ptr = fs;
+         cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_COUNTER;
+         cmd->state.stats.owns_oq = true;
+         gfx_state_set_dirty(cmd, OQ);
+      }
+      break;
+   }
+#endif
    case VK_QUERY_TYPE_OCCLUSION: {
+#if PAN_ARCH == 9
+      cmd->state.stats.owns_oq = false;
+#endif
       cmd->state.gfx.occlusion_query.ptr = report_addr;
       cmd->state.gfx.occlusion_query.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                                ? MALI_OCCLUSION_MODE_COUNTER
@@ -193,9 +220,30 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    had_batch |= end_sync;
 
    switch (pool->vk.query_type) {
+#if PAN_ARCH == 9
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+      if (cmd->state.stats.owns_oq) {
+         cmd->state.gfx.occlusion_query.ptr = 0;
+         cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
+         gfx_state_set_dirty(cmd, OQ);
+      }
+      memset(&cmd->state.stats, 0, sizeof(cmd->state.stats));
+      break;
+   }
+#endif
    case VK_QUERY_TYPE_OCCLUSION: {
       cmd->state.gfx.occlusion_query.ptr = 0;
       cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
+#if PAN_ARCH == 9
+      /* A statistics query still running counts fragment shader
+       * invocations again. */
+      const uint64_t fs = panvk_v9_stats_counter(cmd, 7);
+      if (fs) {
+         cmd->state.gfx.occlusion_query.ptr = fs;
+         cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_COUNTER;
+         cmd->state.stats.owns_oq = true;
+      }
+#endif
       gfx_state_set_dirty(cmd, OQ);
       break;
    }

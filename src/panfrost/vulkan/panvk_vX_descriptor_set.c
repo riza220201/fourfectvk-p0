@@ -35,6 +35,7 @@
 #include "panvk_macros.h"
 #include "panvk_priv_bo.h"
 #include "panvk_sampler.h"
+#include "panfrost/lib/pan_env.h"
 
 static const void *
 get_desc_slot_ptr(struct panvk_descriptor_set *set, uint32_t binding,
@@ -90,7 +91,7 @@ write_desc_data(struct panvk_descriptor_set *set, uint32_t binding,
        * PANVK_NULLDESC_POISON=1 is the negative control: write 0xff bytes  \
        * (invalid type) instead, so a test that really reads the slot must   \
        * change. */                                                          \
-      if (getenv("PANVK_NULLDESC_POISON"))                                   \
+      if (pan_env_flag("PANVK_NULLDESC_POISON"))                                   \
          memset(&null_desc, 0xff, sizeof(null_desc));                        \
       write_desc(set, binding, elem, &null_desc, (subdesc));                 \
    } while (0)
@@ -146,10 +147,22 @@ write_image_view_desc(struct panvk_descriptor_set *set,
       &set->layout->bindings[binding];
 
    if (pImageInfo->imageView == VK_NULL_HANDLE) {
+      /* PATCH: the null texture goes in the texture sub-descriptor. The
+       * sampler one was used, so for a COMBINED_IMAGE_SAMPLER the texture
+       * slot kept whatever the memory held: zero in a fresh pool (reads
+       * looked right), a stale descriptor of an earlier set otherwise
+       * (robustness2 null_descriptor sampled_image fails after other tests).
+       * PANVK_NULL_TEX_SAMPLER_SLOT=1 restores the old slot (control). */
+      const bool old_slot = pan_env_flag("PANVK_NULL_TEX_SAMPLER_SLOT");
+      (void)old_slot;
       for (uint8_t plane = 0; plane < binding_layout->textures_per_desc;
            plane++)
          write_nulldesc(set, binding, elem,
-                        get_sampler_subdesc_info(binding_layout->type, plane));
+                        old_slot
+                           ? get_sampler_subdesc_info(binding_layout->type,
+                                                      plane)
+                           : get_tex_subdesc_info(binding_layout->type,
+                                                  plane));
       return;
    }
 

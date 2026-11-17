@@ -12,6 +12,7 @@
 #include "panvk_macros.h"
 #include "panvk_mempool.h"
 #include "panvk_precomp_cache.h"
+#include "panfrost/lib/pan_env.h"
 
 /* Both arches are implemented. The PAN_ARCH < 9 path below is the original
  * Bifrost one using the separate INVOCATION/PARAMETERS/DRAW sections; the
@@ -135,7 +136,7 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
     * that it was only needed for precompiled internal kernels. Returning here
     * reproduces that stub exactly, which lets the before and after states be
     * compared against one build instead of two. */
-   if (getenv("PANVK_PRECOMP_STUB"))
+   if (pan_env_flag("PANVK_PRECOMP_STUB"))
       return;
 
    ASSERTED enum panlib_barrier supported_barriers =

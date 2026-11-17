@@ -17,6 +17,27 @@
 #include "util/u_atomic.h"
 #include "vk_debug_utils.h"
 #include "vk_log.h"
+#include "panfrost/lib/pan_env.h"
+
+/* Smaller allocations are backed up front: DXVK only suballocates from
+ * large chunks, and small ones are mostly fully used. */
+#define PANVK_DEVMEM_LAZY_MIN_SIZE (8ull << 20)
+
+/* PANVK_KBASE_DEVMEM_LAZY_MIN_KB=N moves the threshold (testing: 0 makes
+ * every device-local-only allocation lazy). */
+static uint64_t
+panvk_devmem_lazy_min_size(void)
+{
+   static int64_t min = -1;
+
+   if (min < 0) {
+      const char *e = getenv("PANVK_KBASE_DEVMEM_LAZY_MIN_KB");
+      min = e && *e ? (int64_t)strtoull(e, NULL, 10) * 1024
+                    : (int64_t)PANVK_DEVMEM_LAZY_MIN_SIZE;
+   }
+
+   return min;
+}
 
 static void
 panvk_memory_emit_report(struct panvk_device *device,
@@ -114,6 +135,22 @@ panvk_AllocateMemory(VkDevice _device,
       if (!can_be_exported &&
           (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
          bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
+
+      /* kbase backs every page of an allocation when it is made. DXVK
+       * suballocates from 256 MiB device-local chunks, so a nearly empty
+       * chunk costs 256 MiB of RAM on this unified-memory GPU. Memory the
+       * CPU cannot map gets its pages when the GPU first touches them
+       * instead (host image copies back the whole buffer first, see
+       * PAN_KMOD_BO_FLAG_LAZY_COMMIT). PANVK_KBASE_DEVMEM_EAGER=1 backs
+       * everything up front as before. */
+      if (!can_be_exported &&
+          !(type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+          pAllocateInfo->allocationSize >= panvk_devmem_lazy_min_size() &&
+          (physical_device->kmod.dev->props.supported_bo_flags &
+           PAN_KMOD_BO_FLAG_LAZY_COMMIT) &&
+          !PANVK_DEBUG(DUMP) && !PANVK_DEBUG(TRACE) &&
+          !pan_env_flag("PANVK_KBASE_DEVMEM_EAGER"))
+         bo_flags |= PAN_KMOD_BO_FLAG_LAZY_COMMIT;
 
       bo_flags = panvk_device_adjust_bo_flags(device, bo_flags);
       mem->bo = pan_kmod_bo_alloc(device->kmod.dev,

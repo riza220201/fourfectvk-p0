@@ -124,20 +124,33 @@ panlib_copy_query_result(uint64_t pool_addr, global uint32_t *available_addr,
       (global uint64_t *)(pool_addr + ((uint64_t)query * query_stride));
 
    bool available = available_addr[query];
+   uint32_t available_idx = 1;
 
    if ((flags & VK_QUERY_RESULT_PARTIAL_BIT) || available) {
       switch (query_type) {
       case VK_QUERY_TYPE_OCCLUSION:
          write_occlusion_query_result(dst, 0, flags, report_addr, report_count);
          break;
+#if PAN_ARCH == 9
+      case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+         /* PATCH v9: one counter per enabled statistic, in bit order. */
+         for (uint32_t r = 0; r < report_count; r++)
+            vk_write_query(dst, r, flags, report_addr[r]);
+         break;
+#endif
       default:
          UNREACHABLE("Unsupported query type");
          break;
       }
    }
 
+#if PAN_ARCH == 9
+   if (query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS)
+      available_idx = report_count;
+#endif
+
    if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-      vk_write_query(dst, 1, flags, available);
+      vk_write_query(dst, available_idx, flags, available);
    }
 }
 

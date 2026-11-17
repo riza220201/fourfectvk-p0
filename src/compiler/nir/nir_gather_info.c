@@ -569,7 +569,15 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
          if (instr->intrinsic == nir_intrinsic_load_per_primitive_input)
             shader->info.per_primitive_inputs |= slot_mask;
          shader->info.inputs_read_16bit |= slot_mask_16bit;
-         if (!nir_src_is_const(*nir_get_io_offset_src(instr))) {
+         /* PATCH: load_attr_pan (Mali LOAD_ATTR) has no IO offset source,
+          * nir_get_io_offset_src() is NULL for it; its handle (src[2]) is
+          * the attribute index with the offset folded in. PanVK's software
+          * vertex shader variant (v9 tessellation/geometry through libpoly)
+          * gathers info after lowering its inputs to it. */
+         nir_src *io_offset = instr->intrinsic == nir_intrinsic_load_attr_pan
+                                 ? &instr->src[2]
+                                 : nir_get_io_offset_src(instr);
+         if (!nir_src_is_const(*io_offset)) {
             shader->info.inputs_read_indirectly |= slot_mask;
             shader->info.inputs_read_indirectly_16bit |= slot_mask_16bit;
          }

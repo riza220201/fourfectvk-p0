@@ -230,6 +230,8 @@ struct wsi_swapchain {
    VkDevice device;
    VkAllocationCallbacks alloc;
    VkFence* fences;
+   /* The present thread waits for fences[] before it uses the image. */
+   bool present_thread_waits_fence;
    VkPresentModeKHR present_mode;
    /**
     * Timeline for presents completing according to VK_KHR_present_wait.  The

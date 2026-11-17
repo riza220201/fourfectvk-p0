@@ -12,6 +12,7 @@
 #include "pan_desc.h"
 #include "pan_util.h"
 #include "pan_v9_trace.h"
+#include "panfrost/lib/pan_env.h"
 
 #include "vk_android.h"
 #include "vk_render_pass.h"
@@ -116,7 +117,7 @@ avoid_direct_resolve_to(const struct pan_image *img)
     * framebuffer layout and we could potentially allow direct resolves in
     * more cases.
     */
-   if (PAN_ARCH == 9 && getenv("PANVK_V9_NO_TILE_RESOLVE"))
+   if (PAN_ARCH == 9 && pan_env_flag("PANVK_V9_NO_TILE_RESOLVE"))
       return true;
 
    return PAN_ARCH < 7 && drm_is_afbc(img->props.modifier);
@@ -871,6 +872,7 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                   noperspective_varyings);
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.first_vertex, info->vertex.base);
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.base_instance, info->instance.base);
+   bool viewport_changed = false;
 
 #if PAN_ARCH < 9
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.raw_vertex_offset,
@@ -881,6 +883,21 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
     * VS drops primitives whose gl_Layer is not this one (lower_layer_writes). */
    set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
    set_gfx_sysval(cmdbuf, dirty_sysvals, draw_id, info->draw_id);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, sfx_vertex_count,
+                  info->index.index_size || info->indirect.buffer_dev_addr
+                     ? UINT32_MAX
+                     : info->vertex.count);
+   /* multiViewport: the viewport transform below follows the viewport of
+    * this copy of the draw. */
+   viewport_changed =
+      cmdbuf->state.gfx.sysvals.viewport_id != info->viewport_id;
+   set_gfx_sysval(cmdbuf, dirty_sysvals, viewport_id, info->viewport_id);
+   /* Clip/cull distances of the last pre-rasterization stage, tested by
+    * the fragment shader. */
+   const struct panvk_shader *last_vtx = cmdbuf->state.gfx.vs.shader;
+   set_gfx_sysval(cmdbuf, dirty_sysvals, clip_cull,
+                  last_vtx ? last_vtx->clip_size | (last_vtx->cull_size << 8)
+                           : 0);
 #endif
 
    if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {
@@ -895,7 +912,7 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                      cmdbuf->state.gfx.fs.blend_descs[i]);
    }
 
-   if (dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
+   if (viewport_changed || dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
        dyn_gfx_state_dirty(cmdbuf, VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) ||
        dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
        dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE)) {
@@ -903,7 +920,13 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
          &cmdbuf->vk.dynamic_graphics_state.rs;
       const struct vk_viewport_state *vp =
          &cmdbuf->vk.dynamic_graphics_state.vp;
+#if PAN_ARCH == 9
+      const VkViewport *viewport =
+         &vp->viewports[MIN2(info->viewport_id,
+                             MAX2(vp->viewport_count, 1) - 1)];
+#else
       const VkViewport *viewport = &vp->viewports[0];
+#endif
 
       /* Doing the viewport transform in the vertex shader and then depth
        * clipping with the viewport depth range gets a similar result to

@@ -193,12 +193,26 @@ poly_heap_alloc_points(constant struct poly_tess_params *p, uint patch,
    }
 
    uint32_t elsize_B = sizeof(struct poly_tess_point);
-   uint32_t alloc_B = poly_heap_alloc_offs(p->heap, elsize_B * count);
+#if defined(PAN_ARCH) && PAN_ARCH == 9
+   /* PATCH v9: IDVS shades vertex IDs in aligned groups of 4, so the TES
+    * also runs for up to 3 IDs past the last point of a patch. Pad the
+    * allocation to 4 points and mark the padding with a sentinel the TES
+    * recognises (u = 0xffffffff, panvk_v9_gate_side_effects). */
+   uint32_t padded = (count + 3) & ~3u;
+#else
+   uint32_t padded = count;
+#endif
+   uint32_t alloc_B = poly_heap_alloc_offs(p->heap, elsize_B * padded);
    uint32_t alloc_el = alloc_B / elsize_B;
 
    p->coord_allocs[patch] = alloc_el;
-   return (global struct poly_tess_point *)(((uintptr_t)p->heap->base) +
-                                            alloc_B);
+   global struct poly_tess_point *pts =
+      (global struct poly_tess_point *)(((uintptr_t)p->heap->base) + alloc_B);
+   for (uint32_t i = count; i < padded; i++) {
+      pts[i].u = 0xffffffff;
+      pts[i].v = 0xffffffff;
+   }
+   return pts;
 }
 
 // Microsoft D3D11 Fixed Function Tessellator Reference - May 7, 2012

@@ -15,6 +15,7 @@
 #include "pan_afbc.h"
 #include "pan_shader.h"
 #include "pan_nir.h"
+#include "panfrost/lib/pan_env.h"
 
 PRAGMA_DIAGNOSTIC_PUSH
 PRAGMA_DIAGNOSTIC_ERROR(-Wpadded)
@@ -359,6 +360,16 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf,
       }
 
       struct pan_image_view pview = *iview;
+#if PAN_ARCH == 9
+      /* PATCH v9: the preload shader fetches layer N of a 2D array. A cube
+       * descriptor has one array element per 6 faces, so faces 1-5 read
+       * face 0 back (CTS geometry.layered.cube*.readback with LOAD_OP_LOAD).
+       * Describe cube attachments as the 2D array they are.
+       * PANVK_V9_PRELOAD_CUBE=1 keeps the cube descriptor (control). */
+      if (pview.dim == MALI_TEXTURE_DIMENSION_CUBE &&
+          !pan_env_flag("PANVK_V9_PRELOAD_CUBE"))
+         pview.dim = MALI_TEXTURE_DIMENSION_2D;
+#endif
       if (loc == FRAG_RESULT_DEPTH)
          pview.format = util_format_get_depth_only(pview.format);
       else if (loc == FRAG_RESULT_STENCIL)

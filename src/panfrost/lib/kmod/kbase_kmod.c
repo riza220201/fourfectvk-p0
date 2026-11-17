@@ -35,8 +35,10 @@
  */
 
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <linux/dma-heap.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -45,6 +47,8 @@
 #include <unistd.h>
 
 #include "util/macros.h"
+#include "util/simple_mtx.h"
+#include "util/list.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
@@ -120,6 +124,17 @@ struct kbase_kmod_vm {
 
 struct kbase_kmod_bo {
    struct pan_kmod_bo base;
+
+   /* Counted in kbase_mem_stats (native allocations only). */
+   bool stats_counted;
+   /* Grow-on-fault region: committed size is queried by PANVK_MEM_PROF. */
+   bool growable;
+   /* LAZY_COMMIT buffer that got fully backed for CPU access. */
+   bool fully_committed;
+   struct list_head grow_link;
+   /* PATCH: fault diagnostics, see kbase_diag_tracking(). */
+   bool diag_tracked;
+   struct list_head diag_link;
 
    /* GPU virtual address.  For SAME_VA allocations this equals the CPU
     * mapping address; for EXEC_VA-zone allocations it is the address
@@ -382,7 +397,8 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
                                 PAN_KMOD_BO_FLAG_NO_MMAP |
                                 PAN_KMOD_BO_FLAG_WB_MMAP |
                                 PAN_KMOD_BO_FLAG_GPU_UNCACHED |
-                                PAN_KMOD_BO_FLAG_CSF_EVENT;
+                                PAN_KMOD_BO_FLAG_CSF_EVENT |
+                                PAN_KMOD_BO_FLAG_LAZY_COMMIT;
 }
 
 /* -------------------------------------------------------------------------
@@ -1308,11 +1324,15 @@ err_unmap_tracking:
    return NULL;
 }
 
+static void kbase_quar_reap(int fd, bool all);
+
 static void
 kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
+
+   kbase_quar_reap(dev->fd, true);
 
    simple_mtx_lock(&kbase_dev->kcpu.lock);
    if (kbase_dev->kcpu.fence_fd >= 0)
@@ -1398,7 +1418,8 @@ to_kbase_mem_flags(uint32_t kmod_flags)
    if (kmod_flags & PAN_KMOD_BO_FLAG_IO_COHERENT)
       flags |= BASE_MEM_COHERENT_SYSTEM;
 
-   if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)
+   if (kmod_flags & (PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
+                     PAN_KMOD_BO_FLAG_LAZY_COMMIT))
       flags |= BASE_MEM_GROW_ON_GPF;
 
    if (kmod_flags & PAN_KMOD_BO_FLAG_CSF_EVENT) {
@@ -1505,6 +1526,285 @@ err_free_bo:
    return NULL;
 }
 
+static struct {
+   uint64_t live_bos, live_bytes, commit_bytes, growable_bos, allocs, frees;
+} kbase_mem_stats;
+
+static simple_mtx_t kbase_grow_lock = SIMPLE_MTX_INITIALIZER;
+static struct list_head kbase_grow_list = {&kbase_grow_list, &kbase_grow_list};
+
+/* PATCH: fault diagnostics. With PANVK_FAULT_REPORT=1 or
+ * PANVK_DBG_FREE_DELAY_MS=<ms>, live BOs are listed so a GPU address can be
+ * named (kbase_kmod_describe_va). PANVK_DBG_FREE_DELAY_MS keeps a freed BO
+ * mapped on the GPU for that long (quarantine): a GPU read of freed memory
+ * then sees the old data instead of faulting, so a fault that goes away
+ * with the delay is a use-after-free. Both are off by default. */
+struct kbase_quar_bo {
+   struct list_head link;
+   uint64_t gpu_va, size, freed_ns;
+   void *cpu_ptr, *gpu_mapping;
+   bool same_va, owns_cpu_mapping;
+   int dmabuf_fd, fd;
+   uint32_t flags;
+};
+
+static simple_mtx_t kbase_diag_lock = SIMPLE_MTX_INITIALIZER;
+static struct list_head kbase_diag_list = {&kbase_diag_list, &kbase_diag_list};
+static struct list_head kbase_quar_list = {&kbase_quar_list, &kbase_quar_list};
+static int kbase_diag_mode = -1;
+static uint64_t kbase_free_delay_ns;
+
+static bool
+kbase_diag_tracking(void)
+{
+   if (kbase_diag_mode < 0) {
+      const char *d = getenv("PANVK_DBG_FREE_DELAY_MS");
+      const char *r = getenv("PANVK_FAULT_REPORT");
+      if (!r || !*r || !strcmp(r, "0"))
+         r = getenv("PANVK_FAULT_AUDIT_ALL");
+      kbase_free_delay_ns = d ? strtoull(d, NULL, 10) * 1000000ull : 0;
+      kbase_diag_mode =
+         (kbase_free_delay_ns || (r && *r && strcmp(r, "0"))) ? 1 : 0;
+   }
+   return kbase_diag_mode == 1;
+}
+
+static void
+kbase_diag_track(struct pan_kmod_bo *bo)
+{
+   if (!bo || !kbase_diag_tracking())
+      return;
+
+   struct kbase_kmod_bo *kbo = container_of(bo, struct kbase_kmod_bo, base);
+   simple_mtx_lock(&kbase_diag_lock);
+   list_addtail(&kbo->diag_link, &kbase_diag_list);
+   kbo->diag_tracked = true;
+   simple_mtx_unlock(&kbase_diag_lock);
+}
+
+static void
+kbase_quar_release(struct kbase_quar_bo *q)
+{
+   if (q->owns_cpu_mapping && q->cpu_ptr && q->cpu_ptr != q->gpu_mapping)
+      munmap(q->cpu_ptr, q->size);
+   if (q->gpu_mapping)
+      munmap(q->gpu_mapping, q->size);
+   if (!q->same_va) {
+      struct kbase_ioctl_mem_free req = { .gpu_addr = q->gpu_va };
+      ioctl(q->fd, KBASE_IOCTL_MEM_FREE, &req);
+   }
+   if (q->dmabuf_fd >= 0)
+      close(q->dmabuf_fd);
+   free(q);
+}
+
+/* Frees quarantined BOs older than the delay, or all of fd's (fd >= 0,
+ * all = true) before that kbase fd is closed. */
+static void
+kbase_quar_reap(int fd, bool all)
+{
+   uint64_t now = os_time_get_nano();
+   struct list_head done;
+   list_inithead(&done);
+
+   simple_mtx_lock(&kbase_diag_lock);
+   list_for_each_entry_safe(struct kbase_quar_bo, q, &kbase_quar_list, link) {
+      if (all ? q->fd == fd : now - q->freed_ns >= kbase_free_delay_ns) {
+         list_del(&q->link);
+         list_addtail(&q->link, &done);
+      }
+   }
+   simple_mtx_unlock(&kbase_diag_lock);
+
+   list_for_each_entry_safe(struct kbase_quar_bo, q, &done, link)
+      kbase_quar_release(q);
+}
+
+static uint64_t kbase_bo_query_commit(int fd, uint64_t gpu_va);
+
+/* PATCH 0077: 0 = [va, va+len) is inside one live BO (1 also says whether
+ * it is growable), -1 = in a freed (quarantined) BO, -2 = in no BO. When
+ * out is set and the BO is CPU-mapped and not growable, copies the bytes.
+ * Fault diagnostics only. */
+int
+kbase_kmod_va_check(uint64_t va, uint64_t len, void *out, bool *growable,
+                    uint64_t *bo_va, uint64_t *bo_size)
+{
+   int ret = -2;
+
+   if (!kbase_diag_tracking())
+      return -3;
+
+   simple_mtx_lock(&kbase_diag_lock);
+   list_for_each_entry(struct kbase_kmod_bo, kbo, &kbase_diag_list,
+                       diag_link) {
+      if (va >= kbo->gpu_va && va < kbo->gpu_va + kbo->base.size) {
+         if (bo_va)
+            *bo_va = kbo->gpu_va;
+         if (bo_size)
+            *bo_size = kbo->base.size;
+         if (growable)
+            *growable = kbo->growable;
+         if (len > kbo->gpu_va + kbo->base.size - va) {
+            ret = -4; /* starts inside, ends past the BO */
+         } else {
+            ret = 0;
+            if (out) {
+               if (!kbo->growable && kbo->cpu_ptr)
+                  memcpy(out, (const uint8_t *)kbo->cpu_ptr +
+                                 (va - kbo->gpu_va), len);
+               else
+                  ret = 1;
+            }
+         }
+         simple_mtx_unlock(&kbase_diag_lock);
+         return ret;
+      }
+   }
+   list_for_each_entry(struct kbase_quar_bo, q, &kbase_quar_list, link) {
+      if (va >= q->gpu_va && va < q->gpu_va + q->size) {
+         ret = -1;
+         break;
+      }
+   }
+   simple_mtx_unlock(&kbase_diag_lock);
+   return ret;
+}
+
+void
+kbase_kmod_describe_va(uint64_t va, char *buf, size_t size)
+{
+   if (!va) {
+      snprintf(buf, size, "null");
+      return;
+   }
+   if (!kbase_diag_tracking()) {
+      snprintf(buf, size, "BO tracking off");
+      return;
+   }
+
+   uint64_t now = os_time_get_nano();
+   simple_mtx_lock(&kbase_diag_lock);
+   list_for_each_entry(struct kbase_kmod_bo, kbo, &kbase_diag_list,
+                       diag_link) {
+      if (va >= kbo->gpu_va && va < kbo->gpu_va + kbo->base.size) {
+         char extra[64] = "";
+         /* PATCH 0077: for a grow-on-fault region, how much of it the
+          * kernel has backed: an address above that needs a page fault
+          * that can fail under memory pressure. */
+         if (kbo->growable)
+            snprintf(extra, sizeof(extra), " growable, backed 0x%" PRIx64,
+                     kbase_bo_query_commit(kbo->base.dev->fd, kbo->gpu_va));
+         snprintf(buf, size, "live BO 0x%" PRIx64 " +0x%" PRIx64
+                  " offset 0x%" PRIx64 " flags 0x%x%s", kbo->gpu_va,
+                  kbo->base.size, va - kbo->gpu_va, kbo->base.flags, extra);
+         simple_mtx_unlock(&kbase_diag_lock);
+         return;
+      }
+   }
+   list_for_each_entry(struct kbase_quar_bo, q, &kbase_quar_list, link) {
+      if (va >= q->gpu_va && va < q->gpu_va + q->size) {
+         snprintf(buf, size, "FREED BO 0x%" PRIx64 " +0x%" PRIx64
+                  " flags 0x%x, freed %" PRIu64 " ms ago", q->gpu_va, q->size,
+                  q->flags, (now - q->freed_ns) / 1000000);
+         simple_mtx_unlock(&kbase_diag_lock);
+         return;
+      }
+   }
+   /* Nearest live BO below: tells an overrun apart from a wild pointer. */
+   uint64_t best_end = 0, best_va = 0;
+   list_for_each_entry(struct kbase_kmod_bo, kbo, &kbase_diag_list,
+                       diag_link) {
+      uint64_t end = kbo->gpu_va + kbo->base.size;
+      if (end <= va && end > best_end) {
+         best_end = end;
+         best_va = kbo->gpu_va;
+      }
+   }
+   simple_mtx_unlock(&kbase_diag_lock);
+   if (best_end)
+      snprintf(buf, size, "not in any tracked BO (nearest below: BO 0x%"
+               PRIx64 ", ends 0x%" PRIx64 " bytes before)", best_va,
+               va - best_end);
+   else
+      snprintf(buf, size, "not in any tracked BO (none below)");
+}
+
+static uint64_t kbase_bo_query_commit(int fd, uint64_t gpu_va);
+
+void
+kbase_kmod_mem_stats(struct kbase_kmod_mem_stats *out)
+{
+   out->live_bos = p_atomic_read(&kbase_mem_stats.live_bos);
+   out->live_bytes = p_atomic_read(&kbase_mem_stats.live_bytes);
+   out->commit_bytes = p_atomic_read(&kbase_mem_stats.commit_bytes);
+   out->growable_bos = p_atomic_read(&kbase_mem_stats.growable_bos);
+   out->allocs = p_atomic_read(&kbase_mem_stats.allocs);
+   out->frees = p_atomic_read(&kbase_mem_stats.frees);
+
+   out->growable_commit_bytes = 0;
+   out->lazy_bos = 0;
+   out->lazy_va_bytes = 0;
+   out->lazy_commit_bytes = 0;
+   simple_mtx_lock(&kbase_grow_lock);
+   list_for_each_entry(struct kbase_kmod_bo, kbo, &kbase_grow_list,
+                       grow_link) {
+      uint64_t c = kbase_bo_query_commit(kbo->base.dev->fd, kbo->gpu_va);
+      out->growable_commit_bytes += c;
+      if (kbo->base.flags & PAN_KMOD_BO_FLAG_LAZY_COMMIT) {
+         out->lazy_bos++;
+         out->lazy_va_bytes += kbo->base.size;
+         out->lazy_commit_bytes += c;
+      }
+   }
+   simple_mtx_unlock(&kbase_grow_lock);
+}
+
+static uint64_t
+kbase_bo_query_commit(int fd, uint64_t gpu_va)
+{
+   union kbase_ioctl_mem_query q = {
+      .in = {
+         .gpu_addr = gpu_va,
+         .query = KBASE_MEM_QUERY_COMMIT_SIZE,
+      },
+   };
+
+   if (ioctl(fd, KBASE_IOCTL_MEM_QUERY, &q))
+      return 0;
+
+   return q.out.value * 4096;
+}
+
+uint64_t
+kbase_kmod_bo_commit_bytes(struct pan_kmod_bo *bo)
+{
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+
+   return kbase_bo_query_commit(bo->dev->fd, kbase_bo->gpu_va);
+}
+
+static void
+kbase_mem_stats_add(uint64_t size, uint64_t commit, bool growable, int sign)
+{
+   if (sign > 0) {
+      p_atomic_inc(&kbase_mem_stats.live_bos);
+      p_atomic_add(&kbase_mem_stats.live_bytes, size);
+      p_atomic_add(&kbase_mem_stats.commit_bytes, commit);
+      if (growable)
+         p_atomic_inc(&kbase_mem_stats.growable_bos);
+      p_atomic_inc(&kbase_mem_stats.allocs);
+   } else {
+      p_atomic_dec(&kbase_mem_stats.live_bos);
+      p_atomic_add(&kbase_mem_stats.live_bytes, -size);
+      p_atomic_add(&kbase_mem_stats.commit_bytes, -commit);
+      if (growable)
+         p_atomic_dec(&kbase_mem_stats.growable_bos);
+      p_atomic_inc(&kbase_mem_stats.frees);
+   }
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
                            uint32_t kmod_flags)
@@ -1540,7 +1840,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
        !(kmod_flags & (PAN_KMOD_BO_FLAG_EXECUTABLE |
                        PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
                        PAN_KMOD_BO_FLAG_CSF_EVENT)))
-      return kbase_kmod_bo_alloc_dmabuf(dev, size, kmod_flags);
+   {
+      struct pan_kmod_bo *dbo = kbase_kmod_bo_alloc_dmabuf(dev, size, kmod_flags);
+      kbase_diag_track(dbo);
+      return dbo;
+   }
 
    const uint64_t page_size = 4096;
    uint64_t va_pages = (size + page_size - 1) / page_size;
@@ -1559,11 +1863,12 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    uint64_t alloc_flags = to_kbase_mem_flags(kmod_flags);
    uint64_t alloc_gpu_va;
 
-   if (kmod_flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT) {
+   if (kmod_flags & (PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
+                     PAN_KMOD_BO_FLAG_LAZY_COMMIT)) {
       /* Growable region: nothing committed up-front, grown in 2 MB
        * increments on GPU page fault (matches panfork's heap setup). */
       commit_pages = 0;
-      extension = (2 * 1024 * 1024) / page_size;
+      extension = MIN2((2 * 1024 * 1024) / page_size, va_pages);
    }
 
    if (kbase_dev->is_csf &&
@@ -1641,6 +1946,16 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
    pan_kmod_bo_init(&kbase_bo->base, dev, exclusive_vm,
                     va_pages * page_size, kmod_flags, handle);
+   kbase_bo->stats_counted = true;
+   kbase_mem_stats_add(va_pages * page_size, commit_pages * page_size,
+                       commit_pages == 0, 1);
+   if (commit_pages == 0) {
+      kbase_bo->growable = true;
+      simple_mtx_lock(&kbase_grow_lock);
+      list_addtail(&kbase_bo->grow_link, &kbase_grow_list);
+      simple_mtx_unlock(&kbase_grow_lock);
+   }
+   kbase_diag_track(&kbase_bo->base);
    return &kbase_bo->base;
 
 err_free_bo:
@@ -1655,6 +1970,44 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
       container_of(bo, struct kbase_kmod_bo, base);
 
    pan_kmod_bo_cleanup(bo);
+
+   if (kbase_bo->growable) {
+      simple_mtx_lock(&kbase_grow_lock);
+      list_del(&kbase_bo->grow_link);
+      simple_mtx_unlock(&kbase_grow_lock);
+   }
+
+   if (kbase_bo->stats_counted)
+      kbase_mem_stats_add(bo->size, kbase_bo->growable ? 0 : bo->size,
+                          kbase_bo->growable, -1);
+
+   if (kbase_bo->diag_tracked) {
+      simple_mtx_lock(&kbase_diag_lock);
+      list_del(&kbase_bo->diag_link);
+      simple_mtx_unlock(&kbase_diag_lock);
+   }
+
+   if (kbase_diag_tracking() && kbase_free_delay_ns) {
+      struct kbase_quar_bo *q = calloc(1, sizeof(*q));
+      if (q) {
+         q->gpu_va = kbase_bo->gpu_va;
+         q->size = bo->size;
+         q->freed_ns = os_time_get_nano();
+         q->cpu_ptr = kbase_bo->cpu_ptr;
+         q->gpu_mapping = kbase_bo->gpu_mapping;
+         q->same_va = kbase_bo->same_va;
+         q->owns_cpu_mapping = kbase_bo->owns_cpu_mapping;
+         q->dmabuf_fd = kbase_bo->dmabuf_fd;
+         q->fd = bo->dev->fd;
+         q->flags = bo->flags;
+         simple_mtx_lock(&kbase_diag_lock);
+         list_addtail(&q->link, &kbase_quar_list);
+         simple_mtx_unlock(&kbase_diag_lock);
+         pan_kmod_dev_free(bo->dev, kbase_bo);
+         kbase_quar_reap(-1, false);
+         return;
+      }
+   }
 
    /* For SAME_VA regions, munmap() alone tears the whole region down
     * (free-on-close); a MEM_FREE afterwards would hit a stale VA.  For
@@ -1697,7 +2050,10 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
 static struct pan_kmod_bo *
 kbase_kmod_bo_import_fd(struct pan_kmod_dev *dev, int fd, uint64_t size)
 {
-   return kbase_kmod_import_dmabuf(dev, NULL, fd, size, 0, true);
+   struct pan_kmod_bo *bo = kbase_kmod_import_dmabuf(dev, NULL, fd, size, 0,
+                                                     true);
+   kbase_diag_track(bo);
+   return bo;
 }
 
 static int
@@ -1745,6 +2101,24 @@ kbase_kmod_bo_mmap(struct pan_kmod_bo *bo, UNUSED int prot, UNUSED int flags,
    if (!kbase_bo->cpu_ptr) {
       errno = EINVAL;
       return MAP_FAILED;
+   }
+
+   /* A CPU access to a page of a grow-on-fault region that has no backing
+    * is fatal (SIGBUS): back all of a LAZY_COMMIT buffer before the CPU
+    * gets the pointer. */
+   if ((bo->flags & PAN_KMOD_BO_FLAG_LAZY_COMMIT) &&
+       !p_atomic_read(&kbase_bo->fully_committed)) {
+      struct kbase_ioctl_mem_commit commit = {
+         .gpu_addr = kbase_bo->gpu_va,
+         .pages = bo->size / 4096,
+      };
+      if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_COMMIT, &commit)) {
+         mesa_loge("kbase: KBASE_IOCTL_MEM_COMMIT of %" PRIu64 " pages "
+                   "failed: %s", (uint64_t)commit.pages, strerror(errno));
+         errno = ENOMEM;
+         return MAP_FAILED;
+      }
+      p_atomic_set(&kbase_bo->fully_committed, true);
    }
 
    return kbase_bo->cpu_ptr;

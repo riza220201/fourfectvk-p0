@@ -40,6 +40,35 @@
 #include "util/os_time.h"
 #include "util/timespec.h"
 #include "pan_v9_trace.h"
+#include "pan_props.h"
+#include "panfrost/lib/pan_env.h"
+#include "panvk_mem_prof.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#else
+static inline void
+kbase_kmod_describe_va(uint64_t va, char *buf, size_t size)
+{
+   snprintf(buf, size, "?");
+}
+static inline int
+kbase_kmod_va_check(uint64_t va, uint64_t len, void *out, bool *growable,
+                    uint64_t *bo_va, uint64_t *bo_size)
+{
+   return -3;
+}
+struct kbase_kmod_mem_stats {
+   uint64_t growable_commit_bytes;
+};
+static inline void
+kbase_kmod_mem_stats(struct kbase_kmod_mem_stats *out)
+{
+}
+#endif
 
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
@@ -329,6 +358,18 @@ struct panvk_kbase_base_fence {
 struct panvk_kbase_job {
    uint64_t jc;
    uint32_t core_req;
+   /* PANVK_FAULT_REPORT: what the atom carries (0076). */
+   struct panvk_cmd_buffer *cmdbuf;
+   struct panvk_batch *batch;
+   unsigned batch_idx;
+};
+
+/* PANVK_FAULT_REPORT: what each atom number carries while in flight. */
+struct panvk_kbase_atom_info {
+   struct panvk_cmd_buffer *cmdbuf;
+   struct panvk_batch *batch;
+   uint32_t core_req;
+   unsigned batch_idx;
 };
 
 /* The job atoms of the vkQueueSubmit being built, not yet in the kernel. */
@@ -345,6 +386,7 @@ struct panvk_kbase_sub {
    uint8_t last; /* the atom whose event completes the submission */
    bool done;
    int fence_fd; /* out-fence made by an export, -1 until then */
+   uint64_t submit_ns; /* PANVK_FRAME_PROF */
    uint16_t nr_atoms;
    uint8_t atoms[PANVK_KBASE_MAX_SUB_ATOMS];
 };
@@ -374,6 +416,8 @@ struct panvk_kbase_jm {
    struct panvk_kbase_chain chain;
    bool wait_submit, cpu_fence_wait, cpu_fence_export;
    bool ctrl_no_fence_wait_dep, ctrl_export_early;
+   /* Read once at creation (were read on every submit). */
+   bool chain_enabled, no_signal;
    /* Counted always, printed at destroy with PANVK_KBASE_FENCE_TRACE=1:
     * waits by payload, FENCE_WAIT atoms, exports by outcome. */
    bool trace;
@@ -381,13 +425,24 @@ struct panvk_kbase_jm {
       uint64_t wait_none, wait_own, wait_file, wait_cpu, fence_wait_atoms;
       uint64_t export_new, export_dup, export_done, export_cpu;
    } stats;
+
+   /* FourFectVK diagnostics (0076/0077), all under mtx. */
+   struct panvk_device *dev;
+   uint64_t t0_ns, fail_print_ns;
+   unsigned errors;
+   bool fault_report, audit_all;
+   unsigned fault_reports, fault_audits;
+   unsigned audit_batches, audit_suspect_batches, audit_lines;
+   struct panvk_kbase_atom_info atom_info[256];
+   /* PANVK_FRAME_PROF: end of the GPU busy time counted so far. */
+   uint64_t busy_end_ns;
 };
 
 static bool
 panvk_kbase_chain_enabled(void)
 {
    /* The trace/dump paths decode each chain right after it ran. */
-   return !getenv("PANVK_KBASE_SYNC_SUBMIT") && !pan_v9_trace_enabled() &&
+   return !pan_env_flag("PANVK_KBASE_SYNC_SUBMIT") && !pan_v9_trace_enabled() &&
           !getenv("PANVK_HEAP_LOG") && !PANVK_DEBUG(TRACE) && !PANVK_DEBUG(DUMP);
 }
 
@@ -430,6 +485,499 @@ panvk_kbase_find_sub(struct panvk_kbase_jm *k, uint8_t atom)
    return NULL;
 }
 
+/* PATCH: PANVK_FAULT_REPORT=1. Prints, for a failed atom, the batch it
+ * carried: which chain, the job types, the status the GPU wrote back into
+ * each job header and the fault pointer, plus what the fault pointer is
+ * (live GPU memory, a quarantined freed BO with PANVK_DBG_FREE_DELAY_MS,
+ * or nothing). The command buffer is still pending, so its descriptors are
+ * alive. Caller holds k->mtx. */
+static const char *
+panvk_job_type_str(unsigned t)
+{
+   switch (t) {
+   case 0: return "not-started";
+   case 1: return "null";
+   case 2: return "write-value";
+   case 3: return "cache-flush";
+   case 4: return "compute";
+   case 7: return "tiler";
+   case 9: return "fragment";
+   case 10: return "indexed-vertex";
+   case 11: return "malloc-vertex";
+   case 12: return "fullscreen";
+   default: return "?";
+   }
+}
+
+/* PATCH 0077: pointer audit of a failed batch. kbase kills the context's
+ * jobs on an MMU fault without telling userspace the address (dmesg only),
+ * and a killed job never writes its status, so the job headers say
+ * nothing. Instead, every GPU address the failed chain follows (job
+ * descriptors -> draw/shader descriptors -> resource tables -> buffer,
+ * texture and plane descriptors -> memory; framebuffer -> render targets,
+ * tiler heap) is checked against the live BOs: an address in no BO, in a
+ * freed BO or running past the end of its BO is printed, and the growable
+ * (grow-on-fault) BOs that are used are listed with how much the kernel has
+ * backed. Descriptor memory is read through the BO's CPU mapping; growable
+ * BOs are never read. */
+struct fault_audit {
+   unsigned checked, outside, freed, past_end, sink, shown;
+   unsigned show_max;
+   unsigned occl_len, jobs_skipped;
+   unsigned nseen;
+   uint64_t seen[256];
+   unsigned ngrow;
+   struct {
+      uint64_t bo, size, max_end;
+      unsigned refs;
+   } grow[16];
+};
+
+static uint32_t
+fa_rd32(const uint8_t *p)
+{
+   uint32_t v;
+   memcpy(&v, p, 4);
+   return v;
+}
+
+static uint64_t
+fa_rd64(const uint8_t *p)
+{
+   uint64_t v;
+   memcpy(&v, p, 8);
+   return v;
+}
+
+/* True the first time a table address is seen (tables are shared by
+ * many draws). */
+static bool
+fa_first(struct fault_audit *a, uint64_t va)
+{
+   for (unsigned i = 0; i < a->nseen; i++)
+      if (a->seen[i] == va)
+         return false;
+   if (a->nseen < ARRAY_SIZE(a->seen))
+      a->seen[a->nseen++] = va;
+   return true;
+}
+
+static void
+fa_ptr(struct fault_audit *a, unsigned job, const char *what, uint64_t va,
+       uint64_t len)
+{
+   if (!va)
+      return;
+   a->checked++;
+   if ((va >> 60) == 0x8) {
+      /* Memory sink of null dynamic buffers: never dereferenced as long
+       * as the size is 0. */
+      a->sink++;
+      if (!len)
+         return;
+   }
+
+   bool growable = false;
+   uint64_t bo = 0, bo_size = 0;
+   int r = kbase_kmod_va_check(va, len ? len : 1, NULL, &growable, &bo,
+                               &bo_size);
+   if (r == 0) {
+      if (growable) {
+         unsigned i;
+         for (i = 0; i < a->ngrow; i++)
+            if (a->grow[i].bo == bo)
+               break;
+         if (i == a->ngrow && a->ngrow < ARRAY_SIZE(a->grow)) {
+            a->grow[i].bo = bo;
+            a->grow[i].size = bo_size;
+            a->grow[i].max_end = 0;
+            a->grow[i].refs = 0;
+            a->ngrow++;
+         }
+         if (i < a->ngrow) {
+            a->grow[i].refs++;
+            a->grow[i].max_end =
+               MAX2(a->grow[i].max_end, va - bo + (len ? len : 1));
+         }
+      }
+      return;
+   }
+   if (r == -3)
+      return;
+
+   if (r == -1)
+      a->freed++;
+   else if (r == -4)
+      a->past_end++;
+   else
+      a->outside++;
+
+   if (a->shown++ < a->show_max) {
+      char where[160];
+      kbase_kmod_describe_va(va, where, sizeof(where));
+      mesa_loge("panvk-fault:   SUSPECT job[%u] %s 0x%" PRIx64 " +0x%" PRIx64
+                ": %s%s", job, what, va, len, where,
+                r == -4 ? " (runs past the end of the BO)" : "");
+   }
+}
+
+static bool
+fa_read(uint64_t va, void *out, size_t len)
+{
+   return va && (va >> 60) != 0x8 &&
+          kbase_kmod_va_check(va, len, out, NULL, NULL, NULL) == 0;
+}
+
+static void
+fa_desc(struct fault_audit *a, unsigned job, const uint8_t *d)
+{
+   switch (d[0] & 0xf) {
+   case 2: { /* Texture */
+      unsigned levels = ((fa_rd32(d + 8) >> 16) & 0x1f) + 1;
+      unsigned layers = (fa_rd32(d + 24) & 0xffff) + 1;
+      uint64_t surfaces = fa_rd64(d + 16);
+      uint64_t n = MIN2((uint64_t)levels * layers, 4096);
+      fa_ptr(a, job, "texture surfaces", surfaces, n * 32);
+      uint8_t pl[32];
+      for (uint64_t i = 0; i < n; i += (n > 1 ? n - 1 : 1)) {
+         if (!fa_read(surfaces + i * 32, pl, 32))
+            break;
+         fa_ptr(a, job, "texture plane", fa_rd64(pl + 8), fa_rd32(pl + 4));
+      }
+      break;
+   }
+   case 8: /* Shader program */
+      fa_ptr(a, job, "shader binary", fa_rd64(d + 8), 4);
+      break;
+   case 9: /* Buffer */
+      fa_ptr(a, job, "buffer", fa_rd64(d + 8), fa_rd32(d + 4));
+      break;
+   case 10: /* Plane */
+      fa_ptr(a, job, "plane", fa_rd64(d + 8), fa_rd32(d + 4));
+      break;
+   default:
+      break;
+   }
+}
+
+static void
+fa_res_table(struct fault_audit *a, unsigned job, uint64_t res)
+{
+   const uint64_t tab = res & ~0x3full;
+   const unsigned count = res & 0x3f;
+
+   if (!tab || !fa_first(a, res))
+      return;
+   fa_ptr(a, job, "resource table", tab, count * 16);
+   for (unsigned i = 0; i < count; i++) {
+      uint8_t e[16];
+      if (!fa_read(tab + i * 16, e, 16))
+         continue;
+      uint64_t addr = fa_rd64(e) & BITFIELD64_MASK(56);
+      uint64_t size = fa_rd64(e + 8);
+      if (!addr || !size || !fa_first(a, addr))
+         continue;
+      fa_ptr(a, job, "descriptor table", addr, size);
+      uint64_t n = MIN2(size / 32, 1024);
+      for (uint64_t k = 0; k < n; k++) {
+         uint8_t d[32];
+         if (!fa_read(addr + k * 32, d, 32))
+            break;
+         fa_desc(a, job, d);
+      }
+   }
+}
+
+/* Shader Environment, 64 bytes. Returns the shader binary address. */
+static uint64_t
+fa_shader_env(struct fault_audit *a, unsigned job, const char *what,
+              const uint8_t *env)
+{
+   uint64_t prog = fa_rd64(env + 40), tls = fa_rd64(env + 48);
+   uint64_t fau = fa_rd64(env + 56), binary = 0;
+   unsigned fau_count = fa_rd32(env + 4) & 0xff;
+   char w[48];
+
+   snprintf(w, sizeof(w), "%s shader program", what);
+   fa_ptr(a, job, w, prog, 32);
+   uint8_t sp[32];
+   if (fa_read(prog, sp, 32)) {
+      binary = fa_rd64(sp + 8);
+      snprintf(w, sizeof(w), "%s shader binary", what);
+      fa_ptr(a, job, w, binary, 4);
+   }
+   if (tls && fa_first(a, tls)) {
+      fa_ptr(a, job, "local storage", tls, 32);
+      uint8_t ls[32];
+      if (fa_read(tls, ls, 32)) {
+         /* Packed address mode (what pan_emit_tls uses on v9) stores the
+          * base shifted right by 8. */
+         uint64_t tls_base = fa_rd64(ls + 8) & BITFIELD64_MASK(48);
+         if ((fa_rd32(ls + 12) >> 28) == 1)
+            tls_base <<= 8;
+         fa_ptr(a, job, "TLS", tls_base, 1);
+         fa_ptr(a, job, "WLS", fa_rd64(ls + 16), 1);
+      }
+   }
+   snprintf(w, sizeof(w), "%s FAU", what);
+   fa_ptr(a, job, w, fau, fau_count * 8);
+   fa_res_table(a, job, fa_rd64(env + 32));
+   return binary;
+}
+
+/* Draw descriptor (DCD), 128 bytes: fragment side of a draw. */
+static void
+fa_draw(struct fault_audit *a, unsigned job, const uint8_t *draw)
+{
+   uint64_t binary = fa_shader_env(a, job, "fragment", draw + 64);
+   uint64_t blend = fa_rd64(draw + 48);
+   unsigned blend_count = blend & 0xf;
+
+   blend &= ~0xfull;
+   fa_ptr(a, job, "depth/stencil descriptor", fa_rd64(draw + 40), 32);
+   /* One 64-bit counter per shader core ID (query pool layout). */
+   fa_ptr(a, job, "occlusion", fa_rd64(draw + 56), a->occl_len);
+   fa_ptr(a, job, "blend descriptors", blend, blend_count * 16);
+   for (unsigned i = 0; i < blend_count; i++) {
+      uint8_t b[16];
+      if (!fa_read(blend + i * 16, b, 16))
+         break;
+      uint32_t pc = fa_rd32(b + 12) & ~0xfu;
+      if ((fa_rd32(b + 8) & 3) == 0 && pc && binary)
+         fa_ptr(a, job, "blend shader", (binary & ~0xffffffffull) | pc, 4);
+   }
+}
+
+static void
+fa_framebuffer(struct fault_audit *a, unsigned job, const uint8_t *frag_job)
+{
+   uint64_t fbd = fa_rd64(frag_job + 40) & ~0x3full;
+   uint8_t p[128];
+
+   fa_ptr(a, job, "framebuffer descriptor", fbd, 128);
+   if (!fa_read(fbd, p, 128))
+      return;
+
+   unsigned rt_count = ((fa_rd32(p + 44) >> 19) & 0xf) + 1;
+   bool has_zs = (fa_rd32(p + 48) >> 21) & 1;
+   uint64_t dcds = fa_rd64(p + 24), tiler = fa_rd64(p + 56);
+   uint32_t modes = fa_rd32(p);
+
+   fa_ptr(a, job, "sample locations", fa_rd64(p + 16), 8);
+   fa_ptr(a, job, "tile enable map", fa_rd64(frag_job + 48), 1);
+   for (unsigned i = 0; i < 3; i++) {
+      uint8_t dcd[128];
+      if (((modes >> (3 * i)) & 7) && fa_read(dcds + i * 128, dcd, 128))
+         fa_draw(a, job, dcd);
+   }
+
+   /* The tiler updates the polygon list pointer (flags in the top bits)
+    * and the heap's bottom/top while it runs: only the 48-bit address and
+    * the CPU-written base + size are checked. */
+   uint8_t t[32];
+   fa_ptr(a, job, "tiler context", tiler, 32);
+   if (fa_read(tiler, t, 32)) {
+      fa_ptr(a, job, "polygon list", fa_rd64(t) & BITFIELD64_MASK(48), 1);
+      uint64_t heap = fa_rd64(t + 24);
+      uint8_t h[32];
+      fa_ptr(a, job, "tiler heap descriptor", heap, 32);
+      if (fa_read(heap, h, 32))
+         fa_ptr(a, job, "tiler heap", fa_rd64(h + 8), fa_rd32(h + 4));
+   }
+
+   uint64_t rts = fbd + 128;
+   if (has_zs) {
+      uint8_t z[64];
+      fa_ptr(a, job, "ZS/CRC extension", rts, 64);
+      if (fa_read(rts, z, 64)) {
+         fa_ptr(a, job, "depth target", fa_rd64(z + 32), 1);
+         fa_ptr(a, job, "stencil target", fa_rd64(z + 48), 1);
+      }
+      rts += 64;
+   }
+   for (unsigned i = 0; i < rt_count; i++) {
+      uint8_t rt[64];
+      if (!fa_read(rts + i * 64, rt, 64))
+         break;
+      fa_ptr(a, job, "render target", fa_rd64(rt + 32), 1);
+   }
+}
+
+/* quiet: PANVK_FAULT_AUDIT_ALL, prints SUSPECT lines only (show_max of
+ * them). Returns the number of suspect addresses. */
+static unsigned
+panvk_fault_audit(struct panvk_kbase_jm *k, struct panvk_batch *batch,
+                  bool frag, bool quiet, unsigned show_max)
+{
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(k->dev->vk.physical);
+   struct fault_audit *a = calloc(1, sizeof(*a));
+   if (!a)
+      return 0;
+   a->show_max = show_max;
+   a->occl_len = 8 * pan_query_core_id_range(&phys_dev->kmod.dev->props);
+
+   unsigned idx = 0;
+   util_dynarray_foreach(&batch->jobs, void *, job) {
+      const uint8_t *j = *job;
+      unsigned type = (fa_rd32(j + 16) >> 1) & BITFIELD_MASK(7);
+
+      /* Bounded: this runs with k->mtx held. */
+      if (idx >= 512) {
+         a->jobs_skipped++;
+         idx++;
+         continue;
+      }
+
+      if (type == 11) { /* malloc vertex */
+         fa_draw(a, idx, j + 128);
+         if (!frag) {
+            fa_shader_env(a, idx, "position", j + 256);
+            fa_shader_env(a, idx, "varying", j + 320);
+         }
+      } else if (type == 9 && frag) {
+         fa_framebuffer(a, idx, j);
+      } else if (type == 4 && !frag) {
+         fa_shader_env(a, idx, "compute", j + 64);
+      }
+      idx++;
+   }
+
+   const unsigned suspects = a->outside + a->freed + a->past_end;
+   if (quiet) {
+      free(a);
+      return suspects;
+   }
+
+   mesa_loge("panvk-fault:   audit: %u GPU addresses checked: %u in no BO, "
+             "%u in freed BOs, %u past the end of their BO, %u null-buffer "
+             "sink%s", a->checked, a->outside, a->freed, a->past_end, a->sink,
+             a->jobs_skipped ? " (first 512 jobs only)" : "");
+   for (unsigned i = 0; i < a->ngrow; i++) {
+      char where[160];
+      kbase_kmod_describe_va(a->grow[i].bo + a->grow[i].max_end - 1, where,
+                             sizeof(where));
+      mesa_loge("panvk-fault:   growable BO 0x%" PRIx64 " +0x%" PRIx64
+                ": %u refs up to offset 0x%" PRIx64 " (%s)", a->grow[i].bo,
+                a->grow[i].size, a->grow[i].refs, a->grow[i].max_end, where);
+   }
+   free(a);
+   return suspects;
+}
+
+static uint64_t
+fa_mem_available_mb(void)
+{
+   FILE *f = fopen("/proc/meminfo", "r");
+   char line[128];
+   uint64_t kb = 0;
+
+   if (!f)
+      return 0;
+   while (fgets(line, sizeof(line), f)) {
+      if (sscanf(line, "MemAvailable: %" SCNu64, &kb) == 1)
+         break;
+   }
+   fclose(f);
+   return kb / 1024;
+}
+
+static void
+panvk_fault_report_batch(struct panvk_kbase_jm *k,
+                         struct panvk_cmd_buffer *cmdbuf,
+                         struct panvk_batch *batch, bool frag)
+{
+   struct kbase_kmod_mem_stats ms = {0};
+   kbase_kmod_mem_stats(&ms);
+   mesa_loge("panvk-fault:   t=%.1fs since device creation, MemAvailable %"
+             PRIu64 " MB, growable BOs backed %" PRIu64 " MB",
+             (os_time_get_nano() - k->t0_ns) / 1e9,
+             fa_mem_available_mb(), ms.growable_commit_bytes >> 20);
+
+   if (!cmdbuf || !batch)
+      return;
+
+   panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+
+   unsigned counts[16] = {0}, done = 0, not_run = 0, shown = 0, idx = 0;
+   util_dynarray_foreach(&batch->jobs, void *, job) {
+      const uint8_t *bytes = *job;
+      uint32_t status, word4;
+      uint64_t fault_ptr;
+
+      memcpy(&status, bytes + 0, sizeof(status));
+      memcpy(&fault_ptr, bytes + 8, sizeof(fault_ptr));
+      memcpy(&word4, bytes + 16, sizeof(word4));
+      unsigned type = (word4 >> 1) & BITFIELD_MASK(7);
+      counts[type & 15]++;
+
+      if ((status & 0xff) == 0x01) {
+         done++;
+      } else if ((status & 0xff) == 0) {
+         not_run++;
+      } else if (shown++ < 8) {
+         char what[160];
+         kbase_kmod_describe_va(fault_ptr, what, sizeof(what));
+         mesa_loge("panvk-fault:   job[%u] %s status 0x%02x (%s) "
+                   "first_incomplete_task %u fault_ptr 0x%" PRIx64 " (%s)",
+                   idx, panvk_job_type_str(type), status & 0xff,
+                   panvk_jd_event_str(status & 0xff),
+                   *(const uint32_t *)(bytes + 4), fault_ptr, what);
+      }
+      idx++;
+   }
+
+   mesa_loge("panvk-fault:   %u jobs: %u done, %u not run, %u other | "
+             "compute %u, malloc-vertex %u, indexed-vertex %u, tiler %u, "
+             "fragment %u, write-value %u, null %u", idx, done, not_run,
+             idx - done - not_run, counts[4], counts[11], counts[10],
+             counts[7], counts[9], counts[2], counts[1]);
+
+   /* The first fault is the one that matters, the rest are its fallout. */
+   if (k->fault_audits++ < 3)
+      panvk_fault_audit(k, batch, frag, false, 12);
+}
+
+static void
+panvk_kbase_fault_report(struct panvk_kbase_jm *k, uint8_t atom,
+                         uint64_t seqno, uint32_t event_code)
+{
+   const struct panvk_kbase_atom_info *ai = &k->atom_info[atom];
+   const bool frag = ai->core_req == 0x01;
+
+   mesa_loge("panvk-fault: event 0x%x (%s) atom %u submission %" PRIu64
+             " %s chain, cmdbuf %p batch %u", event_code,
+             panvk_jd_event_str(event_code), atom, seqno,
+             !ai->batch ? "no job" : frag ? "fragment" : "vertex/tiler/compute",
+             (void *)ai->cmdbuf, ai->batch_idx);
+   panvk_fault_report_batch(k, ai->cmdbuf, ai->batch, frag);
+}
+
+/* A failed atom. kbase kills every job of the context after an MMU fault,
+ * so one fault is followed by many failures: the first 16 are printed, then
+ * one summary line per second, so a log shows whether they keep coming
+ * without slowing the game down (0077). Caller holds k->mtx. */
+static void
+panvk_kbase_report_failure(struct panvk_kbase_jm *k, uint8_t atom,
+                           uint64_t seqno, uint32_t event_code)
+{
+   const uint64_t now = os_time_get_nano();
+
+   if (k->errors >= 16 && now - k->fail_print_ns >= 1000000000ull) {
+      k->fail_print_ns = now;
+      mesa_loge("panvk: %u GPU job chains failed so far (t=%.1fs, last "
+                "event 0x%x submission %" PRIu64 ")", k->errors + 1,
+                (now - k->t0_ns) / 1e9, event_code, seqno);
+   }
+   if (k->errors++ < 16)
+      mesa_loge("panvk: kbase atom %u of submission %" PRIu64
+                " failed: event 0x%x (%s; PANVK_FAULT_REPORT=1 shows what it "
+                "carried)", atom, seqno, event_code,
+                panvk_jd_event_str(event_code));
+   if (k->fault_report && k->fault_reports++ < 64)
+      panvk_kbase_fault_report(k, atom, seqno, event_code);
+}
+
 /* Caller holds k->mtx. */
 static void
 panvk_kbase_handle_event(struct panvk_kbase_jm *k,
@@ -453,15 +1001,21 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
    }
 
    if (ev->event_code != BASE_JD_EVENT_DONE)
-      mesa_loge("panvk: kbase atom %u of submission %" PRIu64
-                " failed: event 0x%x",
-                atom, sub->seqno, ev->event_code);
+      panvk_kbase_report_failure(k, atom, sub->seqno, ev->event_code);
    if (atom == sub->last)
       sub->done = true;
 
    /* Submissions complete in order: retire the finished ones. */
+   const uint64_t now = k->dev->frame_prof.enabled ? os_time_get_nano() : 0;
    while (k->count && k->subs[k->head].done) {
       struct panvk_kbase_sub *s = &k->subs[k->head];
+      if (now) {
+         /* GPU busy = union of [submit, completion seen] (FRAME_PROF). */
+         const uint64_t start = MAX2(s->submit_ns, k->busy_end_ns);
+         if (s->submit_ns && now > start)
+            p_atomic_add(&k->dev->frame_prof.gpu_busy_ns, now - start);
+         k->busy_end_ns = MAX2(k->busy_end_ns, now);
+      }
       panvk_kbase_free_atoms(k, s->nr_atoms, s->atoms);
       if (s->fence_fd >= 0)
          close(s->fence_fd);
@@ -582,6 +1136,7 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
    if (wait_fd >= 0) {
       k->stats.fence_wait_atoms++;
       wait_atom = nums[a];
+      k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){0};
       panvk_kbase_atom(atoms[a], nums[a], (uintptr_t)&wait_fence,
                        BASE_JD_REQ_SOFT_FENCE_WAIT |
                           BASE_JD_REQ_EVENT_ONLY_ON_FAILURE,
@@ -594,6 +1149,9 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
     * one before 8.15, too). */
    for (unsigned i = 0; i < n; i++, a++) {
       uint32_t core_req = jobs[i].core_req;
+      k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){
+         .cmdbuf = jobs[i].cmdbuf, .batch = jobs[i].batch,
+         .core_req = jobs[i].core_req, .batch_idx = jobs[i].batch_idx};
       if (i + 1 < n)
          core_req |= BASE_JD_REQ_EVENT_ONLY_ON_FAILURE;
       if (i == 0)
@@ -607,6 +1165,7 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
    }
 
    if (!n) {
+      k->atom_info[nums[a]] = (struct panvk_kbase_atom_info){0};
       /* Only a wait: a dependency-only atom completes the submission. */
       panvk_kbase_atom(atoms[a], nums[a], 0, BASE_JD_REQ_DEP, prev,
                        BASE_JD_DEP_TYPE_ORDER, wait_atom,
@@ -638,6 +1197,7 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
       .last = nums[nr_atoms - 1],
       .fence_fd = -1,
       .nr_atoms = nr_atoms,
+      .submit_ns = k->dev->frame_prof.enabled ? os_time_get_nano() : 0,
    };
    memcpy(sub->atoms, nums, nr_atoms);
    *seqno = sub->seqno;
@@ -649,9 +1209,12 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
                        uint64_t abs_timeout_ns)
 {
    VkResult result = VK_SUCCESS;
+   const uint64_t t0 = k->dev->frame_prof.enabled ? os_time_get_nano() : 0;
+   bool waited = false;
 
    mtx_lock(&k->mtx);
    while (k->completed_seqno < seqno) {
+      waited = true;
       if (k->lost) {
          result = VK_ERROR_DEVICE_LOST;
          break;
@@ -663,6 +1226,8 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
       }
    }
    mtx_unlock(&k->mtx);
+   if (t0 && waited)
+      p_atomic_add(&k->dev->frame_prof.wait_ns, os_time_get_nano() - t0);
    return result;
 }
 
@@ -700,9 +1265,13 @@ panvk_kbase_flush(struct panvk_kbase_jm *k, struct panvk_kbase_chain *c,
 /* One job chain as its own submission, waited for (the per-chain path). */
 static VkResult
 panvk_kbase_submit_one(struct panvk_kbase_jm *k, uint64_t jc,
-                       uint32_t core_req, uint64_t *seqno)
+                       uint32_t core_req, struct panvk_cmd_buffer *cmdbuf,
+                       struct panvk_batch *batch, unsigned batch_idx,
+                       uint64_t *seqno)
 {
-   const struct panvk_kbase_job job = {.jc = jc, .core_req = core_req};
+   const struct panvk_kbase_job job = {.jc = jc, .core_req = core_req,
+                                       .cmdbuf = cmdbuf, .batch = batch,
+                                       .batch_idx = batch_idx};
 
    mtx_lock(&k->mtx);
    VkResult result = panvk_kbase_submit_locked(k, &job, 1, -1, seqno);
@@ -802,6 +1371,17 @@ panvk_kbase_sync_export_cb(
    return result;
 }
 
+#if PAN_ARCH == 9
+static bool
+reissue_no_va_reset(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = pan_env_flag("PANVK_V9_NO_REISSUE_VA_RESET") != NULL;
+   return v;
+}
+#endif
+
 static bool
 panvk_kbase_chain_has_batch(const struct panvk_kbase_chain *c,
                             const struct panvk_batch *batch)
@@ -819,7 +1399,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_batch *batch, uint32_t *bos,
                          unsigned nr_bos, uint32_t *in_fences,
                          unsigned nr_in_fences,
-                         struct panvk_kbase_chain *chain)
+                         struct panvk_kbase_chain *chain, unsigned batch_idx)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
@@ -827,6 +1407,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    struct panvk_kbase_jm *k = queue->kjm;
    VkResult result;
    int ret;
+
+   if (dev->frame_prof.enabled)
+      p_atomic_inc(&dev->frame_prof.batches);
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
@@ -842,8 +1425,29 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (result != VK_SUCCESS)
          mesa_loge("panvk: wait for a re-issued batch failed: %d", result);
 
-      util_dynarray_foreach(&batch->jobs, void *, job)
+      util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
+#if PAN_ARCH == 9
+         /* PATCH v9 (0072): a MALLOC_VERTEX job writes the vertex packet
+          * pointer and strides into its own Draw.vertex_array (the CPU only
+          * sets packet). Left in place, the next run of the same command
+          * buffer starts from that pointer and faults (kbase 0x58
+          * DATA_INVALID_FAULT on every re-submit, nothing drawn). Put back
+          * what the CPU wrote. PANVK_V9_NO_REISSUE_VA_RESET=1 skips this
+          * (control). The clear above covers words 0-3; the job type is in
+          * word 4. */
+         const uint32_t *hdr = *job;
+         if (((hdr[4] >> 1) & 0x7f) == MALI_JOB_TYPE_MALLOC_VERTEX &&
+             !reissue_no_va_reset()) {
+            uint32_t *va = (uint32_t *)((uint8_t *)(*job) +
+                                        pan_section_offset(MALLOC_VERTEX_JOB,
+                                                           DRAW)) + 2;
+            va[0] = 1; /* packet = true, pointer = 0 */
+            va[1] = 0;
+            va[2] = 0; /* strides */
+         }
+#endif
+      }
 
       /* Reset the tiler before re-issuing the batch */
       if (batch->tiler.ctx_descs.cpu) {
@@ -865,6 +1469,28 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
     * make sure things are GPU-visible. */
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
+   /* PATCH 0077: PANVK_FAULT_AUDIT_ALL=1 checks every batch before it goes
+    * to the GPU (validation of the audit, very slow). */
+   if (k->audit_all) {
+      mtx_lock(&k->mtx);
+      unsigned sus = 0;
+      if (batch->vtc_jc.first_job)
+         sus += panvk_fault_audit(k, batch, false, true,
+                                  k->audit_lines < 40 ? 4 : 0);
+      if (batch->frag_jc.first_job)
+         sus += panvk_fault_audit(k, batch, true, true,
+                                  k->audit_lines < 40 ? 4 : 0);
+      k->audit_batches++;
+      if (sus) {
+         k->audit_suspect_batches++;
+         k->audit_lines += sus;
+      }
+      if ((k->audit_batches & 1023) == 0)
+         mesa_loge("panvk-audit: %u batches checked, %u with suspect "
+                   "addresses", k->audit_batches, k->audit_suspect_batches);
+      mtx_unlock(&k->mtx);
+   }
+
    if (chain) {
       if (chain->nr_jobs + 2 > PANVK_KBASE_MAX_CHAIN ||
           chain->nr_batches + 1 > PANVK_KBASE_MAX_CHAIN) {
@@ -874,10 +1500,12 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       }
       if (batch->vtc_jc.first_job)
          chain->jobs[chain->nr_jobs++] = (struct panvk_kbase_job){
-            .jc = batch->vtc_jc.first_job, .core_req = 0x16};
+            .jc = batch->vtc_jc.first_job, .core_req = 0x16,
+            .cmdbuf = cmdbuf, .batch = batch, .batch_idx = batch_idx};
       if (batch->frag_jc.first_job)
          chain->jobs[chain->nr_jobs++] = (struct panvk_kbase_job){
-            .jc = batch->frag_jc.first_job, .core_req = 0x01};
+            .jc = batch->frag_jc.first_job, .core_req = 0x01,
+            .cmdbuf = cmdbuf, .batch = batch, .batch_idx = batch_idx};
       chain->batches[chain->nr_batches++] = batch;
       batch->issued = true;
       return;
@@ -885,8 +1513,12 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    /* SKIP: dump sebelum submit dipastikan SIGSEGV karena ALLOC_ON_FAULT (commit_pages=0), nggak informatif */
    if (batch->vtc_jc.first_job) {
+      const uint64_t pt0 = dev->frame_prof.enabled ? os_time_get_nano() : 0;
       result = panvk_kbase_submit_one(k, batch->vtc_jc.first_job, 0x16,
+                                      cmdbuf, batch, batch_idx,
                                       &batch->kbase_seqno); /* PATCH eksperimen: dulu 0x16 (CS|T|V) */
+      if (pt0)
+         p_atomic_add(&dev->frame_prof.vtc_ns, os_time_get_nano() - pt0);
       ret = result == VK_SUCCESS ? 0 : -1;
       if (ret)
          mesa_loge("panvk: v9 vtc_jc job chain failed: %d "
@@ -913,8 +1545,12 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
+      const uint64_t pt0 = dev->frame_prof.enabled ? os_time_get_nano() : 0;
       result = panvk_kbase_submit_one(k, batch->frag_jc.first_job, 0x01,
+                                      cmdbuf, batch, batch_idx,
                                       &batch->kbase_seqno);
+      if (pt0)
+         p_atomic_add(&dev->frame_prof.frag_ns, os_time_get_nano() - pt0);
       ret = result == VK_SUCCESS ? 0 : -1;
       if (ret)
          mesa_loge("panvk: v9 frag_jc job chain failed: %d "
@@ -1006,7 +1642,7 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
          if (op->event->kbase) {
             /* The batch has completed (synchronous kbase submit).
              * PANVK_KBASE_EVENT_NO_SET=1: negative control, drop the set. */
-            if (!getenv("PANVK_KBASE_EVENT_NO_SET"))
+            if (!pan_env_flag("PANVK_KBASE_EVENT_NO_SET"))
                p_atomic_set(&op->event->kbase_set, 1);
             break;
          }
@@ -1046,10 +1682,12 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    struct panvk_kbase_jm *k = queue->kjm;
    /* One chain per submit; the per-chain path (8.9's control, trace, dump)
     * waits for every chain, so it keeps the 8.14 waits and signals too. */
-   struct panvk_kbase_chain *chain =
-      panvk_kbase_chain_enabled() ? &k->chain : NULL;
+   struct panvk_kbase_chain *chain = k->chain_enabled ? &k->chain : NULL;
    const bool wait_submit = k->wait_submit || !chain;
    VkResult result;
+   const uint64_t prof_t0 = dev->frame_prof.enabled ? os_time_get_nano() : 0;
+
+   panvk_mem_prof_tick(dev);
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
@@ -1106,6 +1744,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
       struct panvk_cmd_buffer *cmdbuf =
          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+      unsigned batch_idx = 0;
 
       list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
          /* FIXME: should be done at the batch level */
@@ -1170,7 +1809,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
             mesa_loge("panvk: v9 chained submit failed: %d", result);
 
          panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
-                                  nr_in_fences, chain);
+                                  nr_in_fences, chain, batch_idx++);
 
          if (chain && has_event_ops &&
              (result = panvk_kbase_flush(k, chain, true, NULL)))
@@ -1199,7 +1838,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
     * that broken behaviour as a negative control). Now a signalled sync is
     * pending on the submission's seqno: CPU waits block on completion, and
     * a SYNC_FD export becomes a FENCE_TRIGGER atom. */
-   if (!getenv("PANVK_KBASE_NO_SIGNAL")) {
+   if (!k->no_signal) {
       const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT] = {seqno};
 
       for (unsigned i = 0; i < submit->signal_count; i++) {
@@ -1216,6 +1855,12 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       }
    }
 
+   if (prof_t0) {
+      const uint64_t t1 = os_time_get_nano();
+      p_atomic_add(&dev->frame_prof.submit_ns, t1 - prof_t0);
+      p_atomic_inc(&dev->frame_prof.submits);
+      panvk_frame_prof_tick(dev, t1);
+   }
    return VK_SUCCESS;
 }
 
@@ -1251,13 +1896,19 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    k->atom_use[0] = PANVK_KBASE_ATOM_SUB;
    k->nr_free = 255;
    k->cursor = 1;
-   k->wait_submit = os_get_option("PANVK_KBASE_WAIT_SUBMIT") != NULL;
-   k->cpu_fence_wait = os_get_option("PANVK_KBASE_CPU_FENCE_WAIT") != NULL;
-   k->cpu_fence_export = os_get_option("PANVK_KBASE_CPU_FENCE_EXPORT") != NULL;
-   k->trace = os_get_option("PANVK_KBASE_FENCE_TRACE") != NULL;
+   k->wait_submit = pan_env_flag("PANVK_KBASE_WAIT_SUBMIT") != NULL;
+   k->cpu_fence_wait = pan_env_flag("PANVK_KBASE_CPU_FENCE_WAIT") != NULL;
+   k->cpu_fence_export = pan_env_flag("PANVK_KBASE_CPU_FENCE_EXPORT") != NULL;
+   k->trace = pan_env_flag("PANVK_KBASE_FENCE_TRACE") != NULL;
    k->ctrl_no_fence_wait_dep =
-      os_get_option("PANVK_KBASE_CTRL_NO_FENCE_WAIT_DEP") != NULL;
-   k->ctrl_export_early = os_get_option("PANVK_KBASE_CTRL_EXPORT_EARLY") != NULL;
+      pan_env_flag("PANVK_KBASE_CTRL_NO_FENCE_WAIT_DEP") != NULL;
+   k->ctrl_export_early = pan_env_flag("PANVK_KBASE_CTRL_EXPORT_EARLY") != NULL;
+   k->dev = device;
+   k->chain_enabled = panvk_kbase_chain_enabled();
+   k->no_signal = pan_env_flag("PANVK_KBASE_NO_SIGNAL") != NULL;
+   k->t0_ns = os_time_get_nano();
+   k->fault_report = pan_env_flag("PANVK_FAULT_REPORT") != NULL;
+   k->audit_all = pan_env_flag("PANVK_FAULT_AUDIT_ALL") != NULL;
 
    if (mtx_init(&k->mtx, mtx_plain) != thrd_success)
       goto err_free;

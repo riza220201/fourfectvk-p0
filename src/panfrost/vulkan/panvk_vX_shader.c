@@ -48,6 +48,7 @@
 #include "compiler/pan_nir.h"
 #include "pan_shader.h"
 #include "poly/nir/poly_nir.h"
+#include "poly/geometry.h"
 
 #include "vk_log.h"
 #include "vk_pipeline.h"
@@ -55,6 +56,7 @@
 #include "vk_shader.h"
 #include "vk_util.h"
 #include "pan_v9_trace.h"
+#include "panfrost/lib/pan_env.h"
 
 #define FAU_WORD_COUNT 64
 
@@ -257,6 +259,17 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
       break;
 
+#if PAN_ARCH == 9
+   case nir_intrinsic_load_raw_vertex_offset:
+      /* PATCH v9: only the XFB variant emits this (nir_lower_xfb_to_stores
+       * makes gl_VertexIndex raw_vertex_id + raw_vertex_offset). Its compute
+       * job counts vertices from 0 (attribute_offset moves the attribute
+       * fetch only), so the offset is firstVertex, like gallium's
+       * PAN_SYSVAL_VERTEX_INSTANCE_OFFSETS = offset_start. */
+      val = load_sysval(b, graphics, bit_size, vs.first_vertex);
+      break;
+#endif
+
 #if PAN_ARCH < 9
    case nir_intrinsic_load_raw_vertex_offset:
       val = load_sysval(b, graphics, bit_size, vs.raw_vertex_offset);
@@ -324,6 +337,37 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_tess_param_buffer_poly:
       val = load_sysval(b, common, bit_size, tess_param_buffer_poly);
       break;
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      val = load_sysval(b, common, bit_size, geometry_param_buffer_poly);
+      break;
+   case nir_intrinsic_load_provoking_last: {
+      nir_def *last = nir_ine_imm(
+         b, nir_channel(b, load_sysval(b, common, 32, provoking_last_poly), 0),
+         0);
+      val = bit_size == 1 ? last : nir_b2bN(b, last, bit_size);
+      break;
+   }
+   case nir_intrinsic_load_rasterization_stream:
+      /* PATCH v9: geometryStreams, rasterized stream of the draw. */
+      val = nir_u2uN(
+         b,
+         nir_channel(b, load_sysval(b, common, 32, rasterization_stream_poly),
+                     0),
+         bit_size);
+      break;
+   case nir_intrinsic_ro_to_rw_poly:
+      /* PATCH v9: Mali has no read-only aliases of buffers. */
+      val = intr->src[0].ssa;
+      break;
+   case nir_intrinsic_load_stat_query_address_poly: {
+      /* PATCH v9: no pipeline statistics yet. The draw allocates a scratch
+       * area right after struct poly_geometry_params (PANVK_V9_GS_STAT_SINK
+       * bytes) for the counters the GS setup pass bumps. */
+      nir_def *p = load_sysval(b, common, 64, geometry_param_buffer_poly);
+      val = nir_iadd_imm(b, p, sizeof(struct poly_geometry_params) +
+                                  8 * nir_intrinsic_base(intr));
+      break;
+   }
 
    case nir_intrinsic_load_blend_descriptor_pan: {
       uint32_t loc = nir_intrinsic_base(intr);
@@ -479,6 +523,165 @@ lower_gl_pos_layer_writes(nir_builder *b, nir_instr *instr, void *data)
 
    return false;
 }
+
+#if PAN_ARCH == 9
+/* PATCH v9: multiViewport. Mali has one viewport per draw, so a draw whose
+ * shader writes gl_ViewportIndex is recorded once per viewport
+ * (panvk_cmd_draw_v9) and a vertex whose viewport is not the one being drawn
+ * gets an infinite position, like gl_Layer above. Vertex shader: at the
+ * final output copy. Geometry shader: before each EmitVertex, on the API
+ * variables (before libpoly). PANVK_V9_NO_MULTIVIEWPORT=1 hides the
+ * feature (control). */
+static nir_def *
+panvk_v9_viewport_pos(nir_builder *b, nir_def *viewport, nir_def *pos)
+{
+   nir_def *inf_pos = nir_imm_vec4(b, INFINITY, INFINITY, INFINITY, 1.0f);
+   nir_def *ref = load_sysval(b, graphics, 32, viewport_id);
+   return nir_bcsel(b, nir_ieq(b, viewport, ref), pos, inf_pos);
+}
+
+static bool
+lower_gl_pos_viewport_writes(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_copy_deref)
+      return false;
+
+   nir_variable *dst_var = nir_intrinsic_get_var(intr, 0);
+   nir_variable *src_var = nir_intrinsic_get_var(intr, 1);
+   if (!dst_var || dst_var->data.mode != nir_var_shader_out || !src_var ||
+       src_var->data.mode != nir_var_shader_temp)
+      return false;
+
+   if (dst_var->data.location == VARYING_SLOT_VIEWPORT) {
+      b->cursor = nir_instr_remove(instr);
+      return true;
+   }
+
+   if (dst_var->data.location == VARYING_SLOT_POS) {
+      nir_variable *temp_vp_var = data;
+      b->cursor = nir_before_instr(instr);
+      nir_def *vp = nir_load_var(b, temp_vp_var);
+      nir_def *pos = nir_load_var(b, src_var);
+      nir_store_var(b, src_var, panvk_v9_viewport_pos(b, vp, pos), 0xf);
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+lower_viewport_writes(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_VERTEX)
+      return false;
+
+   nir_variable *temp_vp_var = NULL;
+   bool has_vp_var = false;
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_shader_out | nir_var_shader_temp) {
+      if (var->data.location != VARYING_SLOT_VIEWPORT)
+         continue;
+      if (var->data.mode == nir_var_shader_out)
+         has_vp_var = true;
+      else
+         temp_vp_var = var;
+   }
+
+   if (!has_vp_var || !temp_vp_var)
+      return false;
+
+   return nir_shader_instructions_pass(nir, lower_gl_pos_viewport_writes,
+                                       nir_metadata_control_flow,
+                                       temp_vp_var);
+}
+
+struct panvk_v9_gs_vp_ctx {
+   nir_variable *pos, *vp, *shadow;
+};
+
+static bool
+lower_gs_viewport_emit(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct panvk_v9_gs_vp_ctx *ctx = data;
+
+   if (intr->intrinsic != nir_intrinsic_emit_vertex &&
+       intr->intrinsic != nir_intrinsic_emit_vertex_with_counter)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *vp = nir_load_var(b, ctx->vp);
+   nir_def *pos = nir_load_var(b, ctx->shadow);
+   nir_store_var(b, ctx->pos, panvk_v9_viewport_pos(b, vp, pos), 0xf);
+   return true;
+}
+
+static bool
+lower_gs_viewport_writes(nir_shader *nir)
+{
+   struct panvk_v9_gs_vp_ctx ctx = {
+      .pos = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                             VARYING_SLOT_POS),
+      .vp = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                            VARYING_SLOT_VIEWPORT),
+   };
+
+   if (!ctx.pos || !ctx.vp)
+      return false;
+
+   /* The shader's own gl_Position accesses go to a shadow temporary, so the
+    * value can be read back at EmitVertex without an output load (libpoly
+    * does not take load_output). */
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   ctx.shadow = nir_local_variable_create(impl, ctx.pos->type, "pos_vp");
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *deref = nir_instr_as_deref(instr);
+         if (deref->deref_type == nir_deref_type_var && deref->var == ctx.pos) {
+            deref->var = ctx.shadow;
+            deref->modes = nir_var_function_temp;
+         }
+      }
+   }
+   nir_fixup_deref_modes(nir);
+
+   nir_shader_intrinsics_pass(nir, lower_gs_viewport_emit,
+                              nir_metadata_control_flow, &ctx);
+
+   /* Not a hardware output on Mali: keep it as a plain variable. */
+   ctx.vp->data.mode = nir_var_shader_temp;
+   exec_node_remove(&ctx.vp->node);
+   nir_shader_add_variable(nir, ctx.vp);
+   nir_fixup_deref_modes(nir);
+   return nir_progress(true, nir_shader_get_entrypoint(nir), nir_metadata_none);
+}
+
+/* gl_ViewportIndex read by the fragment shader is the viewport of the
+ * draw copy. */
+static bool
+lower_fs_viewport_input(nir_builder *b, nir_intrinsic_instr *intr,
+                        UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_in ||
+       var->data.location != VARYING_SLOT_VIEWPORT)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_u2uN(b, load_sysval(b, graphics, 32, viewport_id),
+                            intr->def.bit_size));
+   return true;
+}
+#endif
 
 static bool
 lower_layer_writes(nir_shader *nir)
@@ -674,8 +877,11 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
     * lowering as Bifrost: drop the layer write and discard
     * primitives whose layer is not the one being drawn.
     * PANVK_V9_HW_LAYER=1 skips this as a negative control. */
-   if (PAN_ARCH < 9 || !getenv("PANVK_V9_HW_LAYER"))
+   if (PAN_ARCH < 9 || !pan_env_flag("PANVK_V9_HW_LAYER"))
       NIR_PASS(_, nir, lower_layer_writes);
+#if PAN_ARCH == 9
+   NIR_PASS(_, nir, lower_viewport_writes);
+#endif
 #endif
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
@@ -762,7 +968,7 @@ panvk_hash_state(struct vk_physical_device *device,
     * device's enabled features, so it is part of the cache key. Both
     * runtime callers pass &vk_device::enabled_features.
     * PANVK_V9_EMU_NO_HASH=1 leaves it out (negative control). */
-   if (!getenv("PANVK_V9_EMU_NO_HASH")) {
+   if (!pan_env_flag("PANVK_V9_EMU_NO_HASH")) {
       const struct vk_device *vkdev =
          container_of(enabled_features, struct vk_device, enabled_features);
       const bool emu = panvk_v9_sampler_emulation_active(vkdev);
@@ -1210,6 +1416,627 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
    }
 }
 
+#if PAN_ARCH >= 9
+/* PATCH v9: the GS RAST variant stores every output slot it knows about,
+ * including slots the API GS never writes (gl_PointSize in a points GS
+ * without it, for example). Those stores carry an undefined value, the
+ * backend drops them but keeps the slot in outputs_written and then trips
+ * over the missing psiz write. Keep only the slots the GS really writes. */
+#if PAN_ARCH == 9
+/* PATCH v9: vertexPipelineStoresAndAtomics. IDVS shades a few vertices
+ * past the end of the draw (an isoline point-mode draw of 10 vertices ran
+ * the TES 12 times). Their memory writes must not happen: a direct
+ * non-indexed draw drops vertex IDs past the vertex count, a tessellated
+ * draw (TES as the hardware VS) drops the 0xffffffff padding entries
+ * written after the tessellator index buffer. Atomics become undefined
+ * there. PANVK_V9_NO_SFX_FILTER=1 disables the filter (control). */
+static bool
+panvk_v9_is_side_effect(const nir_intrinsic_instr *intr, bool *atomic)
+{
+   *atomic = false;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_deref: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      return nir_deref_mode_is_one_of(deref,
+                                      nir_var_mem_ssbo | nir_var_mem_global);
+   }
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      *atomic = true;
+      return nir_deref_mode_is_one_of(deref,
+                                      nir_var_mem_ssbo | nir_var_mem_global);
+   }
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store:
+      return true;
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+      *atomic = true;
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* PATCH v9: cull distances. A primitive is culled when one cull distance
+ * is negative at all its vertices. The hardware VS also outputs
+ * q = (cull < 0) ? 1 : 0 per cull distance (VARYING_SLOT_CULL_PRIMITIVE);
+ * q interpolates to a constant 1 with zero derivatives exactly when every
+ * vertex is culled for that plane (same idea as asahi's
+ * agx_nir_lower_cull_distance). Runs on lowered store_output. */
+struct panvk_v9_cull_ctx {
+   unsigned clip_size, cull_size, base;
+};
+
+static bool
+panvk_v9_lower_cull_write(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct panvk_v9_cull_ctx *ctx = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location != VARYING_SLOT_CLIP_DIST0 &&
+       sem.location != VARYING_SLOT_CLIP_DIST1)
+      return false;
+
+   nir_src *offs = nir_get_io_offset_src(intr);
+   if (!nir_src_is_const(*offs))
+      return false;
+
+   unsigned slot = sem.location - VARYING_SLOT_CLIP_DIST0 +
+                   nir_src_as_uint(*offs);
+   unsigned comp0 = nir_intrinsic_component(intr);
+   unsigned wrmask = nir_intrinsic_write_mask(intr);
+   nir_def *val = intr->src[0].ssa;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   u_foreach_bit(c, wrmask) {
+      unsigned k = slot * 4 + comp0 + c;
+      if (k < ctx->clip_size || k >= ctx->clip_size + ctx->cull_size)
+         continue;
+      unsigned j = k - ctx->clip_size;
+      nir_def *q = nir_b2f32(b, nir_flt_imm(b, nir_channel(b, val, c), 0.0));
+      nir_store_output(b, q, nir_imm_int(b, 0), .base = ctx->base + j / 4,
+                       .component = j % 4, .src_type = nir_type_float32,
+                       .io_semantics.location =
+                          VARYING_SLOT_CULL_PRIMITIVE + j / 4,
+                       .io_semantics.num_slots = 1);
+   }
+   return true;
+}
+
+static void
+panvk_v9_lower_cull_mask(nir_shader *nir, unsigned clip_size,
+                         unsigned cull_size)
+{
+   if (!cull_size || pan_env_flag("PANVK_V9_NO_CLIP_CULL"))
+      return;
+
+   struct panvk_v9_cull_ctx ctx = {
+      .clip_size = clip_size,
+      .cull_size = cull_size,
+   };
+
+   /* New outputs go after the existing driver locations. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            ctx.base = MAX2(ctx.base, nir_intrinsic_base(intr) +
+                                         nir_intrinsic_io_semantics(intr)
+                                            .num_slots);
+         }
+      }
+   }
+
+   if (nir_shader_intrinsics_pass(nir, panvk_v9_lower_cull_write,
+                                  nir_metadata_control_flow, &ctx))
+      nir->info.outputs_written |=
+         BITFIELD64_RANGE(VARYING_SLOT_CULL_PRIMITIVE,
+                          DIV_ROUND_UP(cull_size, 4));
+}
+
+/* Fragment side: discard where an enabled interpolated clip distance is
+ * negative, or where a cull mask is 1 with zero derivatives. The counts
+ * come from the clip_cull sysval of the bound pre-rasterization stage, so
+ * separately compiled fragment shaders work too. When the vertex layout is
+ * known (linked pipeline), only the slots it writes are read and nothing
+ * is added if it has none. Runs on variables, before IO lowering. Returns
+ * whether code was added. PANVK_V9_NO_CLIP_CULL=1 disables (control). */
+static bool
+panvk_v9_lower_fs_clip_cull(nir_shader *nir,
+                            const struct pan_varying_layout *vs_layout)
+{
+   if (pan_env_flag("PANVK_V9_NO_CLIP_CULL"))
+      return false;
+
+   unsigned clip_slots = 2, cull_slots = 2;
+   if (vs_layout) {
+      clip_slots = 0;
+      cull_slots = 0;
+      for (unsigned i = 0; i < 2; i++) {
+         if (pan_varying_layout_find_slot(vs_layout,
+                                          VARYING_SLOT_CLIP_DIST0 + i))
+            clip_slots = i + 1;
+         if (pan_varying_layout_find_slot(vs_layout,
+                                          VARYING_SLOT_CULL_PRIMITIVE + i))
+            cull_slots = i + 1;
+      }
+   }
+   if (!clip_slots && !cull_slots)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   /* Clip and cull distances arrive as one compact float array at
+    * VARYING_SLOT_CLIP_DIST0 (clip first, then cull), the same packing as
+    * the vertex side stores. */
+   nir_variable *clip_var = NULL;
+   unsigned compact_len = 0;
+   if (clip_slots) {
+      clip_var = nir_find_variable_with_location(nir, nir_var_shader_in,
+                                                 VARYING_SLOT_CLIP_DIST0);
+      if (clip_var && clip_var->data.compact)
+         compact_len = MIN2(glsl_get_length(clip_var->type), 8);
+      else if (clip_var && glsl_type_is_array(clip_var->type))
+         clip_slots = MIN2(clip_slots, glsl_get_length(clip_var->type));
+      else if (clip_var)
+         clip_slots = 1;
+      if (!clip_var) {
+         clip_var = nir_variable_create(
+            nir, nir_var_shader_in,
+            glsl_array_type(glsl_vec4_type(), clip_slots, 0), "clip_dist_vp");
+         clip_var->data.location = VARYING_SLOT_CLIP_DIST0;
+      }
+   }
+
+   nir_variable *cull_var = NULL;
+   if (cull_slots) {
+      cull_var = nir_variable_create(
+         nir, nir_var_shader_in,
+         glsl_array_type(glsl_vec4_type(), cull_slots, 0), "cull_mask_vp");
+      cull_var->data.location = VARYING_SLOT_CULL_PRIMITIVE;
+   }
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *cc = load_sysval(&b, graphics, 32, clip_cull);
+   nir_def *nclip = nir_iand_imm(&b, cc, 0xff);
+   nir_def *ncull = nir_ushr_imm(&b, cc, 8);
+
+   nir_push_if(&b, nir_ine_imm(&b, cc, 0));
+   nir_def *kill = nir_imm_false(&b);
+
+   for (unsigned k = 0; k < compact_len; k++) {
+      nir_def *d = nir_load_array_var_imm(&b, clip_var, k);
+      nir_def *on = nir_ult(&b, nir_imm_int(&b, k), nclip);
+      kill = nir_ior(&b, kill, nir_iand(&b, on, nir_flt_imm(&b, d, 0.0)));
+   }
+
+   for (unsigned s = 0; s < (compact_len ? 0 : clip_slots); s++) {
+      nir_def *d = glsl_type_is_array(clip_var->type)
+                      ? nir_load_array_var_imm(&b, clip_var, s)
+                      : nir_load_var(&b, clip_var);
+      for (unsigned c = 0; c < d->num_components && c < 4; c++) {
+         nir_def *on = nir_ult(&b, nir_imm_int(&b, s * 4 + c), nclip);
+         kill = nir_ior(&b, kill,
+                        nir_iand(&b, on, nir_flt_imm(&b, nir_channel(&b, d, c),
+                                                     0.0)));
+      }
+   }
+
+   for (unsigned s = 0; s < cull_slots; s++) {
+      nir_def *q = nir_load_array_var_imm(&b, cull_var, s);
+      nir_def *flat = nir_fadd(&b, nir_fabs(&b, nir_ddx(&b, q)),
+                               nir_fabs(&b, nir_ddy(&b, q)));
+      for (unsigned c = 0; c < 4; c++) {
+         nir_def *on = nir_ult(&b, nir_imm_int(&b, s * 4 + c), ncull);
+         nir_def *all = nir_iand(
+            &b, nir_fgt_imm(&b, nir_channel(&b, q, c), 0.999),
+            nir_flt_imm(&b, nir_channel(&b, flat, c), 1e-5));
+         kill = nir_ior(&b, kill, nir_iand(&b, on, all));
+      }
+   }
+
+   nir_demote_if(&b, kill);
+   nir_pop_if(&b, NULL);
+
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+/* PATCH v9: with tessellation, gl_PrimitiveIDIn of the geometry shader is
+ * the patch the primitive comes from (CTS
+ * geometry.builtin_variable.primitive_id.matching); libpoly gives the index
+ * of the tessellated primitive. The TES compute variant that feeds the GS
+ * also stores its patch ID in the VARYING_SLOT_PRIMITIVE_ID slot of each
+ * vertex, and the GS reads it back from its first input vertex when the
+ * previous stage wrote that slot (vertex output mask, known at draw time).
+ * Runs on lowered IO. PANVK_V9_GS_PRIM_ID_RAW=1 keeps libpoly's value
+ * (control). */
+static void
+panvk_v9_tes_store_patch_id(nir_shader *nir)
+{
+   if (pan_env_flag("PANVK_V9_GS_PRIM_ID_RAW") ||
+       (nir->info.outputs_written & VARYING_BIT_PRIMITIVE_ID))
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   unsigned base = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_store_output)
+            base = MAX2(base, nir_intrinsic_base(intr) +
+                                 nir_intrinsic_io_semantics(intr).num_slots);
+      }
+   }
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_store_output(&b, nir_load_primitive_id(&b), nir_imm_int(&b, 0),
+                    .base = base, .src_type = nir_type_uint32,
+                    .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
+                    .io_semantics.num_slots = 1);
+   nir->info.outputs_written |= VARYING_BIT_PRIMITIVE_ID;
+   nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+static void
+panvk_v9_gs_prim_id_from_tes(nir_shader *nir)
+{
+   if (pan_env_flag("PANVK_V9_GS_PRIM_ID_RAW"))
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct util_dynarray list;
+   util_dynarray_init(&list, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_load_primitive_id)
+            util_dynarray_append(&list, instr);
+      }
+   }
+
+   util_dynarray_foreach(&list, nir_instr *, pinstr) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(*pinstr);
+      nir_builder b = nir_builder_at(nir_before_instr(&intr->instr));
+      nir_def *mask = nir_load_vs_outputs_poly(&b);
+      nir_def *has = nir_i2b(&b, nir_iand_imm(&b, mask,
+                                              VARYING_BIT_PRIMITIVE_ID));
+      nir_push_if(&b, has);
+      nir_def *from_tes = nir_load_per_vertex_input(
+         &b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+         .dest_type = nir_type_uint32,
+         .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID,
+         .io_semantics.num_slots = 1);
+      nir_push_else(&b, NULL);
+      nir_def *raw = nir_load_primitive_id(&b);
+      nir_pop_if(&b, NULL);
+      nir_def_replace(&intr->def, nir_if_phi(&b, from_tes, raw));
+   }
+
+   util_dynarray_fini(&list);
+   nir_progress(true, impl, nir_metadata_none);
+}
+
+static void
+panvk_v9_gate_side_effects(nir_shader *nir, bool tes)
+{
+   if (!nir->info.writes_memory || pan_env_flag("PANVK_V9_NO_SFX_FILTER"))
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct util_dynarray list;
+   util_dynarray_init(&list, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         bool atomic;
+         if (instr->type == nir_instr_type_intrinsic &&
+             panvk_v9_is_side_effect(nir_instr_as_intrinsic(instr), &atomic))
+            util_dynarray_append(&list, instr);
+      }
+   }
+
+   if (!util_dynarray_num_elements(&list, nir_instr *)) {
+      util_dynarray_fini(&list);
+      return;
+   }
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *valid;
+   if (tes) {
+      /* Runs before poly_nir_lower_tes, which lowers the coordinate load.
+       * Padding points read u = 0xffffffff / 65536. */
+      nir_def *u = nir_channel(&b, nir_load_tess_coord_xy(&b), 0);
+      valid = nir_iand(&b, nir_ine_imm(&b, nir_load_vertex_id(&b), 0xffffffff),
+                       nir_fle_imm(&b, u, 1.5));
+   } else {
+      /* load_vertex_id_zero_base was already expanded by
+       * panvk_preprocess_nir and the backend does not take it. */
+      nir_def *count = load_sysval(&b, graphics, 32, sfx_vertex_count);
+      nir_def *id = nir_isub(&b, nir_load_vertex_id(&b),
+                             load_sysval(&b, graphics, 32, vs.first_vertex));
+      valid = nir_ult(&b, id, count);
+   }
+
+   util_dynarray_foreach(&list, nir_instr *, pinstr) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(*pinstr);
+      bool atomic;
+      panvk_v9_is_side_effect(intr, &atomic);
+
+      b.cursor = nir_before_instr(&intr->instr);
+      /* Zero, not undef: the backend cannot take an undef phi source. */
+      nir_def *undef =
+         atomic ? nir_imm_zero(&b, intr->def.num_components, intr->def.bit_size)
+                : NULL;
+      nir_push_if(&b, valid);
+      nir_instr *clone = nir_instr_clone(nir, &intr->instr);
+      nir_builder_instr_insert(&b, clone);
+      nir_pop_if(&b, NULL);
+      if (atomic) {
+         nir_def *res =
+            nir_if_phi(&b, &nir_instr_as_intrinsic(clone)->def, undef);
+         nir_def_rewrite_uses(&intr->def, res);
+      }
+      nir_instr_remove(&intr->instr);
+   }
+
+   util_dynarray_fini(&list);
+   nir_progress(true, impl, nir_metadata_none);
+}
+
+/* PATCH v9: vertexPipelineStoresAndAtomics with a geometry shader. The API
+ * memory writes of the GS must run once per GS invocation, which is the MAIN
+ * compute pass. RAST re-runs the GS once per output vertex, COUNT and the XFB
+ * copy re-run it too, so their copies of the API stores and atomics are
+ * removed (atomic results become undefined there). At this point the API
+ * accesses are still derefs; libpoly's own XFB/index stores are store_global
+ * and stay. PANVK_V9_GS_SFX_ALL=1 keeps them in every part (control). */
+static bool
+panvk_v9_strip_api_side_effects(nir_builder *b, nir_intrinsic_instr *intr,
+                                UNUSED void *data)
+{
+   bool atomic = false;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_deref: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      if (!nir_deref_mode_is_one_of(deref,
+                                    nir_var_mem_ssbo | nir_var_mem_global))
+         return false;
+      break;
+   }
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      if (!nir_deref_mode_is_one_of(deref,
+                                    nir_var_mem_ssbo | nir_var_mem_global))
+         return false;
+      atomic = true;
+      break;
+   }
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_image_store:
+      break;
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+      atomic = true;
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (atomic)
+      nir_def_rewrite_uses(&intr->def, nir_imm_zero(b, intr->def.num_components,
+                                                    intr->def.bit_size));
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+#endif
+
+/* PATCH v9: transform feedback from a geometry shader. libpoly writes the
+ * XFB buffers from the RAST program, once per rasterized vertex. On Mali
+ * the hardware vertex shader is split by IDVS and the draw may be culled or
+ * discarded, so the stores are taken out of the hardware RAST and a copy of
+ * RAST runs as a COMPUTE job over the entries of the rasterization draw
+ * instead (same idea as the VS XFB variant). */
+static bool
+panvk_v9_strip_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
+                         void *data)
+{
+   const nir_intrinsic_op *op = data;
+
+   if (intr->intrinsic != *op)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+struct panvk_v9_xfb_ids {
+   nir_def *vid, *iid;
+};
+
+static bool
+panvk_v9_replace_ids(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct panvk_v9_xfb_ids *ids = data;
+
+   if (intr->intrinsic == nir_intrinsic_load_vertex_id)
+      nir_def_replace(&intr->def, ids->vid);
+   else if (intr->intrinsic == nir_intrinsic_load_instance_id)
+      nir_def_replace(&intr->def, ids->iid);
+   else
+      return false;
+
+   return true;
+}
+
+static void
+panvk_v9_gs_rast_to_xfb(nir_shader *nir, enum poly_gs_shape shape)
+{
+   const nir_intrinsic_op store_output = nir_intrinsic_store_output;
+   nir_shader_intrinsics_pass(nir, panvk_v9_strip_intrinsic,
+                              nir_metadata_control_flow,
+                              (void *)&store_output);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+
+   /* x walks the rasterization draw (index buffer entry or vertex), y its
+    * instances, like the draw built by launch_gs_v9. */
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_def *x = nir_channel(&b, gid, 0);
+   struct panvk_v9_xfb_ids ids = {
+      .vid = x,
+      .iid = nir_channel(&b, gid, 1),
+   };
+   nir_def *valid = nir_imm_true(&b);
+
+   if (poly_gs_indexed(shape)) {
+      /* launch_gs_v9 stores the index buffer address (dynamic, or the
+       * static topology) in output_index_buffer. Restart entries are not
+       * vertices. */
+      nir_def *p = nir_load_geometry_param_buffer_poly(&b);
+      nir_def *ib = nir_load_global_constant(
+         &b, 1, 64,
+         nir_iadd_imm(&b, p,
+                      offsetof(struct poly_geometry_params,
+                               output_index_buffer)),
+         .align_mul = 8);
+
+      if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+         ids.vid = nir_load_global(
+            &b, 1, 32, nir_iadd(&b, ib, nir_u2u64(&b, nir_imul_imm(&b, x, 4))),
+            .align_mul = 4);
+         valid = nir_ine_imm(&b, ids.vid, 0xffffffff);
+      } else {
+         nir_def *word = nir_load_global(
+            &b, 1, 32,
+            nir_iadd(&b, ib, nir_u2u64(&b, nir_iand_imm(&b, x, ~3u))),
+            .align_mul = 4);
+         ids.vid = nir_ubitfield_extract(
+            &b, word, nir_imul_imm(&b, nir_iand_imm(&b, x, 3), 8),
+            nir_imm_int(&b, 8));
+         valid = nir_ine_imm(&b, ids.vid, 0xff);
+      }
+   }
+
+   nir_push_if(&b, valid);
+   nir_cf_reinsert(&body, b.cursor);
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+
+   nir_shader_intrinsics_pass(nir, panvk_v9_replace_ids, nir_metadata_none,
+                              &ids);
+   nir_remove_dead_variables(nir, nir_var_shader_in | nir_var_shader_out,
+                             NULL);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
+/* PATCH v9: libpoly emits the RAST output stores with base 0, but the
+ * panfrost varying layout is indexed by the store base (driver_location),
+ * so every output landed in slot 0. Use the driver_location of the output
+ * variable for that location, as nir_lower_io would have. */
+struct panvk_v9_rast_bases {
+   int base[VARYING_SLOT_MAX];
+};
+
+static bool
+panvk_v9_fix_rast_output_base(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   const struct panvk_v9_rast_bases *map = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   if (loc >= VARYING_SLOT_MAX || map->base[loc] < 0)
+      return false;
+
+   nir_intrinsic_set_base(intr, map->base[loc]);
+   return true;
+}
+
+static void
+panvk_v9_fix_rast_output_bases(nir_shader *nir)
+{
+   struct panvk_v9_rast_bases map;
+   int next = 0;
+
+   for (unsigned i = 0; i < VARYING_SLOT_MAX; i++)
+      map.base[i] = -1;
+
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location < VARYING_SLOT_MAX) {
+         map.base[var->data.location] = var->data.driver_location;
+         next = MAX2(next, (int)var->data.driver_location +
+                              (int)glsl_count_attribute_slots(var->type,
+                                                              false));
+      }
+   }
+
+   /* Slots without a variable (default point size) go after the others. */
+   u_foreach_bit64(loc, nir->info.outputs_written) {
+      if (loc < VARYING_SLOT_MAX && map.base[loc] < 0)
+         map.base[loc] = next++;
+   }
+
+   nir_shader_intrinsics_pass(nir, panvk_v9_fix_rast_output_base,
+                              nir_metadata_control_flow, &map);
+}
+
+static bool
+panvk_v9_drop_unwritten_output(nir_builder *b, nir_intrinsic_instr *intr,
+                               void *data)
+{
+   const uint64_t *written = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   if (loc < 64 && (*written & BITFIELD64_BIT(loc)))
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+#endif
+
 static void
 panvk_lower_nir_io(nir_shader *nir)
 {
@@ -1249,7 +2076,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
     * filtering. PANVK_V9_NO_MINMAX=1 skips it (negative control; compile
     * time, needs MESA_SHADER_CACHE_DISABLE=true). */
    if (panvk_v9_sampler_emulation_active(&dev->vk) &&
-       !getenv("PANVK_V9_NO_MINMAX"))
+       !pan_env_flag("PANVK_V9_NO_MINMAX"))
       NIR_PASS(_, nir, panvk_v9_lower_sampler_minmax);
 #endif
 
@@ -1652,6 +2479,27 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
 
 static const struct vk_shader_ops panvk_shader_ops;
 
+#if PAN_ARCH == 9
+static bool
+panvk_v9_widen_tcs_barrier(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_barrier)
+      return false;
+
+   bool progress = false;
+   if (nir_intrinsic_execution_scope(intr) == SCOPE_SUBGROUP) {
+      nir_intrinsic_set_execution_scope(intr, SCOPE_WORKGROUP);
+      progress = true;
+   }
+   if (nir_intrinsic_memory_scope(intr) == SCOPE_SUBGROUP) {
+      nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+      progress = true;
+   }
+   return progress;
+}
+#endif
+
 static VkResult
 panvk_compile_shader(struct panvk_device *dev,
                      struct vk_shader_compile_info *info,
@@ -1689,6 +2537,30 @@ panvk_compile_shader(struct panvk_device *dev,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
    };
 
+#if PAN_ARCH == 9
+   /* PATCH v9: uniform/storage texel buffers follow the uniform/storage
+    * buffer robustness. PANVK_V9_TEXEL_OOB_HW=1 keeps the hardware values
+    * (control). */
+   inputs.robust_texel_buffers =
+      (info->robustness->uniform_buffers ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT ||
+       info->robustness->storage_buffers ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) &&
+      !pan_env_flag("PANVK_V9_TEXEL_OOB_HW");
+#endif
+
+   /* lower_layer_writes() removed the gl_Layer store, the variable stays. */
+   shader->writes_layer =
+      nir_find_variable_with_location(info->nir, nir_var_shader_out,
+                                      VARYING_SLOT_LAYER) != NULL;
+   shader->writes_viewport =
+      nir_find_variable_with_location(info->nir, nir_var_shader_out,
+                                      VARYING_SLOT_VIEWPORT) != NULL;
+   if (info->stage != MESA_SHADER_FRAGMENT) {
+      shader->clip_size = info->nir->info.clip_distance_array_size;
+      shader->cull_size = info->nir->info.cull_distance_array_size;
+   }
+
    switch (info->stage) {
    case MESA_SHADER_VERTEX: {
       const enum panvk_vs_variant compile_order[] = {
@@ -1701,14 +2573,19 @@ panvk_compile_shader(struct panvk_device *dev,
          const enum panvk_vs_variant v = compile_order[pass];
          struct panvk_shader_variant *variant = &shader->variants[v];
 
+         /* PATCH v9: the JM path runs the XFB variant as a compute job too
+          * (jm/panvk_vX_cmd_xfb.c, launch_xfb_v9). */
          if (v == PANVK_VS_VARIANT_XFB &&
-             (PAN_ARCH < 10 || info->nir->xfb_info == NULL))
+             (PAN_ARCH < 9 || info->nir->xfb_info == NULL))
             continue;
 
+         /* PATCH v9: the JM path runs this variant as compute before the
+          * TCS too (jm/panvk_vX_cmd_draw.c, launch_tess_v9). */
          if (v == PANVK_VS_VARIANT_SW &&
-             (PAN_ARCH < 10 ||
+             (PAN_ARCH < 9 ||
               !(info->next_stage_mask &
-                VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)))
+                (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                 VK_SHADER_STAGE_GEOMETRY_BIT))))
             continue;
 
          /* The hardware variant consumes the original NIR. */
@@ -1723,6 +2600,18 @@ panvk_compile_shader(struct panvk_device *dev,
          } else {
             inputs.no_idvs = false;
          }
+
+#if PAN_ARCH == 9
+         /* vertexPipelineStoresAndAtomics: the hardware variant does the
+          * API memory writes (IDVS overshoot filtered), the XFB copy must
+          * not do them a second time. */
+         if (v == PANVK_VS_VARIANT_HW)
+            panvk_v9_gate_side_effects(nir, false);
+         else if (v == PANVK_VS_VARIANT_XFB && nir->info.writes_memory)
+            NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                     panvk_v9_strip_api_side_effects,
+                     nir_metadata_control_flow, NULL);
+#endif
 
          panvk_lower_nir(dev, nir, info->set_layout_count,
                          info->set_layouts, info->robustness,
@@ -1806,6 +2695,11 @@ panvk_compile_shader(struct panvk_device *dev,
 
          if (v == PANVK_VS_VARIANT_XFB)
             NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+#if PAN_ARCH == 9
+         if (v == PANVK_VS_VARIANT_HW)
+            panvk_v9_lower_cull_mask(nir, shader->clip_size,
+                                     shader->cull_size);
+#endif
 
          struct pan_varying_layout varying_layout;
          if (v != PANVK_VS_VARIANT_SW) {
@@ -1875,6 +2769,16 @@ panvk_compile_shader(struct panvk_device *dev,
       nir_assign_io_var_locations(nir, nir_var_shader_out);
       panvk_lower_nir_io(nir);
       NIR_PASS(_, nir, poly_nir_lower_tcs, false);
+#if PAN_ARCH == 9
+      /* poly_nir_lower_tcs narrows output barriers to subgroup scope since a
+       * patch fits in an AGX subgroup (32). Mali subgroups are 16 wide, so a
+       * larger output patch spans several warps and needs a real workgroup
+       * barrier. */
+      if (shader->tess.tcs_output_patch_size > pan_subgroup_size(PAN_ARCH) &&
+          !pan_env_flag("PANVK_V9_TCS_SUBGROUP_BARRIER"))
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  panvk_v9_widen_tcs_barrier, nir_metadata_all, NULL);
+#endif
       NIR_PASS(_, nir, poly_nir_lower_sysvals);
 
       nir->info.stage = MESA_SHADER_COMPUTE;
@@ -1907,6 +2811,69 @@ panvk_compile_shader(struct panvk_device *dev,
       shader->tess.info.spacing = nir->info.tess.spacing;
       shader->tess.info.mode = nir->info.tess._primitive_mode;
 
+#if PAN_ARCH == 9
+      /* PATCH v9: a GS after tessellation reads the TES outputs from memory.
+       * The SW variant runs the TES as compute over the tessellator's index
+       * buffer and stores its outputs like the VS SW variant
+       * (poly_nir_lower_tes(false) + poly_nir_lower_vs_before_gs, as
+       * Honeykrisp). */
+      if (info->next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT) {
+         struct panvk_shader_variant *sw_variant =
+            &shader->variants[PANVK_TES_VARIANT_SW];
+         nir_shader *sw = nir_shader_clone(NULL, nir);
+
+         nir_assign_io_var_locations(sw, nir_var_shader_in);
+         nir_assign_io_var_locations(sw, nir_var_shader_out);
+         panvk_lower_nir_io(sw);
+#if PAN_ARCH == 9
+         panvk_v9_tes_store_patch_id(sw);
+#endif
+         nir_shader_gather_info(sw, nir_shader_get_entrypoint(sw));
+         shader->tess.vs_outputs = sw->info.outputs_written;
+
+         NIR_PASS(_, sw, poly_nir_lower_tes, false);
+         NIR_PASS(_, sw, poly_nir_lower_sysvals);
+
+         /* Lower the descriptors as the hardware variant does (a TES
+          * lowered to a hardware VS), so both variants share desc_info. */
+         sw->info.stage = MESA_SHADER_VERTEX;
+         memset(&sw->info.vs, 0, sizeof(sw->info.vs));
+         sw->info.vs.tes_poly = true;
+         panvk_lower_nir(dev, sw, info->set_layout_count, info->set_layouts,
+                         info->robustness, state, &shader->desc_info, false);
+
+         NIR_PASS(_, sw, poly_nir_lower_vs_before_gs);
+         sw->info.stage = MESA_SHADER_COMPUTE;
+         memset(&sw->info.cs, 0, sizeof(sw->info.cs));
+         sw->info.workgroup_size[0] = 1;
+         sw->info.workgroup_size[1] = 1;
+         sw->info.workgroup_size[2] = 1;
+         sw->xfb_info = NULL;
+         NIR_PASS(_, sw, poly_nir_lower_sysvals);
+         nir_shader_gather_info(sw, nir_shader_get_entrypoint(sw));
+
+         inputs.varying_layout = NULL;
+         sw_variant->own_bin = true;
+         result = panvk_compile_nir(dev, sw, info->flags, &inputs, state,
+                                    noperspective_varyings,
+                                    &shader->desc_info, sw_variant);
+         ralloc_free(sw);
+         if (result != VK_SUCCESS) {
+            panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+            return result;
+         }
+      }
+#endif
+
+#if PAN_ARCH == 9
+      /* Only the SW variant runs when a GS follows (the GS RAST is the
+       * hardware VS). A TES that writes gl_PointSize but not gl_Position
+       * also trips the IDVS point size handling of the backend. */
+      if ((info->next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT) &&
+          !(info->next_stage_mask & VK_SHADER_STAGE_FRAGMENT_BIT))
+         break;
+#endif
+
       /* Keep input and output driver locations independent.  In particular,
        * the TES position output must retain the VS output base expected by
        * pan_nir_lower_vs_outputs() after poly_nir_lower_tes() changes the
@@ -1914,11 +2881,17 @@ panvk_compile_shader(struct panvk_device *dev,
       nir_assign_io_var_locations(nir, nir_var_shader_in);
       nir_assign_io_var_locations(nir, nir_var_shader_out);
       panvk_lower_nir_io(nir);
+#if PAN_ARCH == 9
+      panvk_v9_gate_side_effects(nir, true);
+#endif
       NIR_PASS(_, nir, poly_nir_lower_tes, true);
       NIR_PASS(_, nir, poly_nir_lower_sysvals);
 
       panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
                       info->robustness, state, &shader->desc_info, false);
+#if PAN_ARCH == 9
+      panvk_v9_lower_cull_mask(nir, shader->clip_size, shader->cull_size);
+#endif
 
       struct pan_varying_layout varying_layout;
       pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
@@ -1936,6 +2909,136 @@ panvk_compile_shader(struct panvk_device *dev,
       break;
    }
 
+#if PAN_ARCH >= 9
+   case MESA_SHADER_GEOMETRY: {
+      /* PATCH v9: geometry shaders through libpoly, the Honeykrisp design.
+       * The API vertex shader runs as compute first (SW variant), MAIN runs
+       * the GS once per input primitive as compute and writes the index
+       * buffer (and XFB), RAST is the hardware VS of the draw and re-runs
+       * the GS for the one output vertex it shades. 🧪 EXPERIMENTAL. */
+      nir_shader *nir = info->nir;
+
+#if PAN_ARCH == 9
+      NIR_PASS(_, nir, lower_gs_viewport_writes);
+#endif
+      nir_assign_io_var_locations(nir, nir_var_shader_in);
+      nir_assign_io_var_locations(nir, nir_var_shader_out);
+      panvk_lower_nir_io(nir);
+#if PAN_ARCH == 9
+      panvk_v9_gs_prim_id_from_tes(nir);
+      shader->gs.invocations = MAX2(nir->info.gs.invocations, 1);
+#endif
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      uint64_t gs_outputs_written = nir->info.outputs_written;
+
+      nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
+               &shader->gs.info);
+
+      nir_shader *xfb = NULL;
+      if (shader->gs.info.xfb && rast) {
+         xfb = nir_shader_clone(NULL, rast);
+         panvk_v9_gs_rast_to_xfb(xfb, shader->gs.info.shape);
+
+         const nir_intrinsic_op store_global = nir_intrinsic_store_global;
+         NIR_PASS(_, rast, nir_shader_intrinsics_pass,
+                  panvk_v9_strip_intrinsic, nir_metadata_control_flow,
+                  (void *)&store_global);
+      }
+
+      struct {
+         nir_shader *nir;
+         enum panvk_gs_variant v;
+      } parts[] = {
+         {nir, PANVK_GS_VARIANT_MAIN},
+         {count, PANVK_GS_VARIANT_COUNT},
+         {pre_gs, PANVK_GS_VARIANT_PRE},
+         {xfb, PANVK_GS_VARIANT_XFB},
+         {rast, PANVK_GS_VARIANT_RAST},
+      };
+
+      result = VK_SUCCESS;
+      for (unsigned i = 0; i < ARRAY_SIZE(parts); i++) {
+         nir_shader *pnir = parts[i].nir;
+         if (!pnir || result != VK_SUCCESS) {
+            if (pnir && pnir != nir)
+               ralloc_free(pnir);
+            continue;
+         }
+
+         struct panvk_shader_variant *variant = &shader->variants[parts[i].v];
+         const bool hw = parts[i].v == PANVK_GS_VARIANT_RAST;
+         struct panvk_shader_desc_info *desc_info =
+            hw ? &shader->desc_info : &shader->gs.cs_desc_info[parts[i].v];
+
+         NIR_PASS(_, pnir, poly_nir_lower_sysvals);
+
+         if (!hw) {
+            /* One invocation per workgroup, the dispatch counts are the
+             * exact primitive/instance counts. */
+            pnir->info.stage = MESA_SHADER_COMPUTE;
+            memset(&pnir->info.cs, 0, sizeof(pnir->info.cs));
+            pnir->info.workgroup_size[0] = 1;
+            pnir->info.workgroup_size[1] = 1;
+            pnir->info.workgroup_size[2] = 1;
+         }
+
+#if PAN_ARCH == 9
+         if (parts[i].v != PANVK_GS_VARIANT_MAIN &&
+             nir->info.writes_memory && !pan_env_flag("PANVK_V9_GS_SFX_ALL")) {
+            NIR_PASS(_, pnir, nir_shader_intrinsics_pass,
+                     panvk_v9_strip_api_side_effects,
+                     nir_metadata_control_flow, NULL);
+            NIR_PASS(_, pnir, nir_opt_dce);
+         }
+#endif
+
+         if (hw) {
+            NIR_PASS(_, pnir, nir_shader_intrinsics_pass,
+                     panvk_v9_drop_unwritten_output,
+                     nir_metadata_control_flow, &gs_outputs_written);
+            NIR_PASS(_, pnir, nir_opt_dce);
+            nir_shader_gather_info(pnir, nir_shader_get_entrypoint(pnir));
+            /* PANVK_V9_GS_RAST_BASE0=1 keeps libpoly's base 0 (control). */
+            if (!pan_env_flag("PANVK_V9_GS_RAST_BASE0"))
+               panvk_v9_fix_rast_output_bases(pnir);
+#if PAN_ARCH == 9
+            panvk_v9_lower_cull_mask(pnir, shader->clip_size,
+                                     shader->cull_size);
+#endif
+         }
+
+         panvk_lower_nir(dev, pnir, info->set_layout_count, info->set_layouts,
+                         info->robustness, state, desc_info, false);
+
+         struct pan_varying_layout varying_layout;
+         if (hw) {
+            /* Upstream e0907dc5/b2c14af8 removed trust_highp_types and the
+             * mediump argument (3-argument call, as on the TES path). */
+            pan_varying_collect_formats(&varying_layout, pnir, inputs.gpu_id);
+            pan_build_varying_layout_compact(&varying_layout, pnir,
+                                             inputs.gpu_id);
+            inputs.varying_layout = &varying_layout;
+         } else {
+            inputs.varying_layout = NULL;
+         }
+
+         variant->own_bin = true;
+         result = panvk_compile_nir(dev, pnir, info->flags, &inputs, state,
+                                    hw ? noperspective_varyings : NULL,
+                                    desc_info, variant);
+         if (pnir != nir)
+            ralloc_free(pnir);
+      }
+
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+      break;
+   }
+#endif
+
    case MESA_SHADER_FRAGMENT: {
       struct panvk_shader_variant *variant =
          (struct panvk_shader_variant *)panvk_shader_only_variant(shader);
@@ -1945,6 +3048,12 @@ panvk_compile_shader(struct panvk_device *dev,
       if (state && state->ms && state->ms->sample_shading_enable)
          nir->info.fs.uses_sample_shading = true;
 
+#if PAN_ARCH == 9
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fs_viewport_input,
+               nir_metadata_control_flow, NULL);
+      nir_remove_dead_variables(nir, nir_var_shader_in, NULL);
+#endif
+
       /* We need to lower input attachments before we lower descriptors */
       NIR_PASS(_, nir, panvk_per_arch(nir_lower_input_attachment_loads),
                state, &variant->fs.input_attachment_read);
@@ -1953,6 +3062,12 @@ panvk_compile_shader(struct panvk_device *dev,
                &variant->fs.tile_image_color_read,
                &variant->fs.tile_image_z_read,
                &variant->fs.tile_image_s_read);
+
+#if PAN_ARCH == 9
+      const bool api_discard = nir->info.fs.uses_discard;
+      variant->fs.clip_cull =
+         panvk_v9_lower_fs_clip_cull(nir, vs_varying_layout);
+#endif
 
       /* Lower input intrinsics for fragment shaders early to get the max
        * number of varying loads, as this number is required during descriptor
@@ -1995,6 +3110,21 @@ panvk_compile_shader(struct panvk_device *dev,
       shader->desc_info.fs_varying_attr_desc_count =
          variant->info.bifrost.uses_ld_var ? nir->num_inputs : 0;
       #endif
+
+#if PAN_ARCH == 9
+      /* The clip/cull discard only runs when the bound pre-rasterization
+       * stage has distances: keep the API discard state for the early-ZS
+       * table of the other draws (panvk_v9_fs_earlyzs_lut). */
+      if (variant->fs.clip_cull) {
+         variant->info.fs.can_discard = api_discard;
+         variant->fs.earlyzs_lut =
+            pan_earlyzs_analyze(&variant->info, PAN_ARCH);
+         struct pan_shader_info clip_info = variant->info;
+         clip_info.fs.can_discard = true;
+         variant->fs.earlyzs_lut_clip =
+            pan_earlyzs_analyze(&clip_info, PAN_ARCH);
+      }
+#endif
 
       break;
    }
@@ -2121,11 +3251,28 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     */
    static int allow_tess_gs = -1;
    if (allow_tess_gs < 0)
-      allow_tess_gs = getenv("PANVK_V9_ALLOW_TESS_GS") != NULL;
+      allow_tess_gs = pan_env_flag("PANVK_V9_ALLOW_TESS_GS") != NULL;
    for (i = 0; !allow_tess_gs && i < shader_count; i++) {
       mesa_shader_stage s = infos[i].stage;
-      if (s != MESA_SHADER_TESS_CTRL && s != MESA_SHADER_TESS_EVAL &&
-          s != MESA_SHADER_GEOMETRY)
+      /* PATCH v9: tessellation runs through libpoly now (launch_tess_v9);
+       * PANVK_V9_NO_TESS=1 rejects it again (negative control). Geometry
+       * shaders are still refused. */
+      const bool tess = s == MESA_SHADER_TESS_CTRL || s == MESA_SHADER_TESS_EVAL;
+      if (tess && !pan_env_flag("PANVK_V9_NO_TESS"))
+         continue;
+      /* PATCH v9: geometry shaders run through libpoly too (launch_gs_v9),
+       * PANVK_V9_NO_GS=1 rejects them again (negative control). A GS after
+       * tessellation is not implemented yet and is still refused. */
+      if (s == MESA_SHADER_GEOMETRY && !pan_env_flag("PANVK_V9_NO_GS")) {
+         /* A GS after tessellation runs on the TES SW variant now;
+          * PANVK_V9_NO_TES_GS=1 refuses it again (negative control). */
+         bool has_tes = false;
+         for (uint32_t j = 0; j < shader_count; j++)
+            has_tes |= infos[j].stage == MESA_SHADER_TESS_EVAL;
+         if (!has_tes || !pan_env_flag("PANVK_V9_NO_TES_GS"))
+            continue;
+      }
+      if (!tess && s != MESA_SHADER_GEOMETRY)
          continue;
 
       mesa_logw_once("panvk: v9: %s shaders are not supported, pipeline "
@@ -2326,6 +3473,13 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
 
    case MESA_SHADER_FRAGMENT:
       shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
+      shader->fs.clip_cull = blob_read_uint8(blob);
+      if (shader->fs.clip_cull) {
+         struct pan_shader_info clip_info = shader->info;
+         clip_info.fs.can_discard = true;
+         shader->fs.earlyzs_lut_clip =
+            pan_earlyzs_analyze(&clip_info, PAN_ARCH);
+      }
       blob_copy_bytes(blob, &shader->fs.input_attachment_read,
                       sizeof(shader->fs.input_attachment_read));
       blob_copy_bytes(blob, &shader->fs.tile_image_color_read,
@@ -2422,6 +3576,13 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    }
 
    blob_copy_bytes(blob, &shader->tess, sizeof(shader->tess));
+#if PAN_ARCH >= 9
+   blob_copy_bytes(blob, &shader->gs, sizeof(shader->gs));
+#endif
+   shader->writes_layer = blob_read_uint8(blob);
+   shader->writes_viewport = blob_read_uint8(blob);
+   shader->clip_size = blob_read_uint8(blob);
+   shader->cull_size = blob_read_uint8(blob);
    if (blob->overrun) {
       panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
       return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
@@ -2493,6 +3654,7 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
       break;
 
    case MESA_SHADER_FRAGMENT:
+      blob_write_uint8(blob, shader->fs.clip_cull);
       blob_write_bytes(blob, &shader->fs.input_attachment_read,
                        sizeof(shader->fs.input_attachment_read));
       blob_write_bytes(blob, &shader->fs.tile_image_color_read,
@@ -2538,6 +3700,13 @@ panvk_shader_serialize(struct vk_device *vk_dev,
    shader_desc_info_serialize(blob, shader);
 
    blob_write_bytes(blob, &shader->tess, sizeof(shader->tess));
+#if PAN_ARCH >= 9
+   blob_write_bytes(blob, &shader->gs, sizeof(shader->gs));
+#endif
+   blob_write_uint8(blob, shader->writes_layer);
+   blob_write_uint8(blob, shader->writes_viewport);
+   blob_write_uint8(blob, shader->clip_size);
+   blob_write_uint8(blob, shader->cull_size);
 
    panvk_shader_foreach_variant(shader, variant) {
       panvk_shader_serialize_variant(vk_dev, variant, blob);
@@ -2949,6 +4118,25 @@ static const struct vk_shader_ops panvk_shader_ops = {
       panvk_shader_get_executable_internal_representations,
 };
 
+/* The hardware vertex shader is the last pre-rasterization stage: the GS
+ * (its RAST variant), else the TES, else the API vertex shader. */
+static void
+panvk_cmd_update_hw_vs(struct panvk_cmd_buffer *cmd)
+{
+   const struct panvk_shader *hw = cmd->state.gfx.gs.shader;
+   if (!hw)
+      hw = cmd->state.gfx.tess.tes;
+   if (!hw)
+      hw = cmd->state.gfx.tess.input_vs;
+
+   if (cmd->state.gfx.vs.shader != hw) {
+      cmd->state.gfx.vs.shader = hw;
+      gfx_state_set_dirty(cmd, VS);
+      gfx_state_set_dirty(cmd, VS_PUSH_UNIFORMS);
+      gfx_state_set_dirty(cmd, DESC_STATE);
+   }
+}
+
 static void
 panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stage,
                       struct panvk_shader *shader)
@@ -2962,15 +4150,12 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
       }
       break;
    case MESA_SHADER_VERTEX:
-      if (cmd->state.gfx.tess.input_vs != shader ||
-          (!cmd->state.gfx.tess.tes &&
-           cmd->state.gfx.vs.shader != shader)) {
+      if (cmd->state.gfx.tess.input_vs != shader) {
          cmd->state.gfx.tess.input_vs = shader;
-         if (!cmd->state.gfx.tess.tes)
-            cmd->state.gfx.vs.shader = shader;
          gfx_state_set_dirty(cmd, VS);
          gfx_state_set_dirty(cmd, VS_PUSH_UNIFORMS);
       }
+      panvk_cmd_update_hw_vs(cmd);
       break;
    case MESA_SHADER_TESS_CTRL:
       if (cmd->state.gfx.tess.tcs != shader) {
@@ -2983,12 +4168,8 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
       }
       break;
    case MESA_SHADER_TESS_EVAL:
-      if (cmd->state.gfx.tess.tes != shader ||
-          cmd->state.gfx.vs.shader !=
-             (shader ? shader : cmd->state.gfx.tess.input_vs)) {
+      if (cmd->state.gfx.tess.tes != shader) {
          cmd->state.gfx.tess.tes = shader;
-         cmd->state.gfx.vs.shader = shader ? shader
-                                           : cmd->state.gfx.tess.input_vs;
          if (shader)
             cmd->state.gfx.tess.info = panvk_tess_info_merge(
                cmd->state.gfx.tess.info, shader->tess.info);
@@ -2996,6 +4177,16 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
          gfx_state_set_dirty(cmd, VS_PUSH_UNIFORMS);
          gfx_state_set_dirty(cmd, DESC_STATE);
       }
+      panvk_cmd_update_hw_vs(cmd);
+      break;
+   case MESA_SHADER_GEOMETRY:
+      if (cmd->state.gfx.gs.shader != shader) {
+         cmd->state.gfx.gs.shader = shader;
+         gfx_state_set_dirty(cmd, VS);
+         gfx_state_set_dirty(cmd, VS_PUSH_UNIFORMS);
+         gfx_state_set_dirty(cmd, DESC_STATE);
+      }
+      panvk_cmd_update_hw_vs(cmd);
       break;
    case MESA_SHADER_FRAGMENT:
       if (cmd->state.gfx.fs.shader != shader) {

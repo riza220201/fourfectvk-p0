@@ -34,6 +34,7 @@
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 #include "pan_v9_trace.h"
+#include "panfrost/lib/pan_env.h"
 
 static void
 panvk_debug_dump_blob(const char *name, const void *ptr, size_t size,
@@ -90,6 +91,15 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
    return VK_SUCCESS;
 }
 
+static bool
+tls_per_batch(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = pan_env_flag("PANVK_TLS_PER_BATCH") != NULL;
+   return v;
+}
+
 void
 panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -137,14 +147,36 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
       unsigned size = pan_get_total_stack_size(batch->tlsinfo.tls.size,
                                                thread_tls_alloc, core_id_range);
-      batch->tlsinfo.tls.ptr =
-         panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+      /* PATCH: reuse the command buffer's scratch when it is big enough
+       * (see panvk_cmd_buffer.h). A smaller per-thread size in the TLS
+       * descriptor only uses the start of a larger buffer.
+       * PANVK_TLS_PER_BATCH=1 keeps one buffer per batch (control). */
+      if (!tls_per_batch() && cmdbuf->state.scratch.tls_size >= size) {
+         batch->tlsinfo.tls.ptr = cmdbuf->state.scratch.tls_ptr;
+      } else {
+         batch->tlsinfo.tls.ptr =
+            panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+         if (batch->tlsinfo.tls.ptr) {
+            cmdbuf->state.scratch.tls_ptr = batch->tlsinfo.tls.ptr;
+            cmdbuf->state.scratch.tls_size = size;
+         }
+      }
    }
 
    if (batch->tlsinfo.wls.size) {
       assert(batch->wls_total_size);
-      batch->tlsinfo.wls.ptr =
-         panvk_cmd_alloc_dev_mem(cmdbuf, tls, batch->wls_total_size, 4096).gpu;
+      if (!tls_per_batch() &&
+          cmdbuf->state.scratch.wls_size >= batch->wls_total_size) {
+         batch->tlsinfo.wls.ptr = cmdbuf->state.scratch.wls_ptr;
+      } else {
+         batch->tlsinfo.wls.ptr =
+            panvk_cmd_alloc_dev_mem(cmdbuf, tls, batch->wls_total_size, 4096)
+               .gpu;
+         if (batch->tlsinfo.wls.ptr) {
+            cmdbuf->state.scratch.wls_ptr = batch->tlsinfo.wls.ptr;
+            cmdbuf->state.scratch.wls_size = batch->wls_total_size;
+         }
+      }
    }
 
    if (batch->tls.cpu)
@@ -213,7 +245,7 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
           * in "intersect" mode, i.e. only on tiles with primitives. With
           * layered rendering, the fragment job of layer 1 was TERMINATED
           * (CTS indirect_draw_multiview, multiview.masks with LOAD). */
-         if (PAN_ARCH < 9 || getenv("PANVK_V9_DCD_PER_LAYER"))
+         if (PAN_ARCH < 9 || pan_env_flag("PANVK_V9_DCD_PER_LAYER"))
             fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
 
          const struct pan_fb_descs fb_descs = {

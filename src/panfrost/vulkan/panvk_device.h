@@ -18,6 +18,8 @@
 #include "panvk_mempool.h"
 #include "panvk_physical_device.h"
 #include "panvk_utrace_perfetto.h"
+#include "panvk_frame_prof.h"
+#include "panvk_mem_prof.h"
 
 #include "kmod/pan_kmod.h"
 #include "kmod/panthor_kmod.h"
@@ -82,8 +84,16 @@ struct panvk_device {
 
    struct panvk_priv_bo *tiler_heap;
    struct panvk_priv_bo *poly_heap;
+   /* PATCH v9: heap storage, separate from the header so it can grow on GPU
+    * page fault (nothing committed until tessellation runs). */
+   struct panvk_priv_bo *poly_heap_data;
    struct panvk_priv_bo *indirect_varying_buffer;
    struct panvk_priv_bo *sample_positions;
+
+   /* Bytes of command pool BOs on the pools' free lists (kept for reuse). */
+   uint64_t pool_cached_bytes;
+   struct panvk_mem_prof mem_prof;
+   struct panvk_frame_prof frame_prof;
 
    struct {
       struct panvk_priv_bo *handlers_bo;

@@ -28,6 +28,7 @@
 
 #include "pan_format.h"
 #include "pan_props.h"
+#include "panfrost/lib/pan_env.h"
 
 /* We reserve one ubo for push constant, one for sysvals and one per-set for the
  * descriptor metadata  */
@@ -229,7 +230,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
-      .EXT_transform_feedback = PAN_ARCH >= 10,
+      .EXT_transform_feedback = PAN_ARCH >= 9, /* PATCH v9: JM XFB */
       .EXT_astc_decode_mode = PAN_ARCH >= 7,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
@@ -318,8 +319,8 @@ panvk_per_arch(get_physical_device_features)(
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,
-      .tessellationShader = PAN_ARCH >= 10,
+      .geometryShader = PAN_ARCH == 9, /* PATCH v9: JM libpoly GS */
+      .tessellationShader = PAN_ARCH >= 9, /* PATCH v9: JM libpoly tess */
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -339,20 +340,27 @@ panvk_per_arch(get_physical_device_features)(
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
-      .multiViewport = false,
+      /* PATCH v9: one draw per viewport when gl_ViewportIndex is written
+       * (panvk_cmd_draw_v9). */
+      .multiViewport = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_MULTIVIEWPORT"),
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
       .textureCompressionBC = has_texture_compression_bc(device),
       .occlusionQueryPrecise = true,
-      .pipelineStatisticsQuery = false,
+      /* PATCH v9: counted by the driver (panlib_stats_add). */
+      .pipelineStatisticsQuery = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_STATS"),
       /* On v13+, the hardware isn't speculatively referencing to invalid
          indices anymore. */
+      /* PATCH v9: the stores of an IDVS vertex shader run in the position
+       * shader only (bifrost_nir_lower_vs_stores), the TCS and the GS main
+       * pass run as compute. PANVK_V9_NO_VPS=1 hides it again (control). */
       .vertexPipelineStoresAndAtomics =
+         (PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_VPS")) ||
          (PAN_ARCH >= 13 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
          instance->drirc.misc.force_enable_shader_atomics,
       .fragmentStoresAndAtomics = true,
-      .shaderTessellationAndGeometryPointSize = PAN_ARCH >= 10,
+      .shaderTessellationAndGeometryPointSize = PAN_ARCH >= 9,
       .shaderImageGatherExtended = true,
       .shaderStorageImageExtendedFormats = true,
 #if PAN_ARCH == 9
@@ -374,8 +382,9 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      .shaderClipDistance = false,
-      .shaderCullDistance = false,
+      /* PATCH v9: emulated in the fragment shader (panvk_v9_lower_fs_clip_cull). */
+      .shaderClipDistance = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_CLIP_CULL"),
+      .shaderCullDistance = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_CLIP_CULL"),
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
@@ -390,7 +399,7 @@ panvk_per_arch(get_physical_device_features)(
       .sparseResidency8Samples = false,
       .sparseResidency16Samples = false,
       .sparseResidencyAliased = false, /* https://gitlab.freedesktop.org/panfrost/mesa/-/issues/237 */
-      .variableMultisampleRate = false,
+      .variableMultisampleRate = PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_VMSR"),
       .inheritedQueries = false,
 
       /* Vulkan 1.1 */
@@ -619,8 +628,8 @@ panvk_per_arch(get_physical_device_features)(
       .inheritedConditionalRendering = PAN_ARCH >= 10,
 
       /* VK_EXT_transform_feedback */
-      .transformFeedback = PAN_ARCH >= 10,
-      .geometryStreams = false,
+      .transformFeedback = PAN_ARCH >= 9, /* PATCH v9: JM XFB */
+      .geometryStreams = PAN_ARCH == 9, /* PATCH v9: libpoly GS streams */
 
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
@@ -664,7 +673,10 @@ panvk_per_arch(get_physical_device_features)(
       .pipelineExecutableInfo = true,
 
       /* VK_KHR_robustness2 */
-      .robustBufferAccess2 = PAN_ARCH == 9 ? getenv("PANVK_V9_RBA2") != NULL : PAN_ARCH >= 11,
+      /* PATCH v9: on since texel buffer reads out of range return the spec
+       * values (pan_nir_lower_texel_buf_oob); PANVK_V9_NO_RBA2=1 hides it.
+       * DXVK 2.4+ and 3.x need it. */
+      .robustBufferAccess2 = PAN_ARCH == 9 ? !pan_env_flag("PANVK_V9_NO_RBA2") : PAN_ARCH >= 11,
       .robustImageAccess2 = false,
       .nullDescriptor = PAN_ARCH >= 9,
 
@@ -959,24 +971,25 @@ panvk_per_arch(get_physical_device_properties)(
       /* 32 vec4 varyings. */
       .maxVertexOutputComponents = 128,
       /* Tessellation is implemented through libpoly compute prepasses. */
-      .maxTessellationGenerationLevel = PAN_ARCH >= 10 ? 64 : 0,
-      .maxTessellationPatchSize = PAN_ARCH >= 10 ? 32 : 0,
+      .maxTessellationGenerationLevel = PAN_ARCH >= 9 ? 64 : 0,
+      .maxTessellationPatchSize = PAN_ARCH >= 9 ? 32 : 0,
       .maxTessellationControlPerVertexInputComponents =
-         PAN_ARCH >= 10 ? 128 : 0,
+         PAN_ARCH >= 9 ? 128 : 0,
       .maxTessellationControlPerVertexOutputComponents =
-         PAN_ARCH >= 10 ? 128 : 0,
+         PAN_ARCH >= 9 ? 128 : 0,
       .maxTessellationControlPerPatchOutputComponents =
-         PAN_ARCH >= 10 ? 120 : 0,
+         PAN_ARCH >= 9 ? 120 : 0,
       .maxTessellationControlTotalOutputComponents =
-         PAN_ARCH >= 10 ? 4096 : 0,
-      .maxTessellationEvaluationInputComponents = PAN_ARCH >= 10 ? 128 : 0,
-      .maxTessellationEvaluationOutputComponents = PAN_ARCH >= 10 ? 128 : 0,
+         PAN_ARCH >= 9 ? 4096 : 0,
+      .maxTessellationEvaluationInputComponents = PAN_ARCH >= 9 ? 128 : 0,
+      .maxTessellationEvaluationOutputComponents = PAN_ARCH >= 9 ? 128 : 0,
       /* Geometry shaders not supported. */
-      .maxGeometryShaderInvocations = 0,
-      .maxGeometryInputComponents = 0,
-      .maxGeometryOutputComponents = 0,
-      .maxGeometryOutputVertices = 0,
-      .maxGeometryTotalOutputComponents = 0,
+      /* PATCH v9: geometry shaders through libpoly, Honeykrisp limits. */
+      .maxGeometryShaderInvocations = PAN_ARCH == 9 ? 32 : 0,
+      .maxGeometryInputComponents = PAN_ARCH == 9 ? 128 : 0,
+      .maxGeometryOutputComponents = PAN_ARCH == 9 ? 128 : 0,
+      .maxGeometryOutputVertices = PAN_ARCH == 9 ? 1024 : 0,
+      .maxGeometryTotalOutputComponents = PAN_ARCH == 9 ? 1024 : 0,
       /* 32 vec4 varyings. */
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */
@@ -1017,7 +1030,8 @@ panvk_per_arch(get_physical_device_properties)(
                               PAN_ARCH == 9 ? 65535 : 1,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
-      .maxViewports = 1,
+      .maxViewports =
+         PAN_ARCH == 9 && !pan_env_flag("PANVK_V9_NO_MULTIVIEWPORT") ? 16 : 1,
       .maxViewportDimensions = {MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_DIMENSION},
       .viewportBoundsRange = {-2.0f * MAX_FRAMEBUFFER_DIMENSION, 2.0f * MAX_FRAMEBUFFER_DIMENSION - 1.0f},
       .viewportSubPixelBits = 0,
@@ -1060,9 +1074,9 @@ panvk_per_arch(get_physical_device_properties)(
          PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
       .timestampPeriod =
          PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
-      .maxClipDistances = 0,
-      .maxCullDistances = 0,
-      .maxCombinedClipAndCullDistances = 0,
+      .maxClipDistances = PAN_ARCH == 9 ? 8 : 0,
+      .maxCullDistances = PAN_ARCH == 9 ? 8 : 0,
+      .maxCombinedClipAndCullDistances = PAN_ARCH == 9 ? 8 : 0,
       .discreteQueuePriorities = 2,
       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
       .lineWidthRange = {0.0, 7.9921875},
@@ -1356,15 +1370,15 @@ panvk_per_arch(get_physical_device_properties)(
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
 
       /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackStreams = PAN_ARCH == 9 ? 4 : 1,
       .maxTransformFeedbackBuffers = PANVK_MAX_XFB_BUFFERS,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = 2048,
       .maxTransformFeedbackBufferDataSize = 512,
       .maxTransformFeedbackBufferDataStride = 2048,
       .transformFeedbackQueries = false,
-      .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackStreamsLinesTriangles = PAN_ARCH == 9,
+      .transformFeedbackRasterizationStreamSelect = PAN_ARCH == 9,
       .transformFeedbackDraw = false,
 
       /* VK_EXT_shader_tile_image */

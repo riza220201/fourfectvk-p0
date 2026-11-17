@@ -11,6 +11,7 @@
 #endif
 
 #include "compiler/pan_compiler.h"
+#include "poly/nir/poly_nir.h"
 
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
@@ -117,6 +118,12 @@ struct panvk_common_sysvals_inner {
     * VS-lowered TES identical offsets. */
    aligned_u64 vertex_param_buffer_poly;
    aligned_u64 tess_param_buffer_poly;
+   /* PATCH v9: struct poly_geometry_params of the current GS draw. */
+   aligned_u64 geometry_param_buffer_poly;
+   /* PATCH v9: 1 when the provoking vertex is the last one (GS). */
+   aligned_u64 provoking_last_poly;
+   /* PATCH v9: vertex stream that is rasterized (geometryStreams). */
+   aligned_u64 rasterization_stream_poly;
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
 struct panvk_common_sysvals {
@@ -196,6 +203,15 @@ struct panvk_graphics_sysvals {
     * draw, and each draw gets its own push-uniform block, so the index is a
     * plain per-draw sysval. Also keeps the struct 8-byte sized. */
    int32_t draw_id;
+   /* PATCH v9: vertex count of a direct non-indexed draw, UINT32_MAX
+    * otherwise. IDVS shades a few vertices past the end of the draw; their
+    * memory writes are dropped (panvk_v9_gate_side_effects). */
+   uint32_t sfx_vertex_count;
+   /* PATCH v9: viewport of this copy of the draw (multiViewport). */
+   uint32_t viewport_id;
+   /* PATCH v9: clip distance count | cull distance count << 8 of the last
+    * pre-rasterization stage, read by the fragment shader. */
+   uint32_t clip_cull;
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
@@ -417,6 +433,10 @@ struct panvk_shader_variant {
 
       struct {
          struct pan_earlyzs_lut earlyzs_lut;
+         /* PATCH v9: early-ZS table when the clip/cull distance discard
+          * runs (clip_cull set), earlyzs_lut otherwise. */
+         struct pan_earlyzs_lut earlyzs_lut_clip;
+         bool clip_cull;
          uint32_t input_attachment_read;
          uint32_t tile_image_color_read;
          bool tile_image_z_read;
@@ -498,6 +518,33 @@ enum panvk_vs_variant {
    PANVK_VS_VARIANTS,
 };
 
+/* PATCH v9: a geometry shader is split by libpoly (poly_nir_lower_gs) into a
+ * hardware vertex shader that re-runs the GS for one output vertex (RAST,
+ * variant 0 so panvk_shader_hw_variant() returns it), the GS proper as a
+ * compute job writing the index buffer / XFB (MAIN), an optional count
+ * pass (COUNT) and a one-thread XFB/query setup pass (PRE). */
+/* PATCH v9: tessellation evaluation shader variants. HW is the hardware
+ * vertex shader of the tessellated draw, SW runs the TES as compute before a
+ * geometry shader (like the VS SW variant). */
+enum panvk_tes_variant {
+   PANVK_TES_VARIANT_HW,
+   PANVK_TES_VARIANT_SW,
+
+   PANVK_TES_VARIANTS,
+};
+
+enum panvk_gs_variant {
+   PANVK_GS_VARIANT_RAST,
+   PANVK_GS_VARIANT_MAIN,
+   PANVK_GS_VARIANT_COUNT,
+   PANVK_GS_VARIANT_PRE,
+   /* PATCH v9: the RAST program as a COMPUTE job that only writes the
+    * transform feedback buffers, once per emitted vertex. */
+   PANVK_GS_VARIANT_XFB,
+
+   PANVK_GS_VARIANTS,
+};
+
 struct panvk_shader {
    struct vk_shader vk;
 
@@ -515,6 +562,30 @@ struct panvk_shader {
       struct panvk_tess_info info;
    } tess;
 
+   /* PATCH v9: the shader writes gl_Layer (or gl_ViewportIndex is not
+    * involved). Without it, a layered draw only renders layer 0. */
+   bool writes_layer;
+
+   /* PATCH v9: the last pre-rasterization stage writes gl_ViewportIndex.
+    * The draw is then replicated per viewport (multiViewport). */
+   bool writes_viewport;
+
+   /* PATCH v9: gl_ClipDistance / gl_CullDistance array sizes. */
+   uint8_t clip_size, cull_size;
+
+#if PAN_ARCH >= 9
+   struct {
+      struct poly_gs_info info;
+      /* Descriptor info of each compute variant (MAIN, COUNT, PRE, XFB),
+       * indexed by enum panvk_gs_variant; the RAST variant uses desc_info
+       * like any hardware vertex shader. Each variant gets its own, the
+       * dynamic-buffer copy table and used sets differ between them. */
+      struct panvk_shader_desc_info cs_desc_info[PANVK_GS_VARIANTS];
+      /* PATCH v9: GS invocations per input primitive (statistics). */
+      uint32_t invocations;
+   } gs;
+#endif
+
    struct panvk_shader_variant variants[];
 };
 
@@ -523,6 +594,12 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 {
    if (stage == MESA_SHADER_VERTEX)
       return PANVK_VS_VARIANTS;
+   if (stage == MESA_SHADER_GEOMETRY)
+      return PANVK_GS_VARIANTS;
+#if PAN_ARCH == 9
+   if (stage == MESA_SHADER_TESS_EVAL)
+      return PANVK_TES_VARIANTS;
+#endif
 
    return 1;
 }
@@ -544,6 +621,21 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
       assert(i < ARRAY_SIZE(panvk_vs_shader_variant_name));
       return panvk_vs_shader_variant_name[i];
    }
+
+   if (shader->vk.stage == MESA_SHADER_GEOMETRY) {
+      static const char *names[] = {
+         [PANVK_GS_VARIANT_RAST] = NULL,
+         [PANVK_GS_VARIANT_MAIN] = "gs-main",
+         [PANVK_GS_VARIANT_COUNT] = "gs-count",
+         [PANVK_GS_VARIANT_PRE] = "gs-pre",
+         [PANVK_GS_VARIANT_XFB] = "gs-xfb",
+      };
+      assert(i < ARRAY_SIZE(names));
+      return names[i];
+   }
+
+   if (shader->vk.stage == MESA_SHADER_TESS_EVAL && i > 0)
+      return "tes-sw";
 
    assert(panvk_shader_num_variants(shader->vk.stage) == 1);
 
@@ -579,10 +671,26 @@ panvk_shader_xfb_variant(const struct panvk_shader *shader)
 }
 
 static const struct panvk_shader_variant *
+panvk_shader_gs_variant(const struct panvk_shader *shader,
+                        enum panvk_gs_variant v)
+{
+   if (!shader)
+      return NULL;
+
+   assert(shader->vk.stage == MESA_SHADER_GEOMETRY);
+   return &shader->variants[v];
+}
+
+static const struct panvk_shader_variant *
 panvk_shader_sw_variant(const struct panvk_shader *shader)
 {
    if (!shader)
       return NULL;
+
+   if (shader->vk.stage == MESA_SHADER_TESS_EVAL) {
+      assert(panvk_shader_num_variants(shader->vk.stage) > 1);
+      return &shader->variants[PANVK_TES_VARIANT_SW];
+   }
 
    assert(shader->vk.stage == MESA_SHADER_VERTEX);
    return &shader->variants[PANVK_VS_VARIANT_SW];

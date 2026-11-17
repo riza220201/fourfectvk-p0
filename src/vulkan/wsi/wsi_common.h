@@ -115,6 +115,12 @@ struct wsi_device {
 
    bool disable_unordered_submits;
 
+   /* X11: wait for the present fence in the swapchain's present thread
+    * instead of in vkQueuePresentKHR (software and wait_present_before_queue
+    * paths). The thread that presents can then queue the next frame while
+    * the GPU is still rendering this one. */
+   bool x11_wait_fence_in_present_thread;
+
    /* Wait for rendering to finish before handing an image to the window
     * system.  Used by dma-buf capable devices which cannot attach their GPU
     * completion fence to the dma-buf reservation object.

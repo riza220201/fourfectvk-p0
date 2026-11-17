@@ -22,6 +22,11 @@
 
 #include "vk_util.h"
 #include "wsi_common.h"
+#include "vk_queue.h"
+#include "util/os_time.h"
+#include "panvk_device.h"
+#include "panvk_entrypoints.h"
+#include "panfrost/lib/pan_env.h"
 
 static VKAPI_PTR PFN_vkVoidFunction
 panvk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
@@ -95,6 +100,13 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
     */
    physical_device->wsi_device.disable_unordered_submits = uses_kbase;
 
+   /* With asynchronous kbase submission the present fence is still pending
+    * when vkQueuePresentKHR runs. Let the X11 present thread wait for it,
+    * so the app thread can submit the next frame meanwhile.
+    * PANVK_KBASE_WSI_SYNC_PRESENT=1: wait in vkQueuePresentKHR as before. */
+   physical_device->wsi_device.x11_wait_fence_in_present_thread =
+      uses_kbase && !pan_env_flag("PANVK_KBASE_WSI_SYNC_PRESENT");
+
    /* kbase is not a DRM fd.  The default CPU WSI path presents through
     * MIT-SHM.  Android dma-heaps can also provide shareable
     * allocations, but some Android X servers advertise DRI3 while rejecting
@@ -119,4 +131,24 @@ panvk_wsi_finish(struct panvk_physical_device *physical_device)
 
    physical_device->vk.wsi_device = NULL;
    wsi_device_finish(&physical_device->wsi_device, &instance->vk.alloc);
+}
+
+/* PANVK_FRAME_PROF: frames are counted here. wsi_QueuePresentKHR is the
+ * common WSI entrypoint this device table would use otherwise. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wsi_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   struct panvk_device *dev = to_panvk_device(queue->base.device);
+
+   if (!dev->frame_prof.enabled)
+      return wsi_QueuePresentKHR(_queue, pPresentInfo);
+
+   const uint64_t t0 = os_time_get_nano();
+   VkResult result = wsi_QueuePresentKHR(_queue, pPresentInfo);
+   panvk_frame_prof_present(dev, t0, os_time_get_nano());
+   return result;
 }

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/bitscan.h"
 #include "util/macros.h"
 #include "vk_log.h"
 
@@ -60,6 +61,15 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
 #endif
       break;
    }
+#if PAN_ARCH == 9
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+      /* PATCH v9: one 64-bit counter per enabled statistic, in bit order
+       * (panvk_v9_stats_counter). */
+      reports_per_query = MAX2(
+         util_bitcount(pCreateInfo->pipelineStatistics), 1);
+      break;
+   }
+#endif
 #if PAN_ARCH >= 10
    case VK_QUERY_TYPE_TIMESTAMP: {
       /* One value per subqueue + 1 value for metadata. */
@@ -284,6 +294,17 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
             break;
          }
 #endif
+#if PAN_ARCH == 9
+         case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+            if (write_results) {
+               const uint32_t n =
+                  util_bitcount(pool->vk.pipeline_statistics);
+               for (uint32_t r = 0; r < n; r++)
+                  cpu_write_query_result(dst, r, flags, src[r].value);
+            }
+            break;
+         }
+#endif
          default:
             UNREACHABLE("Unsupported query type");
          }
@@ -292,8 +313,13 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
       if (!write_results)
          status = VK_NOT_READY;
 
+      uint32_t available_idx = 1;
+#if PAN_ARCH == 9
+      if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS)
+         available_idx = util_bitcount(pool->vk.pipeline_statistics);
+#endif
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-         cpu_write_query_result(dst, 1, flags, available);
+         cpu_write_query_result(dst, available_idx, flags, available);
    }
 
    return status;

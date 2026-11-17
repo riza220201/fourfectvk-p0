@@ -46,6 +46,7 @@
 #include "shader_enums.h"
 
 #include "util/mesa-blake3.h"
+#include "panfrost/lib/pan_env.h"
 
 struct vk_pipeline_binary {
    struct vk_object_base base;
@@ -2044,7 +2045,7 @@ vk_create_graphics_pipeline(struct vk_device *device,
    const VkPipelineLibraryCreateInfoKHR *null_check_libs =
       vk_find_struct_const(pCreateInfo->pNext,
                            PIPELINE_LIBRARY_CREATE_INFO_KHR);
-   if (null_check_libs && !getenv("PANVK_V9_ALLOW_TESS_GS")) {
+   if (null_check_libs && !pan_env_flag("PANVK_V9_ALLOW_TESS_GS")) {
       for (uint32_t i = 0; i < null_check_libs->libraryCount; i++) {
          if (null_check_libs->pLibraries[i] == VK_NULL_HANDLE) {
             mesa_logw_once("vk_pipeline: pLibraries[%u] is VK_NULL_HANDLE, "

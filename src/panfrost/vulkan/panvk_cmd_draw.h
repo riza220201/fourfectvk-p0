@@ -230,6 +230,15 @@ struct panvk_cmd_graphics_state {
       bool active;
    } tess;
 
+   /* PATCH v9: geometry shader (libpoly). gfx.vs.shader is the GS (its RAST
+    * variant is the hardware VS) while one is bound. */
+   struct {
+      const struct panvk_shader *shader;
+      /* Indexed by enum panvk_gs_variant, RAST unused. */
+      struct panvk_shader_desc_state cs_desc[PANVK_GS_VARIANTS];
+      uint64_t cs_push_uniforms[PANVK_GS_VARIANTS];
+   } gs;
+
    struct {
       struct panvk_attrib_buf bufs[MAX_VBS];
       unsigned count;
@@ -481,6 +490,8 @@ struct panvk_draw_info {
    uint32_t draw_id;
    /* Layer (or view) this copy of the draw renders, see panvk_cmd_draw_v9. */
    uint32_t layer_id;
+   /* Viewport this copy of the draw renders (multiViewport). */
+   uint32_t viewport_id;
 #endif
 };
 

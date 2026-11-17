@@ -173,6 +173,11 @@ meta_gfx_start(struct panvk_cmd_buffer *cmdbuf,
    save_ctx->fs.desc = cmdbuf->state.gfx.fs.desc;
    save_ctx->vs.shader = cmdbuf->state.gfx.vs.shader;
    save_ctx->vs.desc = cmdbuf->state.gfx.vs.desc;
+   save_ctx->geom.input_vs = cmdbuf->state.gfx.tess.input_vs;
+   save_ctx->geom.tcs = cmdbuf->state.gfx.tess.tcs;
+   save_ctx->geom.tes = cmdbuf->state.gfx.tess.tes;
+   save_ctx->geom.info = cmdbuf->state.gfx.tess.info;
+   save_ctx->geom.gs = cmdbuf->state.gfx.gs.shader;
    save_ctx->vb0 = cmdbuf->state.gfx.vb.bufs[0];
 
    save_ctx->dyn_state.all = cmdbuf->vk.dynamic_graphics_state;
@@ -239,6 +244,13 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.fs.desc = save_ctx->fs.desc;
    cmdbuf->state.gfx.vs.shader = save_ctx->vs.shader;
    cmdbuf->state.gfx.vs.desc = save_ctx->vs.desc;
+   cmdbuf->state.gfx.tess.input_vs = save_ctx->geom.input_vs;
+   cmdbuf->state.gfx.tess.tcs = save_ctx->geom.tcs;
+   cmdbuf->state.gfx.tess.tes = save_ctx->geom.tes;
+   cmdbuf->state.gfx.tess.info = save_ctx->geom.info;
+   cmdbuf->state.gfx.gs.shader = save_ctx->geom.gs;
+   gfx_state_set_dirty(cmdbuf, VS);
+   gfx_state_set_dirty(cmdbuf, DESC_STATE);
    cmdbuf->state.gfx.vb.bufs[0] = save_ctx->vb0;
 
 #if PAN_ARCH < 9

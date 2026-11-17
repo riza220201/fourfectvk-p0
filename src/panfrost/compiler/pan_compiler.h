@@ -48,6 +48,11 @@ struct pan_compile_inputs {
     * checks. */
    bool robust_descriptors;
 
+   /* PATCH v9: texel buffer reads out of the view range return 0 and 1 for a
+    * missing alpha (robustBufferAccess2), checked in the shader against the
+    * element count the driver stores in BUFFER descriptor dword 5. */
+   bool robust_texel_buffers;
+
    /* Varying layout in memory, if known */
    const struct pan_varying_layout *varying_layout;
 

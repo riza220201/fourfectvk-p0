@@ -88,12 +88,45 @@ struct panvk_cmd_buffer {
    struct {
       struct panvk_cmd_graphics_state gfx;
       struct panvk_cmd_compute_state compute;
+      /* PATCH v9: the poly heap was reset by this command buffer. */
+      bool uses_poly_heap;
+      /* PATCH v9: active pipeline statistics query (addr 0: none). The
+       * counters are 64-bit, one per enabled statistic in bit order. */
+      struct {
+         uint64_t addr;
+         uint32_t mask;
+         /* Fragment shader invocations are counted with the occlusion
+          * counter of the draws while no occlusion query uses it. */
+         bool owns_oq;
+      } stats;
       struct panvk_push_constant_state push_constants;
+      /* PATCH: scratch shared by the batches of this command buffer. The
+       * batches of one command buffer never run at the same time on the
+       * GPU (one queue, every job chain waits for the one before), so one
+       * buffer big enough for the largest batch is enough. Before, every
+       * batch with scratch got its own TLS buffer (1-3 MB each), and a
+       * frame with a few hundred passes held gigabytes. */
+      struct {
+         uint64_t tls_ptr, wls_ptr;
+         uint64_t tls_size, wls_size;
+      } scratch;
    } state;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_cmd_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+
+/* PATCH v9: address of the counter of statistic bit `bit` in the active
+ * pipeline statistics query, 0 when it is not counted. */
+static inline uint64_t
+panvk_v9_stats_counter(const struct panvk_cmd_buffer *cmdbuf, unsigned bit)
+{
+   const uint32_t mask = cmdbuf->state.stats.mask;
+   if (!cmdbuf->state.stats.addr || !(mask & (1u << bit)))
+      return 0;
+   return cmdbuf->state.stats.addr +
+          8 * (uint64_t)__builtin_popcount(mask & ((1u << bit) - 1));
+}
 
 #define panvk_cmd_buffer_obj_list_init(cmdbuf, list_name)                      \
    list_inithead(&(cmdbuf)->list_name)

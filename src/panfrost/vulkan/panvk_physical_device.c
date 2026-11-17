@@ -17,6 +17,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <limits.h>
+#include <ctype.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 
 #include "util/disk_cache.h"
@@ -50,6 +53,7 @@
 #include "pan_props.h"
 
 #include "genxml/gen_macros.h"
+#include "panfrost/lib/pan_env.h"
 
 #define PER_ARCH_FUNCS(_ver)                                                   \
    void panvk_v##_ver##_get_physical_device_extensions(                        \
@@ -505,6 +509,98 @@ get_core_masks(struct panvk_physical_device *device,
    return result;
 }
 
+/* FourFectVK release name for the device name, so it shows in game
+ * overlays (the Winlator wrapper replaces driverName and driverInfo, and
+ * driverVersion is a number). Read from the package's meta.json next to
+ * this library ("name": "FourFectVK-G57-v0.1.0-beta"), or else from the
+ * folder adrenotools installed it in, which carries the same name.
+ * "0.1.0-beta" becomes "0.1.0 Beta". Empty if neither names a FourFectVK
+ * package. PANVK_NO_FOURFECT_NAME=1 leaves the device name alone. */
+static void
+panvk_fourfect_version(char *out, size_t size)
+{
+   Dl_info info;
+   char dir[PATH_MAX];
+
+   out[0] = 0;
+   if (pan_env_flag("PANVK_NO_FOURFECT_NAME"))
+      return;
+   if (!dladdr((void *)panvk_fourfect_version, &info) || !info.dli_fname)
+      return;
+
+   snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+   char *slash = strrchr(dir, '/');
+   if (!slash)
+      return;
+   *slash = 0;
+
+   /* Candidate strings: meta.json "name" first, then the folder name. */
+   char text[512] = "";
+   char path[PATH_MAX + 16];
+   snprintf(path, sizeof(path), "%s/meta.json", dir);
+   FILE *f = fopen(path, "r");
+   if (f) {
+      char buf[2048];
+      size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+      fclose(f);
+      buf[n] = 0;
+      const char *k = strstr(buf, "\"name\"");
+      const char *q = k ? strchr(k + 6, '"') : NULL;
+      const char *e = q ? strchr(q + 1, '"') : NULL;
+      if (q && e && (size_t)(e - q - 1) < sizeof(text))
+         snprintf(text, sizeof(text), "%.*s", (int)(e - q - 1), q + 1);
+   }
+   if (!strstr(text, "FourFectVK")) {
+      const char *base = strrchr(dir, '/');
+      snprintf(text, sizeof(text), "%s", base ? base + 1 : dir);
+   }
+
+   const char *v = strstr(text, "FourFectVK");
+   v = v ? strstr(v, "-v") : NULL;
+   if (!v || !isdigit((unsigned char)v[2]))
+      return;
+   v += 2;
+
+   char ver[64];
+   size_t i = 0;
+   for (; v[i] && i < sizeof(ver) - 1; i++)
+      ver[i] = v[i] == '-' || v[i] == '_' ? ' ' : v[i];
+   ver[i] = 0;
+   char *sp = strchr(ver, ' ');
+   if (sp && sp[1])
+      sp[1] = toupper((unsigned char)sp[1]);
+
+   snprintf(out, size, "FourFectVK %s", ver);
+}
+
+/* Heap size reported on kbase. The default heuristic says 75% of RAM,
+ * 5.6 GiB on an 8 GiB phone, while a game in Winlator gets about 2 GiB
+ * before Android kills it. DXVK 2.x only returns empty memory chunks once
+ * 80% of the heap is allocated, and games size texture streaming from
+ * this number (DXGI DedicatedVideoMemory), so it should be what the app
+ * can really use: a third of RAM, at least 2 GiB, at most 75%.
+ * PANVK_KBASE_HEAP_PERCENT=N (1-100) sets it to N% of RAM. */
+static float
+panvk_kbase_heap_percent(void)
+{
+   const char *e = pan_env_flag("PANVK_KBASE_HEAP_PERCENT");
+   uint64_t total;
+
+   if (e) {
+      int pct = atoi(e);
+      if (pct >= 1 && pct <= 100)
+         return pct / 100.0f;
+   }
+
+   if (!os_get_total_physical_memory(&total) || !total)
+      return OS_GPU_HEAP_SIZE_HEURISTIC;
+
+   uint64_t want = total / 3;
+   want = MAX2(want, 2ull << 30);
+   want = MIN2(want, total / 4 * 3);
+   return (float)((double)want / (double)total);
+}
+
 static VkResult
 get_device_heaps(struct panvk_physical_device *device,
                  struct panvk_instance *instance)
@@ -512,9 +608,11 @@ get_device_heaps(struct panvk_physical_device *device,
    int host_coherent_not_cached_idx = -1;
    int host_cached_not_coherent_idx = -1;
 
-   const uint64_t heap_size =
-      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
-                           &instance->drirc.misc.heap_memory_percent);
+   float percent = instance->drirc.misc.heap_memory_percent;
+   if (device->kbase_node_path[0] && percent == OS_GPU_HEAP_SIZE_HEURISTIC)
+      percent = panvk_kbase_heap_percent();
+
+   const uint64_t heap_size = os_get_gpu_heap_size(percent, &percent);
 
    device->memory.heap_count = 1;
    device->memory.heaps[0] = (VkMemoryHeap){
@@ -1075,7 +1173,7 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
    device->drm_syncobj_type = kbase_cpu_sync_type;
    /* Negative control: PANVK_KBASE_NO_SYNCFD=1 removes SYNC_FD import/export
     * (the state before it was implemented). */
-   if (os_get_option("PANVK_KBASE_NO_SYNCFD")) {
+   if (pan_env_flag("PANVK_KBASE_NO_SYNCFD")) {
       device->drm_syncobj_type.import_sync_file = NULL;
       device->drm_syncobj_type.export_sync_file = NULL;
    }
@@ -1308,7 +1406,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
        * launcher crash on the "Unknown" version). Installing this build is
        * the opt-in. PANVK_V9_REQUIRE_OPTIN=1 restores the gate (control).
        */
-      if (arch == 9 && !os_get_option("PANVK_V9_REQUIRE_OPTIN"))
+      if (arch == 9 && !pan_env_flag("PANVK_V9_REQUIRE_OPTIN"))
          break;
 #endif
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
@@ -1347,6 +1445,14 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
                device->kmod.dev->props.gpu_id, core_count);
    else
       sprintf(device->name, "%s MC%u", device->model->name, core_count);
+
+   char fourfect[96];
+   panvk_fourfect_version(fourfect, sizeof(fourfect));
+   if (fourfect[0]) {
+      size_t len = strlen(device->name);
+      snprintf(device->name + len, sizeof(device->name) - len, " %s",
+               fourfect);
+   }
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)

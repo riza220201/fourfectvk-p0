@@ -28,6 +28,7 @@
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
 #include "pan_v9_trace.h"
+#include "panfrost/lib/pan_env.h"
 
 static void
 cmd_desc_state_bind_sets(struct panvk_descriptor_state *desc_state,
@@ -277,7 +278,7 @@ panvk_per_arch(cmd_prepare_shader_res_table)(
     * the validated baseline is bit-identical without it. */
    static int restab_dbg = -1;
    if (restab_dbg < 0)
-      restab_dbg = getenv("PANVK_DEBUG_RESTAB") ? 1 : 0;
+      restab_dbg = pan_env_flag("PANVK_DEBUG_RESTAB") ? 1 : 0;
    if (restab_dbg)
       PAN_V9_TRACE(
               "[PANVK_DEBUG_RESTAB] used_set_mask=0x%x first_unused_set=%u "

@@ -46,6 +46,19 @@ GENX(pan_buffer_texture_emit)(const struct pan_buffer_view *bview,
       cfg.stride = stride;
       cfg.conversion = conv;
    }
+
+#if PAN_ARCH < 11
+   /* PATCH v9: dwords 5 and 6 are not read by the hardware. They hold the
+    * element count and whether the format has no alpha channel, for the
+    * software bounds check of texel buffer reads (robustBufferAccess2:
+    * out-of-range reads return 0 and 1 for a missing alpha; the hardware
+    * returns 0 with the alpha the wrong way round, see
+    * pan_nir_lower_texel_buf_oob). A null descriptor is all zeros, so every
+    * read is out of range and returns 0, as before. */
+   uint32_t *w = (uint32_t *)out;
+   w[5] = bview->width_el;
+   w[6] = !util_format_has_alpha(bview->format);
+#endif
 }
 
 #elif PAN_ARCH >= 6

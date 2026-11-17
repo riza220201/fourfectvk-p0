@@ -137,6 +137,12 @@ enum pan_kmod_bo_flags {
 
    /* kbase CSF event memory monitored for cross-CSG synchronization. */
    PAN_KMOD_BO_FLAG_CSF_EVENT = BITFIELD_BIT(8),
+
+   /* kbase: physical pages are added when the GPU first touches them
+    * (grow on GPU fault) instead of all at allocation. The first CPU
+    * mapping request (pan_kmod_bo_mmap) backs the whole buffer, since a
+    * CPU access to a page without backing is fatal. */
+   PAN_KMOD_BO_FLAG_LAZY_COMMIT = BITFIELD_BIT(9),
 };
 
 /* Allowed group priority flags. */

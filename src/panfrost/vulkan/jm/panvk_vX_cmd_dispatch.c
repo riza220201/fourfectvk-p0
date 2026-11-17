@@ -22,6 +22,9 @@
 #include "panvk_macros.h"
 #include "panvk_meta.h"
 #include "panvk_physical_device.h"
+#if PAN_ARCH == 9
+#include "geometry_helper.h" /* PATCH v9: pipeline statistics */
+#endif
 
 #include "pan_desc.h"
 #include "pan_encoder.h"
@@ -45,14 +48,20 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
    panvk_per_arch(cmd_alloc_tls_desc)(cmdbuf, false);
 
    batch->tlsinfo.tls.size = MAX2(cs->info.tls_size, batch->tlsinfo.tls.size);
-   batch->tlsinfo.wls.size = cs->info.wls_size;
-
-   if (batch->tlsinfo.wls.size) {
+   /* PATCH v9: tessellation queues several compute jobs (and precompiled
+    * kernels) in one draw batch, which shares one TLS descriptor. Keep the
+    * largest WLS need instead of letting the last job overwrite it. A normal
+    * dispatch has its own batch, so it gets the same values as before. */
+   if (cs->info.wls_size) {
       unsigned core_id_range =
          pan_query_core_id_range(&phys_dev->kmod.dev->props);
-
-      batch->tlsinfo.wls.instances = pan_calc_wls_instances(
+      unsigned instances = pan_calc_wls_instances(
          &cs->cs.local_size, &phys_dev->kmod.dev->props, indirect ? NULL : dim);
+
+      batch->tlsinfo.wls.size =
+         MAX2(batch->tlsinfo.wls.size, cs->info.wls_size);
+      batch->tlsinfo.wls.instances =
+         MAX2(batch->tlsinfo.wls.instances, instances);
       batch->wls_total_size = pan_calc_total_wls_size(
          batch->tlsinfo.wls.size, batch->tlsinfo.wls.instances, core_id_range);
    }
@@ -262,6 +271,33 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    pan_jc_add_job(&batch->vtc_jc,
                   indirect ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE,
                   false, false, 0, indirect_dep, &job, false);
+
+   /* PATCH v9: compute shader invocations of a pipeline statistics query
+    * (panlib_stats_add, geometry.cl). */
+   const uint64_t cs_counter = panvk_v9_stats_counter(cmdbuf, 10);
+   if (cs_counter) {
+      struct pan_ptr args = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, sizeof(struct panlib_stats_params), 16);
+      if (args.gpu) {
+         struct panlib_stats_params *a = args.cpu;
+         memset(a, 0, sizeof(*a));
+         a->counter[10] = cs_counter;
+         a->compute = 1;
+         a->cs_local_size =
+            cs->cs.local_size.x * cs->cs.local_size.y * cs->cs.local_size.z;
+         if (indirect)
+            a->cmd = info->indirect.buffer_dev_addr;
+         else
+            a->cs_invocations = (uint64_t)wg_count.x * wg_count.y *
+                                wg_count.z * a->cs_local_size;
+         struct panvk_precomp_ctx precomp_ctx =
+            panvk_per_arch(precomp_cs)(cmdbuf);
+         panlib_stats_add(&precomp_ctx, panlib_1d(1),
+                          (enum panlib_barrier)(PANLIB_BARRIER_JM_BARRIER |
+                                                PANLIB_BARRIER_JM_SUPPRESS_PREFETCH),
+                          args.gpu);
+      }
+   }
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    clear_dirty_after_dispatch(cmdbuf);

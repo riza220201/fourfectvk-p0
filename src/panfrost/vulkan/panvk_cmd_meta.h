@@ -62,6 +62,13 @@ struct panvk_cmd_meta_graphics_save_ctx {
       struct panvk_shader_desc_state desc;
    } vs;
 
+   /* PATCH v9: vk_meta binds VS+FS pipelines, which unbinds TCS/TES/GS.
+    * Restore them with the VS. */
+   struct {
+      const struct panvk_shader *input_vs, *tcs, *tes, *gs;
+      struct panvk_tess_info info;
+   } geom;
+
    struct panvk_occlusion_query_state occlusion_query;
    bool cond_render_enabled;
    bool cond_render_inherited;

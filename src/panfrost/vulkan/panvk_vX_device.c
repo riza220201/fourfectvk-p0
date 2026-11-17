@@ -646,6 +646,42 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    panvk_priv_bo_flush(device->sample_positions, 0,
                        pan_sample_positions_buffer_size());
 
+#if PAN_ARCH == 9
+   /* PATCH v9: libpoly bump heap for tessellation. CSF allocates 128 MiB
+    * up front; here only a 4 KiB header is committed. The storage is a
+    * grow-on-GPU-fault region (2 MiB steps on kbase), so RAM is only used once
+    * tessellation draws actually write to it. PANVK_V9_POLY_HEAP_MB sets the
+    * virtual size (default 128). */
+   {
+      const char *mb_env = getenv("PANVK_V9_POLY_HEAP_MB");
+      uint64_t heap_mb = mb_env ? strtoull(mb_env, NULL, 10) : 128;
+      if (!heap_mb)
+         heap_mb = 128;
+
+      result = panvk_priv_bo_create(
+         device, 4096,
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->poly_heap);
+      if (result != VK_SUCCESS)
+         goto err_free_priv_bos;
+
+      result = panvk_priv_bo_create(
+         device, heap_mb * 1024 * 1024,
+         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->poly_heap_data);
+      if (result != VK_SUCCESS)
+         goto err_free_priv_bos;
+
+      struct poly_heap *poly_heap = device->poly_heap->addr.host;
+      *poly_heap = (struct poly_heap){
+         .base = device->poly_heap_data->addr.dev,
+         .bottom = 0,
+         .size = heap_mb * 1024 * 1024,
+      };
+      panvk_priv_bo_flush(device->poly_heap, 0, sizeof(*poly_heap));
+   }
+#endif
+
 #if PAN_ARCH >= 10
    /* Device-global libpoly bump heap.  The command stream resets the atomic
     * bottom pointer once before its first software-poly draw. */
@@ -732,6 +768,9 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    panvk_utrace_perfetto_init(device, 2);
 #endif
 
+   panvk_mem_prof_init(device);
+   panvk_frame_prof_init(device);
+
    *pDevice = panvk_device_to_handle(device);
    return VK_SUCCESS;
 
@@ -756,6 +795,7 @@ err_free_priv_bos:
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_priv_bo_unref(device->poly_heap);
+   panvk_priv_bo_unref(device->poly_heap_data);
    panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_device_cleanup_mempools(device);
@@ -785,6 +825,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    if (!device)
       return;
 
+   panvk_mem_prof_finish(device);
+   panvk_frame_prof_finish(device);
    panvk_per_arch(utrace_context_fini)(device);
 
    vk_foreach_queue_safe(queue, &device->vk)
@@ -801,6 +843,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    panvk_priv_bo_unref(device->printf.bo);
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->poly_heap);
+   panvk_priv_bo_unref(device->poly_heap_data);
    panvk_priv_bo_unref(device->indirect_varying_buffer);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);
