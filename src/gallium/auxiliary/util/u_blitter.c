@@ -72,6 +72,9 @@ struct blitter_context_priv
 
    bool single_triangle_active;
 
+   /* pipe_blit_info::rotation of the blit in flight */
+   uint8_t blit_rotation;
+
    /* Templates for various state objects. */
 
    /* Constant state objects. */
@@ -902,6 +905,24 @@ static void blitter_set_dst_dimensions(struct blitter_context_priv *ctx,
 static void set_texcoords_in_vertices(const struct blitter_attrib *attrib,
                                       float *out, unsigned stride)
 {
+   if (attrib->texcoord.rotation & 3) {
+      /* Destination vertices are TL, TR, BR, BL. Turning the source a
+       * quarter clockwise moves its BL corner to the destination TL, so
+       * vertex i takes source corner (i - rotation) mod 4. */
+      const float c[4][2] = {
+         {attrib->texcoord.x1, attrib->texcoord.y1},
+         {attrib->texcoord.x2, attrib->texcoord.y1},
+         {attrib->texcoord.x2, attrib->texcoord.y2},
+         {attrib->texcoord.x1, attrib->texcoord.y2},
+      };
+      for (unsigned i = 0; i < 4; i++, out += stride) {
+         const unsigned k = (i + 4 - (attrib->texcoord.rotation & 3)) & 3;
+         out[0] = c[k][0];
+         out[1] = c[k][1];
+      }
+      return;
+   }
+
    out[0] = attrib->texcoord.x1;
    out[1] = attrib->texcoord.y1;
    out += stride;
@@ -1839,6 +1860,7 @@ blitter_draw_tex(struct blitter_context_priv *ctx,
    get_texcoords(src, src_width0, src_height0,
                  src_x1, src_y1, src_x2, src_y2, layer, sample,
                  uses_txf, &coord);
+   coord.texcoord.rotation = ctx->blit_rotation;
 
    if (src->target == PIPE_TEXTURE_CUBE ||
        src->target == PIPE_TEXTURE_CUBE_ARRAY) {
@@ -2265,7 +2287,7 @@ void util_blitter_blit_generic(struct blitter_context *blitter,
     * oversized triangle to the destination rect.
     */
    struct pipe_scissor_state synth_scissor;
-   if (ctx->base.use_single_triangle && !scissor) {
+   if (ctx->base.use_single_triangle && !ctx->blit_rotation && !scissor) {
       synth_scissor.minx = MAX2(dstbox->x, 0);
       synth_scissor.miny = MAX2(dstbox->y, 0);
       synth_scissor.maxx = dstbox->x + dstbox->width;
@@ -2279,7 +2301,10 @@ void util_blitter_blit_generic(struct blitter_context *blitter,
 
    blitter_set_common_draw_rect_state(ctx, scissor != NULL, dst_samples > 1);
 
-   ctx->single_triangle_active = ctx->base.use_single_triangle;
+   /* The oversized triangle extrapolates axis-aligned texcoords; a rotated
+    * blit needs the four corners of the quad. */
+   ctx->single_triangle_active = ctx->base.use_single_triangle &&
+                                 !ctx->blit_rotation;
    do_blits(ctx, dst, dstbox, src, src_width0, src_height0,
             srcbox, dst_has_depth || dst_has_stencil, use_txf, sample0_only,
             dst_sample, 1);
@@ -2326,12 +2351,14 @@ util_blitter_blit(struct blitter_context *blitter,
    src_view = pipe->create_sampler_view(pipe, src, &src_templ);
 
    /* Copy. */
+   ctx->blit_rotation = info->rotation & 3;
    util_blitter_blit_generic(blitter, &dst_templ, &info->dst.box,
                              src_view, &info->src.box, src->width0, src->height0,
                              info->mask, info->filter,
                              info->scissor_enable ? &info->scissor : NULL,
                              info->alpha_blend, info->sample0_only,
                              info->dst_sample, fs_override);
+   ctx->blit_rotation = 0;
 
    pipe_sampler_view_reference(&src_view, NULL);
 }

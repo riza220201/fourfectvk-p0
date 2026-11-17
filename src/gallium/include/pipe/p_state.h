@@ -941,6 +941,12 @@ struct pipe_blit_info
    bool render_condition_enable; /**< whether the blit should honor the
                                  current render condition */
    bool alpha_blend; /* dst.rgb = src.rgb * src.a + dst.rgb * (1 - src.a) */
+
+   /* Quarter turns clockwise (0-3) applied to the source rectangle: with 1,
+    * the source's bottom-left corner lands on the destination's top-left.
+    * For 1 and 3 the destination box is the source box transposed. Only
+    * honoured by drivers blitting through util_blitter. */
+   uint8_t rotation;
 };
 
 /**

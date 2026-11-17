@@ -42,6 +42,7 @@
 #include "util/compiler.h"
 #include "util/libsync.h"
 #include "util/os_file.h"
+#include "util/u_debug.h"
 
 #include "main/glconfig.h"
 #include "egl_dri2.h"
@@ -135,6 +136,67 @@ close_in_fence_fd(struct dri2_egl_surface *dri2_surf)
    dri2_surf->in_fence_fd = -1;
 }
 
+/* Pre-rotation, see dri2_egl_surface::prerotate_hint. Off by default until
+ * validated per device: MESA_ANDROID_PREROTATE=1 (debug.mesa.android.prerotate=1).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(android_prerotate, "MESA_ANDROID_PREROTATE", false)
+
+static void
+droid_prerotate_release(struct dri2_egl_surface *dri2_surf)
+{
+   if (dri2_surf->dri_image_back &&
+       dri2_surf->dri_image_back == dri2_surf->prerotate_image)
+      dri2_surf->dri_image_back = NULL;
+   if (dri2_surf->prerotate_image) {
+      dri2_destroy_image(dri2_surf->prerotate_image);
+      dri2_surf->prerotate_image = NULL;
+   }
+   dri2_surf->prerotate_valid = false;
+}
+
+/* Before each dequeue: follow the window's transform hint. For a quarter
+ * turn, request buffers in the display's orientation with the inverse
+ * transform (as the platform Vulkan loader does for a pre-rotated swapchain);
+ * the app keeps rendering in its own orientation into prerotate_image. */
+static void
+droid_update_prerotation(struct dri2_egl_surface *dri2_surf)
+{
+   struct ANativeWindow *window = dri2_surf->window;
+   int hint = 0;
+
+   if (!debug_get_option_android_prerotate() ||
+       _eglSurfaceInSharedBufferMode(&dri2_surf->base) ||
+       ANativeWindow_query(window, ANATIVEWINDOW_QUERY_TRANSFORM_HINT, &hint) ||
+       (hint != ANATIVEWINDOW_TRANSFORM_ROTATE_90 &&
+        hint != ANATIVEWINDOW_TRANSFORM_ROTATE_270))
+      hint = 0;
+
+   /* The app-oriented size: the user dimensions if set, else the default. */
+   const int w = ANativeWindow_getWidth(window);
+   const int h = ANativeWindow_getHeight(window);
+   if (w <= 0 || h <= 0)
+      hint = 0;
+
+   if (hint) {
+      ANativeWindow_setBuffersDimensions(window, h, w);
+      ANativeWindow_setBuffersTransform(
+         window, hint == ANATIVEWINDOW_TRANSFORM_ROTATE_90
+                    ? ANATIVEWINDOW_TRANSFORM_ROTATE_270
+                    : ANATIVEWINDOW_TRANSFORM_ROTATE_90);
+   } else if (dri2_surf->prerotate_hint) {
+      ANativeWindow_setBuffersDimensions(window, 0, 0);
+      ANativeWindow_setBuffersTransform(window, 0);
+   }
+
+   if (hint != dri2_surf->prerotate_hint || w != dri2_surf->prerotate_w ||
+       h != dri2_surf->prerotate_h)
+      droid_prerotate_release(dri2_surf);
+
+   dri2_surf->prerotate_hint = hint;
+   dri2_surf->prerotate_w = w;
+   dri2_surf->prerotate_h = h;
+}
+
 static EGLBoolean
 droid_window_dequeue_buffer(struct dri2_egl_surface *dri2_surf)
 {
@@ -202,7 +264,8 @@ droid_window_enqueue_buffer(_EGLDisplay *disp,
    dri2_surf->back = NULL;
 
    if (dri2_surf->dri_image_back) {
-      dri2_destroy_image(dri2_surf->dri_image_back);
+      if (dri2_surf->dri_image_back != dri2_surf->prerotate_image)
+         dri2_destroy_image(dri2_surf->dri_image_back);
       dri2_surf->dri_image_back = NULL;
    }
 
@@ -405,8 +468,17 @@ droid_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
       if (dri2_surf->buffer)
          droid_window_cancel_buffer(dri2_surf);
 
+      /* Hand the window back without our transform and dimensions. */
+      if (dri2_surf->prerotate_hint) {
+         ANativeWindow_setBuffersTransform(dri2_surf->window, 0);
+         ANativeWindow_setBuffersDimensions(dri2_surf->window, 0, 0);
+      }
+
       ANativeWindow_release(dri2_surf->window);
    }
+
+   /* (also clears dri_image_back when it is the pre-rotation image) */
+   droid_prerotate_release(dri2_surf);
 
    if (dri2_surf->dri_image_back) {
       _eglLog(_EGL_DEBUG, "%s : %d : destroy dri_image_back", __func__,
@@ -455,17 +527,35 @@ update_buffers(struct dri2_egl_surface *dri2_surf)
       return 0;
 
    /* try to dequeue the next back buffer */
-   if (!dri2_surf->buffer && !droid_window_dequeue_buffer(dri2_surf)) {
-      _eglLog(_EGL_WARNING, "Could not dequeue buffer from native window");
-      dri2_surf->base.Lost = EGL_TRUE;
-      return -1;
+   if (!dri2_surf->buffer) {
+      droid_update_prerotation(dri2_surf);
+      if (!droid_window_dequeue_buffer(dri2_surf)) {
+         _eglLog(_EGL_WARNING, "Could not dequeue buffer from native window");
+         dri2_surf->base.Lost = EGL_TRUE;
+         return -1;
+      }
+      /* A buffer not in the requested orientation (dimensions not honoured):
+       * render to it directly and present it untransformed. */
+      if (dri2_surf->prerotate_hint &&
+          (dri2_surf->buffer->width != dri2_surf->prerotate_h ||
+           dri2_surf->buffer->height != dri2_surf->prerotate_w)) {
+         ANativeWindow_setBuffersTransform(dri2_surf->window, 0);
+         ANativeWindow_setBuffersDimensions(dri2_surf->window, 0, 0);
+         droid_prerotate_release(dri2_surf);
+         dri2_surf->prerotate_hint = 0;
+      }
    }
 
-   /* free outdated buffers and update the surface size */
-   if (dri2_surf->base.Width != dri2_surf->buffer->width ||
-       dri2_surf->base.Height != dri2_surf->buffer->height) {
-      dri2_surf->base.Width = dri2_surf->buffer->width;
-      dri2_surf->base.Height = dri2_surf->buffer->height;
+   /* free outdated buffers and update the surface size (the app's
+    * orientation: a pre-rotated window buffer is transposed) */
+   int width = dri2_surf->buffer->width, height = dri2_surf->buffer->height;
+   if (dri2_surf->prerotate_hint) {
+      width = dri2_surf->buffer->height;
+      height = dri2_surf->buffer->width;
+   }
+   if (dri2_surf->base.Width != width || dri2_surf->base.Height != height) {
+      dri2_surf->base.Width = width;
+      dri2_surf->base.Height = height;
    }
 
    return 0;
@@ -503,7 +593,7 @@ get_front_bo(struct dri2_egl_surface *dri2_surf, unsigned int format)
 }
 
 static int
-get_back_bo(struct dri2_egl_surface *dri2_surf)
+get_back_bo(struct dri2_egl_surface *dri2_surf, unsigned int format)
 {
    _EGLDisplay *disp = dri2_surf->base.Resource.Display;
 
@@ -514,6 +604,24 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
       if (!dri2_surf->buffer) {
          _eglLog(_EGL_WARNING, "Could not get native buffer");
          return -1;
+      }
+
+      if (dri2_surf->prerotate_hint) {
+         /* Render in the app's orientation; the window buffer (and its
+          * acquire fence) is written by the rotating blit at swap time. */
+         if (!dri2_surf->prerotate_image) {
+            struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+            dri2_surf->prerotate_image = dri_create_image(
+               dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
+               dri2_surf->base.Height, format, NULL, 0, 0, NULL);
+            dri2_surf->prerotate_valid = false;
+            if (!dri2_surf->prerotate_image) {
+               _eglLog(_EGL_WARNING, "pre-rotation image allocation failed");
+               return -1;
+            }
+         }
+         dri2_surf->dri_image_back = dri2_surf->prerotate_image;
+         return 0;
       }
 
       dri2_surf->dri_image_back =
@@ -569,7 +677,7 @@ droid_image_get_buffers(struct dri_drawable *driDrawable, unsigned int format,
       return 0;
 
    if (_eglSurfaceInSharedBufferMode(&dri2_surf->base)) {
-      if (get_back_bo(dri2_surf) < 0)
+      if (get_back_bo(dri2_surf, format) < 0)
          return 0;
 
       /* We have dri_image_back because this is a window surface and
@@ -594,7 +702,7 @@ droid_image_get_buffers(struct dri_drawable *driDrawable, unsigned int format,
    }
 
    if (buffer_mask & __DRI_IMAGE_BUFFER_BACK) {
-      if (get_back_bo(dri2_surf) < 0)
+      if (get_back_bo(dri2_surf, format) < 0)
          return 0;
 
       if (dri2_surf->dri_image_back) {
@@ -615,6 +723,10 @@ droid_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
       _eglError(EGL_BAD_ALLOC, "droid_query_buffer_age");
       return -1;
    }
+
+   /* The pre-rotation image persists across frames. */
+   if (dri2_surf->prerotate_hint)
+      return dri2_surf->prerotate_valid ? 1 : 0;
 
    return dri2_surf->back ? dri2_surf->back->age : 0;
 }
@@ -648,6 +760,32 @@ droid_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw)
     */
    if (dri2_surf->back)
       dri2_surf->back->age = 1;
+
+   /* Pre-rotation: write the window buffer now, before the flush below
+    * creates the release fence that queueBuffer passes on. */
+   if (dri2_surf->prerotate_hint && dri2_surf->buffer &&
+       dri2_surf->prerotate_image && !dri2_dpy->pure_swrast) {
+      _EGLContext *ctx = _eglGetCurrentContext();
+      struct dri_image *dst =
+         ctx ? droid_create_image_from_native_buffer(disp, dri2_surf->buffer,
+                                                     NULL)
+             : NULL;
+      if (dst) {
+         handle_in_fence_fd(dri2_surf, dst);
+         const int quarter_turns =
+            dri2_surf->prerotate_hint == ANATIVEWINDOW_TRANSFORM_ROTATE_90 ? 1
+                                                                           : 3;
+         dri2_blit_image(dri2_egl_context(ctx)->dri_context, dst,
+                         dri2_surf->prerotate_image, 0, 0,
+                         dri2_surf->buffer->width, dri2_surf->buffer->height,
+                         0, 0, dri2_surf->base.Width, dri2_surf->base.Height,
+                         quarter_turns << __BLIT_FLAG_ROTATE_SHIFT);
+         dri2_destroy_image(dst);
+         dri2_surf->prerotate_valid = true;
+      } else {
+         _eglLog(_EGL_WARNING, "pre-rotation: no window buffer image");
+      }
+   }
 
    dri2_flush_drawable_for_swapbuffers_flags(disp, draw,
                                              __DRI2_NOTHROTTLE_SWAPBUFFER);
@@ -943,7 +1081,8 @@ droid_display_shared_buffer(struct dri_drawable *driDrawable, int fence_fd,
       dri2_surf->back = NULL;
 
       if (dri2_surf->dri_image_back) {
-         dri2_destroy_image(dri2_surf->dri_image_back);
+         if (dri2_surf->dri_image_back != dri2_surf->prerotate_image)
+            dri2_destroy_image(dri2_surf->dri_image_back);
          dri2_surf->dri_image_back = NULL;
       }
 

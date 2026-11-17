@@ -47,6 +47,8 @@ enum blitter_attrib_type {
 struct blitter_attrib {
    struct {
       float x1, y1, x2, y2, z, w;
+      /* quarter turns clockwise, see pipe_blit_info::rotation */
+      uint8_t rotation;
    } texcoord;
 };
 

@@ -78,7 +78,14 @@ panfrost_blitter_draw_rectangle(struct blitter_context *blitter,
    if (pctx->has_blit_loop)
       panfrost_get_fresh_batch_for_fbo(pctx, "Blit feedback loop flush");
 
-   if (scr->dev.arch <= 8 || depth != 0.0f || num_instances > 1)
+   /* The fullscreen path maps texcoords linearly per axis; a rotated blit
+    * needs the four corners of the quad (util_blitter_draw_rectangle). */
+   const bool rotated =
+      attrib && (type == UTIL_BLITTER_ATTRIB_TEXCOORD_XY ||
+                 type == UTIL_BLITTER_ATTRIB_TEXCOORD_XYZW) &&
+      attrib->texcoord.rotation;
+
+   if (scr->dev.arch <= 8 || depth != 0.0f || num_instances > 1 || rotated)
       goto fallback;
 
    /* Map viewport to the dest rect of the framebuffer. The tiler will then be

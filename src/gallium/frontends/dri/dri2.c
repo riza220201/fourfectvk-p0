@@ -1530,6 +1530,8 @@ dri2_blit_image(struct dri_context *ctx, struct dri_image *dst, struct dri_image
    blit.src.format = src->texture->format;
    blit.mask = PIPE_MASK_RGBA;
    blit.filter = PIPE_TEX_FILTER_NEAREST;
+   blit.rotation = (flush_flag & __BLIT_FLAG_ROTATE_MASK) >> __BLIT_FLAG_ROTATE_SHIFT;
+   flush_flag &= ~__BLIT_FLAG_ROTATE_MASK;
 
    pipe->blit(pipe, &blit);
 

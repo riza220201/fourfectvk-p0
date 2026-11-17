@@ -662,6 +662,10 @@ enum __DRIFixedRateCompression {
 
 #define __BLIT_FLAG_FLUSH		0x0001
 #define __BLIT_FLAG_FINISH		0x0002
+/* Quarter turns clockwise (0-3) of the source, in bits 4-5 of the flags;
+ * see pipe_blit_info::rotation. */
+#define __BLIT_FLAG_ROTATE_SHIFT	4
+#define __BLIT_FLAG_ROTATE_MASK		(3 << __BLIT_FLAG_ROTATE_SHIFT)
 
 /**
  * Flags for createImageFromDmaBufs

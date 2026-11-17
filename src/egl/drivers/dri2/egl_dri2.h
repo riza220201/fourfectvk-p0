@@ -383,6 +383,17 @@ struct dri2_egl_surface {
       int age;
    } *color_buffers, *back;
    uint32_t gralloc_usage;
+
+   /* Pre-rotation (MESA_ANDROID_PREROTATE): when the window's transform hint
+    * is a quarter turn, the app renders into prerotate_image (its own
+    * orientation, base.Width x base.Height); eglSwapBuffers rotates it into a
+    * display-oriented window buffer tagged with the inverse transform, so the
+    * compositor can scan it out without rotating (no GPU composition).
+    * prerotate_hint is the NATIVE_WINDOW_TRANSFORM_ROT_* applied, or 0. */
+   int prerotate_hint;
+   int prerotate_w, prerotate_h;
+   struct dri_image *prerotate_image;
+   bool prerotate_valid;
 #endif
 
    /* surfaceless and device */
