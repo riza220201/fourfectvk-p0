@@ -1,0 +1,14 @@
+[4496.190762 +   0.000] F4 infinite-loop compute shader (stores a counter every pass) + FENCE_TRIGGER on it; wait up to 30 s
+[4496.192800 +   0.002] ctx A fd=4 kbase UK 11.46 tgt=0x782d6ea000 desc=0x782d5f9000
+[4496.192912 +   0.002] hang job: code VA 0x7fffc00000, store target VA 0x782d6f7000
+[4496.194811 +   0.004] ctx A submitted 2 atoms (first 1)
+[4496.194864 +   0.004]   OK   hang atom submitted
+[4501.325873 +   5.135] FENCE signalled, status -14, 5.133 s after submit
+[4501.326141 +   5.135] store target freed (on the fence)
+[4501.326218 +   5.136] ctx A EVENT atom 1 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[4501.326245 +   5.136] ctx A EVENT atom 2 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[4501.326295 +   5.136] fence at +5.133 s, hang event 0x4002 JOB_CANCELLED at +5.133 s, trigger event 0x4002 JOB_CANCELLED
+[4501.326312 +   5.136] fence signalled 0.437 ms BEFORE the hang atom's event was read
+[4502.328213 +   6.137]   OK   both atoms reported exactly once
+[4502.331727 +   6.141] context torn down in 3.261 ms
+[4502.331786 +   6.141] RESULT PASS (0 failed checks)

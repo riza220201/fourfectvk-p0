@@ -1,0 +1,12 @@
+[8139.909614 +   0.000] vkhang watchdog (PANVK_KBASE_P0=- EXPORT_BARRIER=- WATCHDOG_MS=-)
+[8139.910337 +   0.001] never-signalled foreign fence: fd 5 from a raw kbase context (never-ending ring)
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+Failed to create //.cache for shader cache (Read-only file system)---disabling.
+[8139.923856 +   0.014] device: Mali-G57 MC2 | driver: panvk Mesa 26.3.0-devel (git-7d3a1cd5c7)
+[8139.927070 +   0.017] buffer mapped at 0x740b16d000 (memory type 1)
+[8139.927193 +   0.018] submitted work waiting on the never-signalled fence; vkWaitForFences(UINT64_MAX)
+[8169.957644 +  30.048] vkWaitForFences = -4 (DEVICE_LOST) after 30.030 s; v[1] = 0x0
+[8169.957689 +  30.048] APP FREES the buffer memory
+[8169.957707 +  30.048] APP FREED the buffer memory
+[8169.958810 +  30.049] vkDestroyDevice took 1.096 ms
+[8169.958833 +  30.049] RESULT DEVICE_LOST by the watchdog

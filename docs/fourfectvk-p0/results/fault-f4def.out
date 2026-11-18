@@ -1,0 +1,17 @@
+[3694.902998 +   0.000] F4 infinite-loop compute shader (stores a counter every pass); wait up to 30 s
+[3694.904121 +   0.001] ctx A fd=4 kbase UK 11.46 tgt=0x7de3e01000 desc=0x7de3d02000
+[3694.904172 +   0.001] hang job: code VA 0x7fffc00000, store target VA 0x7de3dfc000
+[3694.904218 +   0.001] ctx A submitted 1 atoms (first 1)
+[3694.904223 +   0.001]   OK   hang atom submitted
+[3695.903731 +   1.001]   t= 1 s: no event; counter as the CPU sees it: 23448
+[3696.903674 +   2.001]   t= 2 s: no event; counter as the CPU sees it: 23448
+[3699.902900 +   5.000]   t= 5 s: no event; counter as the CPU sees it: 23448
+[3700.011334 +   5.108] ctx A EVENT atom 1 code 0x4 TERMINATED (#1 for this atom)
+[3700.011561 +   5.109] hang atom: code 0x4 TERMINATED after 5.107 s; store target freed 0.238 ms after the event
+[3702.011879 +   7.109]   OK   the hang atom reported exactly once
+[3702.012122 +   7.109] ctx A submitted 1 atoms (first 2)
+[3702.012399 +   7.109] ctx A EVENT atom 2 code 0x1 DONE (#1 for this atom)
+[3702.012479 +   7.110] reuse: atom 2 event code 0x1 DONE tgt 0x00004242
+[3702.012501 +   7.110]   OK   context usable after the hang
+[3702.013594 +   7.111] context torn down in 1.070 ms
+[3702.013644 +   7.111] RESULT PASS (0 failed checks)

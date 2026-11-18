@@ -1,0 +1,12 @@
+[7811.904672 +   0.000] vkhang hang (PANVK_KBASE_P0=- EXPORT_BARRIER=- WATCHDOG_MS=-)
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+Failed to create //.cache for shader cache (Read-only file system)---disabling.
+[7811.924565 +   0.020] device: Mali-G57 MC2 | driver: panvk Mesa 26.3.0-devel (git-dada4b3bcb)
+[7811.929271 +   0.025] buffer mapped at 0x769987c000 (memory type 1)
+[7811.929380 +   0.025] hang dispatch submitted
+[7817.033862 +   5.129] vkWaitForFences = -4 (DEVICE_LOST) after 5.104 s; counter as the CPU sees it 39998028
+[7817.033996 +   5.129] APP FREES the buffer memory
+[7817.034046 +   5.129] APP FREED the buffer memory
+[7817.034154 +   5.130] app objects destroyed; waiting 3 s before vkDestroyDevice
+[7820.036089 +   8.131] vkDestroyDevice took 1.631 ms
+[7820.036933 +   8.132] RESULT DEVICE_LOST as expected

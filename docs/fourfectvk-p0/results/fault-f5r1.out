@@ -1,0 +1,13 @@
+[6966.426788 +   0.000] F5 barrier after a hang: hang(1) -> ORDER -> WRITE_VALUE barrier(2) -> DATA -> FENCE_TRIGGER(3)
+[6966.429016 +   0.002] ctx A fd=4 kbase UK 11.46 tgt=0x796c395000 desc=0x796c2a4000
+[6966.429128 +   0.002] hang job: code VA 0x7fffc00000, store target VA 0x796c3a2000
+[6966.431030 +   0.004] ctx A submitted 3 atoms (first 1)
+[6966.431086 +   0.004]   OK   hang + barrier + trigger submitted
+[6971.547772 +   5.121] FENCE signalled, status 1
+[6971.547941 +   5.121] ctx A EVENT atom 1 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[6971.547974 +   5.121] ctx A EVENT atom 2 code 0x1 DONE (#1 for this atom)
+[6971.548087 +   5.121] ctx A EVENT atom 3 code 0x1 DONE (#1 for this atom)
+[6971.548129 +   5.121] hang 0x4002 JOB_CANCELLED +5.119 s; barrier 0x1 DONE +5.119 s tgt 0x0000ba77; trigger 0x1 DONE; fence +5.119 s
+[6971.548146 +   5.121]   OK   the barrier ran and reported DONE
+[6971.548181 +   5.121]   OK   the fence behind the barrier signalled without error
+[6971.548550 +   5.122] RESULT PASS (0 failed checks)

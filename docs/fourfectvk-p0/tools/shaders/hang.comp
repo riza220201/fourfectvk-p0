@@ -1,0 +1,5 @@
+#version 450
+// An endless loop: soft-stop cannot take it off the GPU (its workgroup never ends); kbase hard-stops it at ~5 s.
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) buffer B { uint v[]; };
+void main() { while (true) { atomicAdd(v[0], 1u); } }

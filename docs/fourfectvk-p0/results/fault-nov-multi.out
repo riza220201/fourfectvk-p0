@@ -1,0 +1,15 @@
+[819.290982 +   0.000] vkhang multi (PANVK_KBASE_P0=- EXPORT_BARRIER=- WATCHDOG_MS=-)
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+MESA: warning: Gralloc doesn't support lock_ycbcr (video buffers won't be supported)
+MESA: info: Using fallback gralloc implementation
+Failed to create //.cache for shader cache (Read-only file system)---disabling.
+[819.314316 +   0.023] device: Mali-G57 MC2 | driver: panvk Mesa 26.3.0-devel (git-9dd7134886)
+[819.319106 +   0.028] buffer mapped at 0x7983feb000 (memory type 1)
+[819.319484 +   0.029] hang + 5 tiny submissions queued; waiting on the last one's fence
+MESA: error: panvk: kbase atom 1 of submission 1 failed: event 0x4 (TERMINATED; PANVK_FAULT_REPORT=1 shows what it carried)
+[824.424363 +   5.133] vkWaitForFences = -4 (DEVICE_LOST) after 5.105 s; v[1] = 0x105
+[824.424483 +   5.134] APP FREES the buffer memory
+[824.424566 +   5.134] APP FREED the buffer memory
+MESA: info: panvk: P0 settled 1.2 ms after the loss: 5 submission(s) in flight reported after 0.5 ms, barrier DONE after 0.7 ms (1 try); released 1 freed BO(s), 64 KiB
+[827.425825 +   8.135] vkDestroyDevice took 0.760 ms
+[827.425970 +   8.135] RESULT DEVICE_LOST as expected

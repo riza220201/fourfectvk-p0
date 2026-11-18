@@ -1,0 +1,35 @@
+[3431.436573 +   0.000] F3 FENCE_WAIT on foreign fences that do not signal
+[3431.437572 +   0.001] ctx A fd=4 kbase UK 11.46 tgt=0x7571944000 desc=0x7571845000
+[3431.438285 +   0.002] ctx B fd=5 kbase UK 11.46 tgt=0x7571936000 desc=0x757183d000
+[3431.438308 +   0.002] F3a control: B holds a fence with EVENT_WAIT (subject to soft_job_timeout); A waits on it
+[3431.438332 +   0.002] ctx B submitted 2 atoms (first 1)
+[3431.438341 +   0.002] ctx A submitted 2 atoms (first 1)
+[3434.465806 +   3.029] ctx A EVENT atom 1 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3434.465916 +   3.029] ctx A EVENT atom 2 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3434.465944 +   3.029] ctx B EVENT atom 1 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3434.465963 +   3.029] ctx B EVENT atom 2 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3434.466001 +   3.029] F3a: A complete after 3.028 s: wait 0x4002 JOB_CANCELLED, job 0x4002 JOB_CANCELLED; B event-wait 0x4002 JOB_CANCELLED, trigger 0x4002 JOB_CANCELLED; fence status -14
+[3434.466013 +   3.029]   OK   control: the EVENT_WAIT-held fence resolves (by timeout) and A's atoms report
+[3434.466055 +   3.030] F3b: B's never-ending chain -> FENCE_TRIGGER; A: FENCE_WAIT on it -> WRITE_VALUE; watch 60 s
+[3434.466138 +   3.030] ctx B submitted 2 atoms (first 10)
+[3434.466154 +   3.030] B's fence fd 6
+[3434.466178 +   3.030] ctx A submitted 2 atoms (first 10)
+[3444.477256 +  13.041]   t= 10 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3454.487457 +  23.051]   t= 20 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3464.498683 +  33.062]   t= 30 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3474.507474 +  43.071]   t= 40 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3484.519497 +  53.083]   t= 50 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3494.530385 +  63.094]   t= 60 s: A events wait 0 / job 0; B events loop 0 / trigger 0; fence status 0
+[3494.530516 +  63.094] F3b after 60.1 s: A wait events 0, job events 0, tgt 0xdeadbeef
+[3494.530536 +  63.094]   OK   FENCE_WAIT on a never-signalled foreign fence: no event, job not run
+[3494.530552 +  63.094] F3c: context C waits on the same fence and is torn down while waiting
+[3494.532484 +  63.096] ctx C fd=7 kbase UK 11.46 tgt=0x7571839000 desc=0x7571831000
+[3494.532617 +  63.096] ctx C submitted 2 atoms (first 1)
+[3495.034916 +  63.598] C torn down with a pending FENCE_WAIT in 1.455 ms
+[3495.035031 +  63.598] F3b end: the producer dies -- context B (loop + FENCE_TRIGGER) is torn down; A must then complete
+[3495.036291 +  63.600] B torn down in 1.229 ms
+[3495.036514 +  63.600] ctx A EVENT atom 10 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3495.036650 +  63.600] ctx A EVENT atom 11 code 0x4002 JOB_CANCELLED (#1 for this atom)
+[3495.036827 +  63.600] A after B's teardown (0.304 ms): wait 0x4002 JOB_CANCELLED at +0.028 ms, job 0x4002 JOB_CANCELLED, tgt 0xdeadbeef; fence status -14
+[3495.036923 +  63.600]   OK   the producer's teardown resolves the fence: A's wait and job report
+[3495.038213 +  63.602] RESULT PASS (0 failed checks)

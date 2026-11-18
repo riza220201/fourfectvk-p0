@@ -1,0 +1,14 @@
+[8287.178795 +   0.000] vkhang export (PANVK_KBASE_P0=- EXPORT_BARRIER=1 WATCHDOG_MS=-)
+WARNING: panvk is not a conformant Vulkan implementation, testing use only.
+Failed to create //.cache for shader cache (Read-only file system)---disabling.
+[8287.215329 +   0.037] device: Mali-G57 MC2 | driver: panvk Mesa 26.3.0-devel (git-7d3a1cd5c7)
+[8287.225997 +   0.047] buffer mapped at 0x71212ec000 (memory type 1)
+[8287.226508 +   0.048] hang dispatch submitted (signals an exportable semaphore)
+[8287.226655 +   0.048] exported SYNC_FD 17, status 0
+[8292.327328 +   5.149] EXPORTED FENCE signalled, status 1, 5.101 s after submit
+[8292.328259 +   5.150] vkWaitForFences = -4 (DEVICE_LOST) after 5.102 s; counter as the CPU sees it 0
+[8292.328337 +   5.150] APP FREES the buffer memory
+[8292.328382 +   5.150] APP FREED the buffer memory
+[8292.328647 +   5.150] app objects destroyed; waiting 3 s before vkDestroyDevice
+[8295.335828 +   8.157] vkDestroyDevice took 5.167 ms
+[8295.337528 +   8.159] RESULT DEVICE_LOST as expected

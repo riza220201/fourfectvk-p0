@@ -1,0 +1,62 @@
+[2941.207587 +   0.000] F1 MMU fault (translation) among in-flight atoms
+[2941.208726 +   0.001] ctx A fd=4 kbase UK 11.46 tgt=0x7b210eb000 desc=0x7b20fec000
+[2941.209523 +   0.002] ctx B fd=5 kbase UK 11.46 tgt=0x7b210dd000 desc=0x7b20fe4000
+[2941.209597 +   0.002] bad VA 0x7b210e2000 = a freed BO (MEM_FREE rc -1 Invalid argument)
+[2941.209661 +   0.002] ctx A submitted 11 atoms (first 1)
+[2941.209667 +   0.002]   OK   A: 11 atoms submitted
+[2941.209756 +   0.002] ctx B submitted 8 atoms (first 1)
+[2941.209759 +   0.002]   OK   B: 8 atoms submitted
+[2941.210636 +   0.003] ctx A EVENT atom 1 code 0x1 DONE (#1 for this atom)
+[2941.210665 +   0.003] ctx A EVENT atom 2 code 0x1 DONE (#1 for this atom)
+[2941.210671 +   0.003] ctx A EVENT atom 3 code 0x1 DONE (#1 for this atom)
+[2941.210675 +   0.003] ctx A EVENT atom 4 code 0x1 DONE (#1 for this atom)
+[2941.210680 +   0.003] ctx A EVENT atom 5 code 0x4 TERMINATED (#1 for this atom)
+[2941.210684 +   0.003] ctx A EVENT atom 6 code 0x4 TERMINATED (#1 for this atom)
+[2941.210688 +   0.003] ctx A EVENT atom 8 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2941.210692 +   0.003] ctx A EVENT atom 9 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2941.210696 +   0.003] ctx A EVENT atom 7 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2941.210699 +   0.003] ctx A EVENT atom 10 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2941.210703 +   0.003] ctx A EVENT atom 11 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2941.210712 +   0.003] ctx B EVENT atom 1 code 0x1 DONE (#1 for this atom)
+[2941.210716 +   0.003] ctx B EVENT atom 2 code 0x1 DONE (#1 for this atom)
+[2941.210720 +   0.003] ctx B EVENT atom 3 code 0x1 DONE (#1 for this atom)
+[2941.210724 +   0.003] ctx B EVENT atom 4 code 0x1 DONE (#1 for this atom)
+[2941.210728 +   0.003] ctx B EVENT atom 5 code 0x1 DONE (#1 for this atom)
+[2941.210732 +   0.003] ctx B EVENT atom 6 code 0x1 DONE (#1 for this atom)
+[2941.210736 +   0.003] ctx B EVENT atom 7 code 0x1 DONE (#1 for this atom)
+[2941.210740 +   0.003] ctx B EVENT atom 8 code 0x1 DONE (#1 for this atom)
+[2941.210744 +   0.003] A: 0 atoms without an event after 0.001 s; B: 0
+[2942.211143 +   1.004]   A atom  1: 1 event(s), code 0x1 DONE at +1.023 ms, tgt=0x00001001
+[2942.211203 +   1.004]   A atom  2: 1 event(s), code 0x1 DONE at +1.058 ms, tgt=0x00001002
+[2942.211217 +   1.004]   A atom  3: 1 event(s), code 0x1 DONE at +1.064 ms, tgt=0x00001003
+[2942.211228 +   1.004]   A atom  4: 1 event(s), code 0x1 DONE at +1.069 ms, tgt=0x00001004
+[2942.211238 +   1.004]   A atom  5: 1 event(s), code 0x4 TERMINATED at +1.073 ms, tgt=0x00000000
+[2942.211248 +   1.004]   A atom  6: 1 event(s), code 0x4 TERMINATED at +1.077 ms, tgt=0xdeadbeef
+[2942.211258 +   1.004]   A atom  7: 1 event(s), code 0x42 JOB_READ_FAULT at +1.089 ms, tgt=0xdeadbeef
+[2942.211268 +   1.004]   A atom  8: 1 event(s), code 0x42 JOB_READ_FAULT at +1.081 ms, tgt=0xdeadbeef
+[2942.211277 +   1.004]   A atom  9: 1 event(s), code 0x42 JOB_READ_FAULT at +1.085 ms, tgt=0xdeadbeef
+[2942.211286 +   1.004]   A atom 10: 1 event(s), code 0x42 JOB_READ_FAULT at +1.093 ms, tgt=0xdeadbeef
+[2942.211296 +   1.004]   A atom 11: 1 event(s), code 0x42 JOB_READ_FAULT at +1.097 ms, tgt=0xdeadbeef
+[2942.211305 +   1.004]   OK   A: every atom reported exactly once
+[2942.211314 +   1.004]   OK   B (other context): all 8 DONE once, values written
+[2942.211323 +   1.004]   OK   A: a value is written exactly when its atom reported DONE
+[2942.211332 +   1.004] F1 phase 2: reuse context A (same atom numbers 1..4, then 20..23)
+[2942.211412 +   1.004] ctx A submitted 8 atoms (first 1)
+[2942.212032 +   1.004] ctx A EVENT atom 1 code 0x1 DONE (#1 for this atom)
+[2942.212070 +   1.005] ctx A EVENT atom 2 code 0x1 DONE (#1 for this atom)
+[2942.212079 +   1.005] ctx A EVENT atom 3 code 0x1 DONE (#1 for this atom)
+[2942.212086 +   1.005] ctx A EVENT atom 4 code 0x1 DONE (#1 for this atom)
+[2942.212092 +   1.005] ctx A EVENT atom 21 code 0x1 DONE (#1 for this atom)
+[2942.212098 +   1.005] ctx A EVENT atom 22 code 0x1 DONE (#1 for this atom)
+[2942.212104 +   1.005] ctx A EVENT atom 23 code 0x1 DONE (#1 for this atom)
+[2942.212110 +   1.005] ctx A EVENT atom 24 code 0x1 DONE (#1 for this atom)
+[2942.212118 +   1.005] A phase 2: 0 missing after 0.001 s; codes 1:0x1 21:0x1
+[2942.212122 +   1.005]   OK   A after the fault: 8 more atoms DONE and written (context usable)
+[2942.212126 +   1.005] F1 phase 3: one more bad atom, then good atoms ORDER-dependent on it
+[2942.212170 +   1.005] ctx A submitted 2 atoms (first 30)
+[2942.213068 +   1.006] ctx A EVENT atom 30 code 0x4 TERMINATED (#1 for this atom)
+[2942.213169 +   1.006] ctx A EVENT atom 31 code 0x42 JOB_READ_FAULT (#1 for this atom)
+[2942.213177 +   1.006] A phase 3: 0 missing; 30: 0x4 TERMINATED, 31: 0x42 JOB_READ_FAULT tgt=0xdeadbeef
+[2942.213181 +   1.006]   OK   A: the second fault also reports
+[2942.213874 +   1.006] A torn down in 0.681 ms
+[2942.214718 +   1.007] RESULT PASS (0 failed checks)

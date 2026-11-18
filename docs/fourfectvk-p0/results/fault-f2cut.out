@@ -1,0 +1,15 @@
+[3340.057720 +   0.000] F2 never-ending, soft-stoppable job chain (J0 <-> J1 clearing each other), watch 20 s, end=gpucut
+[3340.058830 +   0.001] ctx A fd=4 kbase UK 11.46 tgt=0x7623d14000 desc=0x7623c15000
+[3340.060494 +   0.003] ctx A submitted 1 atoms (first 1)
+[3340.060522 +   0.003]   OK   loop atom submitted
+[3341.063088 +   1.005]   t=  1 s: events for the loop atom: 0
+[3342.064375 +   2.007]   t=  2 s: events for the loop atom: 0
+[3350.074836 +  10.017]   t= 10 s: events for the loop atom: 0
+[3360.087497 +  20.030]   t= 20 s: events for the loop atom: 0
+[3360.087638 +  20.030] after 20.0 s: loop atom events 0 (code 0x0 ?)
+[3360.087665 +  20.030]   OK   no event while the chain loops (no hard-stop, no reset)
+[3360.087755 +  20.030] ctx A submitted 1 atoms (first 2)
+[3370.087624 +  30.030] GPU-side cut: 2 of 2 atoms without an event after 9999.896 ms; cutter 0x0 ? at +-1.000 ms, loop 0x0 ? at +-1.000 ms
+[3370.087714 +  30.030]   FAIL the cutter ran between soft-stops; the loop ended DONE
+[3370.089941 +  30.032] context A torn down (loop STILL RUNNING): munmap+close took 2.182 ms
+[3370.090019 +  30.032] RESULT FAIL (1 failed checks)
