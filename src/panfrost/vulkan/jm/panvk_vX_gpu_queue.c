@@ -72,6 +72,15 @@ static inline void
 kbase_kmod_mem_stats(struct kbase_kmod_mem_stats *out)
 {
 }
+static inline void
+kbase_kmod_quarantine_hold(struct pan_kmod_dev *dev)
+{
+}
+static inline unsigned
+kbase_kmod_quarantine_release(struct pan_kmod_dev *dev, uint64_t *bytes_out)
+{
+   return 0;
+}
 #endif
 
 struct panvk_kbase_event_v2 {
@@ -356,6 +365,29 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
 #define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE (1U << 12)
 #define BASE_JD_EVENT_DONE 0x1
 #define BASE_JD_EVENT_JOB_CANCELLED 0x4002
+#define BASE_JD_REQ_CS (1U << 1)
+
+/* P0 (FourFectVK T06/T08): after a failed atom the Vulkan device is lost,
+ * but the GPU may still be running the failed work -- a hung shader until
+ * kbase hard-stops it (~5 s) or resets the GPU (~8.5 s), other atoms until
+ * they report -- and the application now frees everything. Measured on the
+ * RS4 (mesa-mobile JOURNAL (ai)): kbase posts an event for every atom, but
+ * neither the event nor an exported fence proves the GPU has stopped (a
+ * FENCE_TRIGGER can signal during the GPU reset), and closing the fd does
+ * not order the frees after the jobs (mappings keep the context alive until
+ * they are gone). What does prove it: a new GPU job completing after every
+ * failed atom has reported -- kbase starts nothing on the GPU while a reset
+ * is pending (kbase_backend_slot_update), so its DONE comes after any reset.
+ * So from the loss on, freed BOs are held mapped (kbase_kmod_quarantine_*),
+ * a settle thread waits for every in-flight atom to report and for such a
+ * barrier job, then releases them. Work that never ends (a foreign fence
+ * that is never signalled, a job chain that obeys soft-stop forever) cannot
+ * settle: the memory stays held until the device is destroyed; neither case
+ * has the GPU under reset, so freeing then faults on the GPU instead of
+ * reaching freed pages (measured). PANVK_KBASE_P0=0 turns all of it off
+ * (control); PANVK_KBASE_P0_DEADLINE_MS (12000) bounds the settle. */
+#define PANVK_KBASE_P0_ATOM 255 /* reserved for the settle barrier */
+#define PANVK_KBASE_P0_SLOT_SIZE 128 /* one WRITE_VALUE job per atom number */
 
 /* struct base_fence, mali_base_kernel.h */
 struct panvk_kbase_base_fence {
@@ -409,6 +441,7 @@ struct panvk_kbase_sub {
    uint64_t seqno;
    uint8_t last; /* the atom whose event completes the submission */
    bool done;
+   bool terminal; /* P0: its last atom reported, whatever the code */
    int fence_fd; /* out-fence made by an export, -1 until then */
    uint64_t submit_ns; /* PANVK_FRAME_PROF */
    uint16_t nr_atoms;
@@ -467,7 +500,29 @@ struct panvk_kbase_jm {
    struct panvk_kbase_atom_info atom_info[256];
    /* PANVK_FRAME_PROF: end of the GPU busy time counted so far. */
    uint64_t busy_end_ns;
+
+   /* P0, see PANVK_KBASE_P0_ATOM. Under mtx except where noted. */
+   struct {
+      bool enabled;
+      bool started;      /* loss latched: quarantine held, settle started */
+      bool thread_ok;
+      bool settled;      /* proven: quarantine released */
+      bool barrier_seen;
+      uint32_t barrier_code;
+      thrd_t thread;
+      uint64_t lost_ns, deadline_ns;
+      unsigned aux_inflight; /* export FENCE_TRIGGERs not yet reported */
+      struct panvk_priv_bo *bo; /* barrier WRITE_VALUE jobs, one per atom */
+   } p0;
+   /* An export's barrier atom, freed with its FENCE_TRIGGER (0 = none). */
+   uint8_t aux_pair[256];
+   bool export_barrier;
+   /* Watchdog: a wait with work in flight and no event for watchdog_ns
+    * latches a loss (PANVK_KBASE_WATCHDOG_MS, 0 = off). */
+   uint64_t watchdog_ns, last_progress_ns;
 };
+
+static void panvk_kbase_mark_lost(struct panvk_kbase_jm *k);
 
 static bool
 panvk_kbase_chain_enabled(void)
@@ -969,16 +1024,36 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
 {
    const uint8_t atom = ev->atom_number;
 
+   k->last_progress_ns = os_time_get_nano();
+
+   if (atom == PANVK_KBASE_P0_ATOM && k->p0.bo) {
+      k->p0.barrier_seen = true;
+      k->p0.barrier_code = ev->event_code;
+      return;
+   }
+
    if (k->atom_use[atom] == PANVK_KBASE_ATOM_AUX) {
+      /* An export: its FENCE_TRIGGER always reports; its barrier (if any)
+       * only on failure, and is freed with the trigger. */
+      const bool trigger =
+         k->atom_info[atom].core_req == BASE_JD_REQ_SOFT_FENCE_TRIGGER;
+      if (trigger && k->p0.aux_inflight)
+         k->p0.aux_inflight--;
       if (ev->event_code != BASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase out-fence atom %u: event 0x%x", atom,
                    ev->event_code);
-         k->lost = true;
+         panvk_kbase_mark_lost(k);
          vk_device_set_lost(&k->dev->vk, "kbase out-fence failed: 0x%x",
                             ev->event_code);
       }
-      if (!k->lost)
+      if (!k->lost && trigger) {
          panvk_kbase_free_atoms(k, 1, &atom);
+         if (k->aux_pair[atom]) {
+            const uint8_t barrier = k->aux_pair[atom];
+            k->aux_pair[atom] = 0;
+            panvk_kbase_free_atoms(k, 1, &barrier);
+         }
+      }
       return;
    }
 
@@ -993,10 +1068,14 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
        !(k->atom_info[atom].core_req == BASE_JD_REQ_SOFT_FENCE_WAIT &&
          ev->event_code == BASE_JD_EVENT_JOB_CANCELLED)) {
       panvk_kbase_report_failure(k, atom, sub->seqno, ev->event_code);
-      k->lost = true;
+      panvk_kbase_mark_lost(k);
       vk_device_set_lost(&k->dev->vk, "kbase atom %u failed: 0x%x", atom,
                          ev->event_code);
    }
+   /* P0: the last atom depends on every other atom of its submission (DATA
+    * chain, the wait by ORDER), so once it reported, all of it has. */
+   if (atom == sub->last)
+      sub->terminal = true;
    if (k->lost)
       return;
 
@@ -1074,10 +1153,149 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    for (unsigned i = 0; len > 0 && i < len / sizeof(ev[0]); i++)
       panvk_kbase_handle_event(k, &ev[i]);
    if (failed)
-      k->lost = true;
+      panvk_kbase_mark_lost(k);
    k->reading = false;
    u_cnd_monotonic_broadcast(&k->cnd);
    return ret != 0;
+}
+
+/* P0: a WRITE_VALUE job in atom number num's slot of the barrier BO (it writes
+ * num to the slot's second half). A slot is only rewritten once its atom
+ * number is free again, i.e. after its previous job reported. */
+static uint64_t
+panvk_kbase_barrier_job(struct panvk_kbase_jm *k, uint8_t num)
+{
+   uint8_t *cpu = (uint8_t *)k->p0.bo->addr.host +
+                  (size_t)num * PANVK_KBASE_P0_SLOT_SIZE;
+   const uint64_t gpu = k->p0.bo->addr.dev +
+                        (uint64_t)num * PANVK_KBASE_P0_SLOT_SIZE;
+
+   memset(cpu, 0, PANVK_KBASE_P0_SLOT_SIZE);
+   pan_section_pack(cpu, WRITE_VALUE_JOB, HEADER, cfg) {
+      cfg.type = MALI_JOB_TYPE_WRITE_VALUE;
+      cfg.index = 1;
+   }
+   pan_section_pack(cpu, WRITE_VALUE_JOB, PAYLOAD, cfg) {
+      cfg.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_32;
+      cfg.address = gpu + PANVK_KBASE_P0_SLOT_SIZE / 2;
+      cfg.immediate_value = num;
+   }
+   return gpu;
+}
+
+/* P0: every submission still in the ring has reported its last atom, and
+ * every export's FENCE_TRIGGER has reported. Caller holds k->mtx. */
+static bool
+panvk_kbase_p0_all_terminal(const struct panvk_kbase_jm *k)
+{
+   for (unsigned i = 0; i < k->count; i++) {
+      const struct panvk_kbase_sub *sub =
+         &k->subs[(k->head + i) % PANVK_KBASE_MAX_SUBS];
+      if (!sub->done && !sub->terminal)
+         return false;
+   }
+   return k->p0.aux_inflight == 0;
+}
+
+static int
+panvk_kbase_p0_settle(void *data)
+{
+   struct panvk_kbase_jm *k = data;
+   const uint64_t deadline = k->p0.lost_ns + k->p0.deadline_ns;
+   unsigned tries = 0, pending = 0;
+   const char *why = NULL;
+
+   mtx_lock(&k->mtx);
+   for (unsigned i = 0; i < k->count; i++)
+      pending += !k->subs[(k->head + i) % PANVK_KBASE_MAX_SUBS].terminal;
+
+   /* 1. Every atom in flight reports. kbase bounds GPU work (hard-stop,
+    * reset); only foreign fences and soft-stoppable endless chains don't. */
+   while (!panvk_kbase_p0_all_terminal(k)) {
+      if (os_time_get_nano() >= deadline) {
+         why = "in-flight work did not report";
+         break;
+      }
+      panvk_kbase_progress_locked(k, deadline);
+   }
+   const uint64_t terminal_ns = os_time_get_nano();
+
+   /* 2. A new GPU job completes after it: kbase starts nothing on the GPU
+    * while a reset is pending, so its DONE comes after any reset. */
+   while (!why && !k->p0.settled) {
+      if (++tries > 3) {
+         why = "the barrier job failed three times";
+         break;
+      }
+      uint8_t atom[PANVK_KBASE_ATOM_STRIDE];
+      panvk_kbase_atom(atom, PANVK_KBASE_P0_ATOM,
+                       panvk_kbase_barrier_job(k, PANVK_KBASE_P0_ATOM),
+                       BASE_JD_REQ_CS, 0, 0, 0, 0);
+      struct kbase_ioctl_job_submit submit = {
+         .addr = (uint64_t)(uintptr_t)atom,
+         .nr_atoms = 1,
+         .stride = PANVK_KBASE_ATOM_STRIDE,
+      };
+      k->p0.barrier_seen = false;
+      if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+         mesa_loge("panvk: P0 barrier submit failed: %s", strerror(errno));
+         why = "the barrier job could not be submitted";
+         break;
+      }
+      while (!k->p0.barrier_seen) {
+         if (os_time_get_nano() >= deadline)
+            break;
+         panvk_kbase_progress_locked(k, deadline);
+      }
+      if (!k->p0.barrier_seen) {
+         why = "the barrier job did not report";
+         break;
+      }
+      if (k->p0.barrier_code == BASE_JD_EVENT_DONE)
+         k->p0.settled = true;
+      else
+         mesa_loge("panvk: P0 barrier job: event 0x%x (%s), again",
+                   k->p0.barrier_code, panvk_jd_event_str(k->p0.barrier_code));
+   }
+   const bool settled = k->p0.settled;
+   mtx_unlock(&k->mtx);
+
+   const uint64_t now = os_time_get_nano();
+   if (settled) {
+      uint64_t bytes = 0;
+      const unsigned n =
+         kbase_kmod_quarantine_release(k->dev->kmod.dev, &bytes);
+      mesa_logi("panvk: P0 settled %.1f ms after the loss: %u submission(s) "
+                "in flight reported after %.1f ms, barrier DONE after %.1f ms "
+                "(%u tr%s); released %u freed BO(s), %" PRIu64 " KiB",
+                (now - k->p0.lost_ns) / 1e6, pending,
+                (terminal_ns - k->p0.lost_ns) / 1e6, (now - terminal_ns) / 1e6,
+                tries, tries == 1 ? "y" : "ies", n, bytes >> 10);
+   } else {
+      mesa_loge("panvk: P0 NOT settled %.1f ms after the loss (%s): freed "
+                "memory stays held until the device is destroyed",
+                (now - k->p0.lost_ns) / 1e6, why ? why : "?");
+   }
+   return 0;
+}
+
+/* Latch a device loss. With P0, hold the quarantine from now on and start
+ * proving the GPU done with the failed work. Caller holds k->mtx. */
+static void
+panvk_kbase_mark_lost(struct panvk_kbase_jm *k)
+{
+   k->lost = true;
+   u_cnd_monotonic_broadcast(&k->cnd);
+   if (!k->p0.enabled || k->p0.started)
+      return;
+   k->p0.started = true;
+   k->p0.lost_ns = os_time_get_nano();
+   kbase_kmod_quarantine_hold(k->dev->kmod.dev);
+   k->p0.thread_ok =
+      thrd_create(&k->p0.thread, panvk_kbase_p0_settle, k) == thrd_success;
+   if (!k->p0.thread_ok)
+      mesa_loge("panvk: P0 settle thread failed to start: freed memory stays "
+                "held until the device is destroyed");
 }
 
 /* Caller holds k->mtx. May wait (dropping it) for completions to free
@@ -1203,11 +1421,12 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
       /* Some atoms may be in the kernel: keep their numbers, give up. */
       mesa_loge("panvk: kbase JOB_SUBMIT of %u atoms failed: %s", nr_atoms,
                 strerror(errno));
-      k->lost = true;
-      u_cnd_monotonic_broadcast(&k->cnd);
+      panvk_kbase_mark_lost(k);
       return VK_ERROR_DEVICE_LOST;
    }
 
+   if (!k->count)
+      k->last_progress_ns = os_time_get_nano(); /* watchdog: work starts */
    assert(k->count < PANVK_KBASE_MAX_SUBS);
    struct panvk_kbase_sub *sub =
       &k->subs[(k->head + k->count) % PANVK_KBASE_MAX_SUBS];
@@ -1239,10 +1458,26 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
          result = VK_ERROR_DEVICE_LOST;
          break;
       }
-      if (!panvk_kbase_progress_locked(k, abs_timeout_ns) &&
+      const bool watch = k->watchdog_ns && k->count;
+      const uint64_t watch_end = k->last_progress_ns + k->watchdog_ns;
+      if (!panvk_kbase_progress_locked(
+             k, watch ? MIN2(abs_timeout_ns, watch_end) : abs_timeout_ns) &&
           k->completed_seqno < seqno) {
-         result = VK_TIMEOUT;
-         break;
+         const uint64_t now = os_time_get_nano();
+         if (watch && now >= k->last_progress_ns + k->watchdog_ns &&
+             !k->lost) {
+            mesa_loge("panvk: no kbase event for %.1f s with %u submission(s) "
+                      "in flight: device lost (PANVK_KBASE_WATCHDOG_MS)",
+                      (now - k->last_progress_ns) / 1e9, k->count);
+            panvk_kbase_mark_lost(k);
+            vk_device_set_lost(&k->dev->vk, "kbase watchdog: no progress");
+            result = VK_ERROR_DEVICE_LOST;
+            break;
+         }
+         if (now >= abs_timeout_ns) {
+            result = VK_TIMEOUT;
+            break;
+         }
       }
    }
    if (k->lost || k->closing)
@@ -1506,35 +1741,60 @@ panvk_kbase_sync_export_active(
       assert(k->count && sub->seqno == seqno);
 
       if (sub->fence_fd < 0) {
-         uint8_t num;
-         result = panvk_kbase_alloc_atoms(k, 1, &num, PANVK_KBASE_ATOM_AUX);
+         /* P0: with the export barrier, the FENCE_TRIGGER waits for a
+          * WRITE_VALUE job ORDER-dependent on the submission (a failure does
+          * not cancel it): kbase only runs it once the submission is over
+          * and after any GPU reset, so the sync_file never signals while the
+          * GPU may still run the work (a trigger DATA-dependent on the
+          * submission itself signals -EFAULT as soon as the kernel cancels
+          * it, which can be during the reset). The cost: a tiny job per
+          * export; the fence then reports success even if the work failed,
+          * the device loss is reported through Vulkan. */
+         const bool barrier = k->export_barrier;
+         uint8_t nums[2];
+         result = panvk_kbase_alloc_atoms(k, barrier ? 2 : 1, nums,
+                                          PANVK_KBASE_ATOM_AUX);
          if (result != VK_SUCCESS)
             break;
          /* The allocation may have waited: the submission may have completed,
           * or another export may have made its fence. Look again. */
          if (k->completed_seqno >= seqno || sub->fence_fd >= 0) {
-            panvk_kbase_free_atoms(k, 1, &num);
+            panvk_kbase_free_atoms(k, barrier ? 2 : 1, nums);
             continue;
          }
+         const uint8_t num = nums[barrier ? 1 : 0];
 
          struct panvk_kbase_base_fence fence = {.fd = -1, .stream_fd = -1};
-         uint8_t atom[PANVK_KBASE_ATOM_STRIDE];
-         panvk_kbase_atom(atom, num, (uintptr_t)&fence,
-                          BASE_JD_REQ_SOFT_FENCE_TRIGGER, sub->last,
+         uint8_t atom[2][PANVK_KBASE_ATOM_STRIDE];
+         if (barrier) {
+            k->atom_info[nums[0]] =
+               (struct panvk_kbase_atom_info){.core_req = BASE_JD_REQ_CS};
+            panvk_kbase_atom(atom[0], nums[0],
+                             panvk_kbase_barrier_job(k, nums[0]),
+                             BASE_JD_REQ_CS |
+                                BASE_JD_REQ_EVENT_ONLY_ON_FAILURE,
+                             sub->last, BASE_JD_DEP_TYPE_ORDER, 0, 0);
+         }
+         k->atom_info[num] = (struct panvk_kbase_atom_info){
+            .core_req = BASE_JD_REQ_SOFT_FENCE_TRIGGER};
+         panvk_kbase_atom(atom[barrier ? 1 : 0], num, (uintptr_t)&fence,
+                          BASE_JD_REQ_SOFT_FENCE_TRIGGER,
+                          barrier ? nums[0] : sub->last,
                           BASE_JD_DEP_TYPE_DATA, 0, 0);
          struct kbase_ioctl_job_submit submit = {
             .addr = (uint64_t)(uintptr_t)atom,
-            .nr_atoms = 1,
+            .nr_atoms = barrier ? 2 : 1,
             .stride = PANVK_KBASE_ATOM_STRIDE,
          };
          if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
             mesa_loge("panvk: kbase FENCE_TRIGGER submit failed: %s",
                       strerror(errno));
-            k->lost = true;
-            u_cnd_monotonic_broadcast(&k->cnd);
+            panvk_kbase_mark_lost(k);
             result = VK_ERROR_DEVICE_LOST;
             break;
          }
+         k->aux_pair[num] = barrier ? nums[0] : 0;
+         k->p0.aux_inflight++;
          if (fence.fd < 0) {
             /* The atom completes (and frees its number) with an error. */
             mesa_loge("panvk: kbase FENCE_TRIGGER gave no fd");
@@ -2148,8 +2408,7 @@ err_submit:
       chain->nr_batches = 0;
    }
    mtx_lock(&k->mtx);
-   k->lost = true;
-   u_cnd_monotonic_broadcast(&k->cnd);
+   panvk_kbase_mark_lost(k);
    mtx_unlock(&k->mtx);
    return vk_device_set_lost(&dev->vk, "kbase submission failed: %d", result);
 }
@@ -2211,9 +2470,11 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
 
    k->fd = device->drm_fd;
    k->chain.wait_fd = -1;
-   /* Atom number 0 means "no dependency": never hand it out. */
+   /* Atom number 0 means "no dependency": never hand it out. 255 is the P0
+    * settle barrier's. */
    k->atom_use[0] = PANVK_KBASE_ATOM_SUB;
-   k->nr_free = 255;
+   k->atom_use[PANVK_KBASE_P0_ATOM] = PANVK_KBASE_ATOM_SUB;
+   k->nr_free = 254;
    k->cursor = 1;
    k->wait_submit = pan_env_flag("PANVK_KBASE_WAIT_SUBMIT") != NULL;
    k->cpu_fence_wait = pan_env_flag("PANVK_KBASE_CPU_FENCE_WAIT") != NULL;
@@ -2232,6 +2493,25 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    k->t0_ns = os_time_get_nano();
    k->fault_report = pan_env_flag("PANVK_FAULT_REPORT") != NULL;
    k->audit_all = pan_env_flag("PANVK_FAULT_AUDIT_ALL") != NULL;
+   /* P0 (see PANVK_KBASE_P0_ATOM): on by default; =0 is the control. */
+   k->p0.enabled = debug_get_bool_option("PANVK_KBASE_P0", true);
+   k->p0.deadline_ns =
+      debug_get_num_option("PANVK_KBASE_P0_DEADLINE_MS", 12000) * 1000000ull;
+   k->watchdog_ns =
+      debug_get_num_option("PANVK_KBASE_WATCHDOG_MS", 30000) * 1000000ull;
+   if (k->p0.enabled || debug_get_bool_option("PANVK_KBASE_EXPORT_BARRIER",
+                                              false)) {
+      if (panvk_priv_bo_create(device, 256 * PANVK_KBASE_P0_SLOT_SIZE, 0,
+                               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE,
+                               &k->p0.bo) != VK_SUCCESS) {
+         mesa_loge("panvk: P0 barrier BO allocation failed: P0 off");
+         k->p0.bo = NULL;
+         k->p0.enabled = false;
+      }
+   }
+   k->export_barrier =
+      k->p0.bo && debug_get_bool_option("PANVK_KBASE_EXPORT_BARRIER",
+                                        k->p0.enabled);
 
    if (mtx_init(&k->mtx, mtx_plain) != thrd_success)
       goto err_free;
@@ -2255,6 +2535,7 @@ err_cnd:
 err_mtx:
    mtx_destroy(&k->mtx);
 err_free:
+   panvk_priv_bo_unref(k->p0.bo);
    vk_free(&device->vk.alloc, k);
    return panvk_error(device, VK_ERROR_INITIALIZATION_FAILED);
 }
@@ -2264,6 +2545,11 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
 {
    if (!k)
       return;
+
+   /* P0: let the settle finish (it ends by its deadline) before anything is
+    * torn down; what is still held after that is freed at device destroy. */
+   if (k->p0.started && k->p0.thread_ok)
+      thrd_join(k->p0.thread, NULL);
 
    panvk_kbase_jm_close(k);
    uint64_t wake;
@@ -2277,8 +2563,9 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
       if (!panvk_kbase_progress_locked(k, timeout))
          break;
    }
-   if (k->lost || k->completed_seqno < k->last_seqno)
-      mesa_loge("panvk: kbase GPU retirement unproven at destroy");
+   if (k->lost ? !k->p0.settled : k->completed_seqno < k->last_seqno)
+      mesa_loge("panvk: kbase GPU retirement unproven at destroy%s",
+                k->lost && !k->p0.enabled ? " (PANVK_KBASE_P0=0)" : "");
    mtx_unlock(&k->mtx);
 
    panvk_kbase_log_stats(k);
@@ -2291,6 +2578,7 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
    }
    if (k->chain.wait_fd >= 0)
       close(k->chain.wait_fd);
+   panvk_priv_bo_unref(k->p0.bo);
    for (unsigned i = 0; i < 2; i++) {
       panvk_priv_bo_unref(k->overlap_banks[i].heap);
       panvk_priv_bo_unref(k->overlap_banks[i].tls);
