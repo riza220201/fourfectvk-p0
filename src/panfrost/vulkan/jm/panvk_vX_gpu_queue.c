@@ -528,7 +528,7 @@ struct panvk_kbase_jm {
    uint8_t aux_pair[256];
    bool export_barrier;
    /* Watchdog: a wait with work in flight and no event for watchdog_ns
-    * latches a loss (PANVK_KBASE_WATCHDOG_MS, 0 = off). */
+    * latches a loss (PANVK_KBASE_WATCHDOG_MS, default 0 = off). */
    uint64_t watchdog_ns, last_progress_ns;
 };
 
@@ -2510,8 +2510,11 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    k->p0.enabled = debug_get_bool_option("PANVK_KBASE_P0", true);
    k->p0.deadline_ns =
       debug_get_num_option("PANVK_KBASE_P0_DEADLINE_MS", 12000) * 1000000ull;
+   /* Opt-in: a legitimate wait can exceed any fixed time (screen off, the
+    * compositor holds the swapchain image a queued submission waits for),
+    * and a false loss kills the app. */
    k->watchdog_ns =
-      debug_get_num_option("PANVK_KBASE_WATCHDOG_MS", 30000) * 1000000ull;
+      debug_get_num_option("PANVK_KBASE_WATCHDOG_MS", 0) * 1000000ull;
    if (k->p0.enabled || debug_get_bool_option("PANVK_KBASE_EXPORT_BARRIER",
                                               false)) {
       if (panvk_priv_bo_create(device, 256 * PANVK_KBASE_P0_SLOT_SIZE, 0,
