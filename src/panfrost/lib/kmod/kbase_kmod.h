@@ -94,6 +94,16 @@ uint64_t kbase_kmod_bo_commit_bytes(struct pan_kmod_bo *bo);
 /* PATCH: names what a GPU address belongs to (live BO, quarantined freed
  * BO, nothing) when PANVK_FAULT_REPORT or PANVK_DBG_FREE_DELAY_MS is set. */
 void kbase_kmod_describe_va(uint64_t va, char *buf, size_t size);
+
+/* P0 (FourFectVK T06/T08). A JM queue that has seen a failure holds the
+ * quarantine: every BO freed meanwhile stays mapped on the GPU instead of
+ * going back to kbase. Once the queue has proven the GPU is done with the
+ * failed work (every in-flight atom reported and a barrier job completed
+ * after any reset), it releases: the held BOs are freed and later frees go
+ * straight back. Device destroy frees whatever is still held. */
+void kbase_kmod_quarantine_hold(struct pan_kmod_dev *dev);
+unsigned kbase_kmod_quarantine_release(struct pan_kmod_dev *dev,
+                                       uint64_t *bytes_out);
 int kbase_kmod_va_check(uint64_t va, uint64_t len, void *out, bool *growable,
                         uint64_t *bo_va, uint64_t *bo_size);
 

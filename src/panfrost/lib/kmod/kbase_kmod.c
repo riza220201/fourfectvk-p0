@@ -90,6 +90,12 @@ struct kbase_kmod_dev {
    /* CSF USER register page (LATEST_FLUSH etc.), CSF only. */
    void *user_reg_page;
 
+   /* P0 (FourFectVK T06/T08): > 0 while a JM failure is unsettled. Freed BOs
+    * are then kept mapped on the GPU (quarantined, "held") instead of being
+    * returned to kbase, until the queue proves the GPU is done with them
+    * (kbase_kmod_quarantine_release) or the device is destroyed. */
+   int quar_hold; /* p_atomic */
+
    /* Monotonically-increasing handle counter.
     * kbase has no GEM handles; we mint our own u32 handles for use with the
     * pan_kmod handle_to_bo sparse array. */
@@ -1627,6 +1633,7 @@ struct kbase_quar_bo {
    uint64_t gpu_va, size, freed_ns;
    void *cpu_ptr, *gpu_mapping;
    bool same_va, owns_cpu_mapping;
+   bool held; /* P0 hold: only kbase_kmod_quarantine_release or destroy free it */
    int dmabuf_fd, fd;
    uint32_t flags;
 };
@@ -1702,7 +1709,8 @@ kbase_quar_reap(int fd, bool all)
 
    simple_mtx_lock(&kbase_diag_lock);
    list_for_each_entry_safe(struct kbase_quar_bo, q, &kbase_quar_list, link) {
-      if (all ? q->fd == fd : now - q->freed_ns >= kbase_free_delay_ns) {
+      if (all ? q->fd == fd
+              : !q->held && now - q->freed_ns >= kbase_free_delay_ns) {
          list_del(&q->link);
          list_addtail(&q->link, &done);
       }
@@ -1711,6 +1719,43 @@ kbase_quar_reap(int fd, bool all)
 
    list_for_each_entry_safe(struct kbase_quar_bo, q, &done, link)
       kbase_quar_release(q);
+}
+
+void
+kbase_kmod_quarantine_hold(struct pan_kmod_dev *dev)
+{
+   struct kbase_kmod_dev *kdev = container_of(dev, struct kbase_kmod_dev, base);
+   p_atomic_inc(&kdev->quar_hold);
+}
+
+unsigned
+kbase_kmod_quarantine_release(struct pan_kmod_dev *dev,
+                              uint64_t *bytes_out)
+{
+   struct kbase_kmod_dev *kdev = container_of(dev, struct kbase_kmod_dev, base);
+   struct list_head done;
+   unsigned n = 0;
+   uint64_t bytes = 0;
+   list_inithead(&done);
+
+   /* Stop holding first: a BO freed from here on goes straight back. */
+   p_atomic_dec(&kdev->quar_hold);
+   simple_mtx_lock(&kbase_diag_lock);
+   list_for_each_entry_safe(struct kbase_quar_bo, q, &kbase_quar_list, link) {
+      if (q->held && q->fd == dev->fd) {
+         list_del(&q->link);
+         list_addtail(&q->link, &done);
+         n++;
+         bytes += q->size;
+      }
+   }
+   simple_mtx_unlock(&kbase_diag_lock);
+
+   list_for_each_entry_safe(struct kbase_quar_bo, q, &done, link)
+      kbase_quar_release(q);
+   if (bytes_out)
+      *bytes_out = bytes;
+   return n;
 }
 
 static uint64_t kbase_bo_query_commit(int fd, uint64_t gpu_va);
@@ -2125,7 +2170,10 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
       simple_mtx_unlock(&kbase_diag_lock);
    }
 
-   if (kbase_diag_tracking() && kbase_free_delay_ns) {
+   struct kbase_kmod_dev *kdev =
+      container_of(bo->dev, struct kbase_kmod_dev, base);
+   const bool held = p_atomic_read(&kdev->quar_hold) > 0;
+   if (held || (kbase_diag_tracking() && kbase_free_delay_ns)) {
       struct kbase_quar_bo *q = calloc(1, sizeof(*q));
       if (q) {
          q->gpu_va = kbase_bo->gpu_va;
@@ -2138,6 +2186,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
          q->dmabuf_fd = kbase_bo->dmabuf_fd;
          q->fd = bo->dev->fd;
          q->flags = bo->flags;
+         q->held = held;
          simple_mtx_lock(&kbase_diag_lock);
          list_addtail(&q->link, &kbase_quar_list);
          simple_mtx_unlock(&kbase_diag_lock);
