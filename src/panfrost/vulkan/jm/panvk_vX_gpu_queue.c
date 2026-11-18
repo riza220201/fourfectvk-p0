@@ -263,6 +263,12 @@ panvk_jd_event_str(uint32_t code)
       return "TERMINATED";
    case 0x08:
       return "ACTIVE";
+   case 0x42:
+      return "JOB_READ_FAULT";
+   case 0x4002:
+      return "JOB_CANCELLED";
+   case 0x4003:
+      return "JOB_INVALID";
    default:
       return code >= PANVK_JD_EVENT_FAULT_START ? "FAULT" : "non-fatal";
    }
@@ -511,6 +517,10 @@ struct panvk_kbase_jm {
       uint32_t barrier_code;
       thrd_t thread;
       uint64_t lost_ns, deadline_ns;
+      /* The last kbase event before the loss: kbase bounds GPU work (hard-
+       * stop, reset) from there, so the settle deadline counts from it. A
+       * watchdog loss comes long after it: no point waiting again. */
+      uint64_t progress_at_loss_ns;
       unsigned aux_inflight; /* export FENCE_TRIGGERs not yet reported */
       struct panvk_priv_bo *bo; /* barrier WRITE_VALUE jobs, one per atom */
    } p0;
@@ -1201,7 +1211,7 @@ static int
 panvk_kbase_p0_settle(void *data)
 {
    struct panvk_kbase_jm *k = data;
-   const uint64_t deadline = k->p0.lost_ns + k->p0.deadline_ns;
+   const uint64_t deadline = k->p0.progress_at_loss_ns + k->p0.deadline_ns;
    unsigned tries = 0, pending = 0;
    const char *why = NULL;
 
@@ -1290,6 +1300,9 @@ panvk_kbase_mark_lost(struct panvk_kbase_jm *k)
       return;
    k->p0.started = true;
    k->p0.lost_ns = os_time_get_nano();
+   k->p0.progress_at_loss_ns =
+      k->last_progress_ns ? MIN2(k->last_progress_ns, k->p0.lost_ns)
+                          : k->p0.lost_ns;
    kbase_kmod_quarantine_hold(k->dev->kmod.dev);
    k->p0.thread_ok =
       thrd_create(&k->p0.thread, panvk_kbase_p0_settle, k) == thrd_success;
